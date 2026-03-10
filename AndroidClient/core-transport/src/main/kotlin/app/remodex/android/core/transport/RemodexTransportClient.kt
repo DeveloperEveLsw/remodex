@@ -76,9 +76,9 @@ class RemodexTransportClient(
     suspend fun connect(
         pairing: RemodexPairingPayload,
         role: String = "mobile",
-    ): RemodexHandshakeResult = connectInternal(
+    ): RemodexHandshakeResult = connectWithRoleCompatibility(
         sessionUrl = pairing.relaySessionUrl(),
-        role = role,
+        preferredRole = role,
         attempt = 1,
     )
 
@@ -92,9 +92,9 @@ class RemodexTransportClient(
 
         while (true) {
             try {
-                return connectInternal(
+                return connectWithRoleCompatibility(
                     sessionUrl = sessionUrl,
-                    role = role,
+                    preferredRole = role,
                     attempt = attempt,
                 )
             } catch (throwable: Throwable) {
@@ -110,6 +110,31 @@ class RemodexTransportClient(
                 delay(reconnectPolicy.backoffMillis[attempt - 1])
                 attempt += 1
             }
+        }
+    }
+
+    private suspend fun connectWithRoleCompatibility(
+        sessionUrl: String,
+        preferredRole: String,
+        attempt: Int,
+    ): RemodexHandshakeResult {
+        return try {
+            connectInternal(
+                sessionUrl = sessionUrl,
+                role = preferredRole,
+                attempt = attempt,
+            )
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldRetryWithLegacyRole(preferredRole, classified)) {
+                throw classified
+            }
+
+            connectInternal(
+                sessionUrl = sessionUrl,
+                role = "iphone",
+                attempt = attempt,
+            )
         }
     }
 
@@ -582,6 +607,23 @@ class RemodexTransportClient(
                 cause = throwable,
             )
         }
+    }
+
+    private fun shouldRetryWithLegacyRole(
+        preferredRole: String,
+        error: RemodexTransportException,
+    ): Boolean {
+        if (preferredRole != "mobile") {
+            return false
+        }
+
+        if (error.relayCloseCode == 4000) {
+            return true
+        }
+
+        val loweredMessage = error.message?.lowercase().orEmpty()
+        return loweredMessage.contains("invalid x-role")
+            || loweredMessage.contains("socket rejected outgoing message")
     }
 
     private fun permanentRelayDisconnectMessage(closeCode: Int): String? {
