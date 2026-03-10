@@ -4,7 +4,9 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class RpcMessage(
-    val jsonrpc: String? = "2.0",
+    // The current Codex app-server flow used by Remodex expects the iOS-style
+    // envelope with no explicit `jsonrpc` field on outbound messages.
+    val jsonrpc: String? = null,
     val id: JsonValue? = null,
     val method: String? = null,
     val params: JsonValue? = null,
