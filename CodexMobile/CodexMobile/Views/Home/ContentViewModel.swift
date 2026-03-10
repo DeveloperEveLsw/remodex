@@ -197,7 +197,7 @@ final class ContentViewModel {
 
 extension ContentViewModel {
     func connect(codex: CodexService, serverURL: String) async throws {
-        try await codex.connect(serverURL: serverURL, token: "", role: "iphone")
+        try await codex.connect(serverURL: serverURL, token: "", role: "mobile")
     }
 
     func connectWithAutoRecovery(

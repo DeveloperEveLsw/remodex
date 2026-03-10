@@ -1,5 +1,5 @@
 // FILE: qr.js
-// Purpose: Prints the pairing QR payload that the iPhone scanner expects.
+// Purpose: Prints the pairing QR payload that the mobile scanner expects.
 // Layer: CLI helper
 // Exports: printQR
 // Depends on: qrcode-terminal
@@ -12,7 +12,7 @@ function printQR(sessionId, relayUrl) {
     sessionId,
   });
 
-  console.log("\nScan this QR with the iPhone:\n");
+  console.log("\nScan this QR with the mobile app:\n");
   qrcode.generate(payload, { small: true });
   console.log(`\nSession ID: ${sessionId}`);
   console.log(`Relay: ${relayUrl}\n`);

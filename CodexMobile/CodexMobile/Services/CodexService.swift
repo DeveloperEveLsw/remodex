@@ -62,6 +62,18 @@ enum CodexConnectionRecoveryState: Equatable, Sendable {
     case retrying(attempt: Int, message: String)
 }
 
+struct CodexHostCapabilities: Equatable, Sendable {
+    let desktopRefreshAvailable: Bool
+    let desktopRefreshEnabled: Bool
+    let desktopAppRoutingAvailable: Bool
+}
+
+struct CodexHostInfo: Equatable, Sendable {
+    let platform: String
+    let displayName: String
+    let capabilities: CodexHostCapabilities
+}
+
 @MainActor
 @Observable
 final class CodexService {
@@ -113,6 +125,7 @@ final class CodexService {
     var supportsStructuredSkillInput = true
     // Runtime compatibility flag for `turn/start.collaborationMode` plan turns.
     var supportsTurnCollaborationMode = false
+    var connectedHostInfo: CodexHostInfo?
 
     // Relay session persistence
     var relaySessionId: String?

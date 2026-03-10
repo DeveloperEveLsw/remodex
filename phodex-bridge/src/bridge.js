@@ -11,6 +11,10 @@ const {
   readBridgeConfig,
 } = require("./codex-desktop-refresher");
 const { createCodexTransport } = require("./codex-transport");
+const {
+  createBridgeHostInfo,
+  serializeBridgeHostInfoNotification,
+} = require("./host-info");
 const { printQR } = require("./qr");
 const { rememberActiveThread } = require("./session-state");
 const { handleGitRequest } = require("./git-handler");
@@ -119,6 +123,7 @@ function startBridge() {
       clearReconnectTimer();
       reconnectAttempt = 0;
       logConnectionStatus("connected");
+      nextSocket.send(serializeBridgeHostInfoNotification(config));
       while (pendingCodexMessages.length > 0) {
         const buffered = pendingCodexMessages.shift();
         nextSocket.send(buffered);
@@ -137,7 +142,7 @@ function startBridge() {
         return;
       }
       desktopRefresher.handleInbound(message);
-      rememberThreadFromMessage("phone", message);
+      rememberThreadFromMessage("mobile", message);
       codex.send(message);
     });
 
@@ -197,8 +202,8 @@ function startBridge() {
     rememberActiveThread(threadId, source);
   }
 
-  // The spawned/shared Codex app-server stays warm across phone reconnects.
-  // When iPhone reconnects it sends initialize again, but forwarding that to the
+  // The spawned/shared Codex app-server stays warm across mobile reconnects.
+  // When a mobile client reconnects it sends initialize again, but forwarding that to the
   // already-initialized Codex transport only produces "Already initialized".
   function handleBridgeManagedHandshakeMessage(rawMessage, relaySocket) {
     let parsed = null;
@@ -223,6 +228,7 @@ function startBridge() {
         id: parsed.id,
         result: {
           bridgeManaged: true,
+          host: createBridgeHostInfo(config),
         },
       }));
       return true;
@@ -324,4 +330,6 @@ function readString(value) {
   return typeof value === "string" && value ? value : null;
 }
 
-module.exports = { startBridge };
+module.exports = {
+  startBridge,
+};

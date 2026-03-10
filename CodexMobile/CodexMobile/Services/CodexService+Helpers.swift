@@ -7,6 +7,27 @@
 import Foundation
 
 extension CodexService {
+    func handleBridgeHostInfoUpdated(_ paramsObject: IncomingParamsObject?) {
+        guard let paramsObject,
+              let platform = trimmedNonEmptyString(paramsObject["platform"]?.stringValue) else {
+            return
+        }
+
+        let displayName = trimmedNonEmptyString(paramsObject["platformDisplayName"]?.stringValue)
+            ?? hostPlatformDisplayName(for: platform)
+        let capabilitiesObject = paramsObject["capabilities"]?.objectValue
+
+        connectedHostInfo = CodexHostInfo(
+            platform: platform,
+            displayName: displayName,
+            capabilities: CodexHostCapabilities(
+                desktopRefreshAvailable: capabilitiesObject?["desktopRefreshAvailable"]?.boolValue ?? false,
+                desktopRefreshEnabled: capabilitiesObject?["desktopRefreshEnabled"]?.boolValue ?? false,
+                desktopAppRoutingAvailable: capabilitiesObject?["desktopAppRoutingAvailable"]?.boolValue ?? false
+            )
+        )
+    }
+
     func resolveThreadID(_ preferredThreadID: String?) async throws -> String {
         if let preferredThreadID, !preferredThreadID.isEmpty {
             return preferredThreadID
@@ -77,4 +98,26 @@ extension CodexService {
         return fallbackId
     }
 
+}
+
+private func hostPlatformDisplayName(for platform: String) -> String {
+    switch platform.lowercased() {
+    case "darwin":
+        return "macOS"
+    case "win32":
+        return "Windows"
+    case "linux":
+        return "Linux"
+    default:
+        return platform
+    }
+}
+
+private func trimmedNonEmptyString(_ value: String?) -> String? {
+    guard let value else {
+        return nil
+    }
+
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
 }

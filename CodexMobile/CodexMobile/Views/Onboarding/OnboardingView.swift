@@ -46,7 +46,7 @@ struct OnboardingView: View {
                                 Text("Remodex")
                                     .font(AppFont.title2(weight: .bold))
 
-                                Text("Control Codex from your iPhone.")
+                                Text("Control Codex from your phone.")
                                     .font(AppFont.caption(weight: .regular))
                                     .foregroundStyle(.secondary)
                             }

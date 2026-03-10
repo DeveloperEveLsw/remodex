@@ -119,6 +119,9 @@ extension CodexService {
         let paramsObject = params?.objectValue
 
         switch method {
+        case "bridge/hostInfo":
+            handleBridgeHostInfoUpdated(paramsObject)
+
         case "thread/started":
             handleThreadStarted(paramsObject)
 

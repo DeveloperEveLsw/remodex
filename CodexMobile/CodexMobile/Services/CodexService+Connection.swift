@@ -112,6 +112,7 @@ extension CodexService {
         }
         supportsStructuredSkillInput = true
         supportsTurnCollaborationMode = false
+        connectedHostInfo = nil
         stopSyncLoop()
         clearHydrationCaches()
         resumedThreadIDs.removeAll()
@@ -121,7 +122,7 @@ extension CodexService {
         failAllPendingRequests(with: CodexServiceError.disconnected)
     }
 
-    // Clears the remembered relay pairing when the remote Mac session is gone for good.
+    // Clears the remembered relay pairing when the remote host session is gone for good.
     func clearSavedRelaySession() {
         SecureStore.deleteValue(for: CodexSecureKeys.relaySessionId)
         SecureStore.deleteValue(for: CodexSecureKeys.relayUrl)
@@ -509,9 +510,9 @@ extension CodexService {
 
         switch rawValue {
         case 4002:
-            return "The Mac session closed. Scan a new QR code to reconnect."
+            return "The host session closed. Scan a new QR code to reconnect."
         case 4001:
-            return "This relay session was replaced by another Mac connection. Scan a new QR code to reconnect."
+            return "This relay session was replaced by another host connection. Scan a new QR code to reconnect."
         case 4003:
             return "This device was replaced by a newer connection. Scan a new QR code to reconnect."
         default:

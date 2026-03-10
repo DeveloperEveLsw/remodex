@@ -86,6 +86,29 @@ struct SettingsView: View {
                 .font(AppFont.caption())
                 .foregroundStyle(.secondary)
 
+            if let hostInfo = codex.connectedHostInfo {
+                HStack {
+                    Text("Host")
+                    Spacer()
+                    Text(hostInfo.displayName)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Desktop refresh")
+                    Spacer()
+                    Text(desktopRefreshLabel(for: hostInfo))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Desktop routing")
+                    Spacer()
+                    Text(hostInfo.capabilities.desktopAppRoutingAvailable ? "Available" : "Unavailable")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             if codex.isConnecting && !codex.isConnected {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -125,6 +148,14 @@ struct SettingsView: View {
             await codex.disconnect()
             codex.clearSavedRelaySession()
         }
+    }
+
+    private func desktopRefreshLabel(for hostInfo: CodexHostInfo) -> String {
+        guard hostInfo.capabilities.desktopRefreshAvailable else {
+            return "Unavailable"
+        }
+
+        return hostInfo.capabilities.desktopRefreshEnabled ? "Enabled" : "Disabled"
     }
 
     // MARK: - Runtime bindings
@@ -353,7 +384,7 @@ private struct SettingsArchivedChatsCard: View {
 private struct SettingsAboutCard: View {
     var body: some View {
         SettingsCard(title: "About") {
-            Text("Remodex connects to Codex running locally on your Mac via a relay WebSocket. All sessions stay on your machine.")
+            Text("Remodex connects to Codex running on your host machine through a relay WebSocket. All sessions stay on your machine.")
                 .font(AppFont.caption())
                 .foregroundStyle(.secondary)
         }

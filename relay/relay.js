@@ -4,14 +4,15 @@
 // Exports: setupRelay, getRelayStats
 
 const { WebSocket } = require("ws");
+const { normalizeRelayRole } = require("./relay-role");
 
 const MAX_HISTORY = 500;
 const CLEANUP_DELAY_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const CLOSE_CODE_SESSION_UNAVAILABLE = 4002;
-const CLOSE_CODE_IPHONE_REPLACED = 4003;
+const CLOSE_CODE_MOBILE_REPLACED = 4003;
 
-// In-memory session registry for one Mac host and one live iPhone client per session.
+// In-memory session registry for one host and one live mobile client per session.
 const sessions = new Map();
 
 // Attaches relay behavior to a ws WebSocketServer instance.
@@ -33,9 +34,9 @@ function setupRelay(wss) {
     const urlPath = req.url || "";
     const match = urlPath.match(/^\/relay\/([^/?]+)/);
     const sessionId = match?.[1];
-    const role = req.headers["x-role"];
+    const role = normalizeRelayRole(req.headers["x-role"]);
 
-    if (!sessionId || (role !== "mac" && role !== "iphone")) {
+    if (!sessionId || (role !== "mac" && role !== "mobile")) {
       ws.close(4000, "Missing sessionId or invalid x-role header");
       return;
     }
@@ -45,9 +46,9 @@ function setupRelay(wss) {
       ws._relayAlive = true;
     });
 
-    // Only the Mac host is allowed to create a fresh session room.
-    if (role === "iphone" && !sessions.has(sessionId)) {
-      ws.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac session not available");
+    // Only the host is allowed to create a fresh session room.
+    if (role === "mobile" && !sessions.has(sessionId)) {
+      ws.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Host session not available");
       return;
     }
 
@@ -62,8 +63,8 @@ function setupRelay(wss) {
 
     const session = sessions.get(sessionId);
 
-    if (role === "iphone" && session.mac?.readyState !== WebSocket.OPEN) {
-      ws.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac session not available");
+    if (role === "mobile" && session.mac?.readyState !== WebSocket.OPEN) {
+      ws.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Host session not available");
       return;
     }
 
@@ -77,9 +78,9 @@ function setupRelay(wss) {
         session.mac.close(4001, "Replaced by new Mac connection");
       }
       session.mac = ws;
-      console.log(`[relay] Mac connected -> session ${sessionId}`);
+      console.log(`[relay] Host connected -> session ${sessionId}`);
     } else {
-      // Keep one live iPhone RPC client per session to avoid competing sockets.
+      // Keep one live mobile RPC client per session to avoid competing sockets.
       for (const existingClient of session.clients) {
         if (existingClient === ws) {
           continue;
@@ -89,8 +90,8 @@ function setupRelay(wss) {
           || existingClient.readyState === WebSocket.CONNECTING
         ) {
           existingClient.close(
-            CLOSE_CODE_IPHONE_REPLACED,
-            "Replaced by newer iPhone connection"
+            CLOSE_CODE_MOBILE_REPLACED,
+            "Replaced by newer mobile connection"
           );
         }
         session.clients.delete(existingClient);
@@ -98,7 +99,7 @@ function setupRelay(wss) {
 
       session.clients.add(ws);
       console.log(
-        `[relay] iPhone connected -> session ${sessionId} (${session.clients.size} client(s))`
+        `[relay] Mobile connected -> session ${sessionId} (${session.clients.size} client(s))`
       );
 
       // Replay recent host output so a reconnecting client can catch up.
@@ -131,17 +132,17 @@ function setupRelay(wss) {
       if (role === "mac") {
         if (session.mac === ws) {
           session.mac = null;
-          console.log(`[relay] Mac disconnected -> session ${sessionId}`);
+          console.log(`[relay] Host disconnected -> session ${sessionId}`);
           for (const client of session.clients) {
             if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
-              client.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac disconnected");
+              client.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Host disconnected");
             }
           }
         }
       } else {
         session.clients.delete(ws);
         console.log(
-          `[relay] iPhone disconnected -> session ${sessionId} (${session.clients.size} remaining)`
+          `[relay] Mobile disconnected -> session ${sessionId} (${session.clients.size} remaining)`
         );
       }
       scheduleCleanup(sessionId);
