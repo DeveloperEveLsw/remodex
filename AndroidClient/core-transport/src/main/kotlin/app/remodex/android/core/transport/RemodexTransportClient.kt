@@ -182,10 +182,8 @@ class RemodexTransportClient(
             }
         } catch (throwable: Throwable) {
             pendingRequests.remove(requestKey)
-            if (throwable is RemodexTransportException) {
-                throw throwable
-            }
-            throw classifyThrowable(throwable)
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            throw classified.withMethodContext(method)
         }
     }
 
@@ -246,15 +244,19 @@ class RemodexTransportClient(
                 sendThreadListRequest(legacyParams)
             }.getOrElse {
                 if (archived || legacyParams.isNotEmpty()) {
-                    sendThreadListRequest(
-                        if (archived) {
-                            mapOf("archived" to JsonPrimitive(true))
-                        } else {
-                            emptyMap()
-                        },
-                    )
+                    runCatching {
+                        sendThreadListRequest(
+                            if (archived) {
+                                mapOf("archived" to JsonPrimitive(true))
+                            } else {
+                                emptyMap()
+                            },
+                        )
+                    }.getOrElse {
+                        sendThreadListRequest(null)
+                    }
                 } else {
-                    throw classified
+                    sendThreadListRequest(null)
                 }
             }
         }
@@ -274,10 +276,10 @@ class RemodexTransportClient(
         return page.mapNotNull(::decodeThread)
     }
 
-    private suspend fun sendThreadListRequest(params: Map<String, JsonValue>): RpcMessage {
+    private suspend fun sendThreadListRequest(params: Map<String, JsonValue>?): RpcMessage {
         return sendRequest(
             method = "thread/list",
-            params = JsonObject(params),
+            params = params?.let(::JsonObject),
         )
     }
 
@@ -690,6 +692,24 @@ class RemodexTransportClient(
         return runCatching {
             json.decodeFromJsonElement(CodexHostInfo.serializer(), value)
         }.getOrNull()
+    }
+
+    private fun RemodexTransportException.withMethodContext(method: String): RemodexTransportException {
+        val loweredMessage = message.lowercase()
+        val prefixedMessage = if (loweredMessage.startsWith("${method.lowercase()} failed:")) {
+            message
+        } else {
+            "$method failed: $message"
+        }
+
+        return RemodexTransportException(
+            kind = kind,
+            message = prefixedMessage,
+            cause = cause,
+            rpcError = rpcError,
+            relayCloseCode = relayCloseCode,
+            isPermanent = isPermanent,
+        )
     }
 
     private fun updateConnectedState(
