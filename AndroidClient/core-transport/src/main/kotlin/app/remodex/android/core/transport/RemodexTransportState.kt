@@ -1,5 +1,7 @@
 package app.remodex.android.core.transport
 
+import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.protocol.RpcError
 import app.remodex.android.core.protocol.RpcMessage
@@ -41,6 +43,11 @@ data class RemodexHandshakeResult(
     val initializeResponse: RpcMessage,
     val hostInfo: CodexHostInfo? = null,
     val supportsPlanCollaborationMode: Boolean = false,
+)
+
+data class RemodexThreadReadResult(
+    val thread: CodexThread,
+    val messages: List<CodexMessage> = emptyList(),
 )
 
 enum class RemodexTransportFailureKind {

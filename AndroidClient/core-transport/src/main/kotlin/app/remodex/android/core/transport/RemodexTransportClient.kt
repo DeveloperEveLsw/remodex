@@ -1,6 +1,10 @@
 package app.remodex.android.core.transport
 
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexMessageKind
+import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
@@ -205,6 +209,96 @@ class RemodexTransportClient(
         sendMessage(RpcMessage.failure(id = id, error = RpcError(code = code, message = message, data = data)))
     }
 
+    suspend fun listThreads(
+        limit: Int = DEFAULT_THREAD_LIMIT,
+        archived: Boolean = false,
+    ): List<CodexThread> {
+        val params = buildMap<String, JsonValue> {
+            put(
+                "sourceKinds",
+                JsonArray(
+                    THREAD_LIST_SOURCE_KINDS.map(::JsonPrimitive),
+                ),
+            )
+            put("cursor", kotlinx.serialization.json.JsonNull)
+            put("limit", JsonPrimitive(limit))
+            if (archived) {
+                put("archived", JsonPrimitive(true))
+            }
+        }
+
+        val response = sendRequest(
+            method = "thread/list",
+            params = JsonObject(params),
+        )
+
+        val resultObject = response.result as? JsonObject
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "thread/list response missing payload",
+            )
+
+        val page = (resultObject["data"] ?: resultObject["items"] ?: resultObject["threads"]) as? JsonArray
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "thread/list response missing data array",
+            )
+
+        return page.mapNotNull(::decodeThread)
+    }
+
+    suspend fun readThread(
+        threadId: String,
+        includeTurns: Boolean = true,
+    ): RemodexThreadReadResult {
+        val response = try {
+            sendThreadReadRequest(threadId = threadId, includeTurns = includeTurns)
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!includeTurns || !shouldRetryThreadReadWithoutTurns(classified)) {
+                throw classified
+            }
+            sendThreadReadRequest(threadId = threadId, includeTurns = false)
+        }
+
+        val resultObject = response.result as? JsonObject
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "thread/read response missing payload",
+            )
+        val threadObject = resultObject["thread"] as? JsonObject
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "thread/read response missing thread payload",
+            )
+
+        val thread = decodeThread(threadObject)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "thread/read returned an undecodable thread",
+            )
+
+        return RemodexThreadReadResult(
+            thread = thread,
+            messages = if (includeTurns) decodeMessagesFromThreadRead(threadId, threadObject) else emptyList(),
+        )
+    }
+
+    private suspend fun sendThreadReadRequest(
+        threadId: String,
+        includeTurns: Boolean,
+    ): RpcMessage {
+        return sendRequest(
+            method = "thread/read",
+            params = JsonObject(
+                mapOf(
+                    "threadId" to JsonPrimitive(threadId),
+                    "includeTurns" to JsonPrimitive(includeTurns),
+                ),
+            ),
+        )
+    }
+
     fun isRecoverableTransientFailure(throwable: Throwable): Boolean {
         val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
         return when (classified.kind) {
@@ -392,6 +486,22 @@ class RemodexTransportClient(
             || message.contains("field")
     }
 
+    private fun shouldRetryThreadReadWithoutTurns(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        return message.contains("not materialized")
+            || message.contains("materialized")
+            || message.contains("no messages")
+    }
+
     private suspend fun sendMessage(message: RpcMessage) {
         val socket = currentWebSocket
             ?: throw RemodexTransportException(
@@ -508,6 +618,12 @@ class RemodexTransportClient(
     private fun extractHostInfoFromInitializeResponse(response: RpcMessage): CodexHostInfo? {
         val result = response.result as? JsonObject ?: return null
         return decodeHostInfo(result["host"])
+    }
+
+    private fun decodeThread(value: JsonValue): CodexThread? {
+        return runCatching {
+            json.decodeFromJsonElement(CodexThread.serializer(), value)
+        }.getOrNull()
     }
 
     private fun decodeHostInfo(value: JsonValue?): CodexHostInfo? {
@@ -647,9 +763,135 @@ class RemodexTransportClient(
         }
     }
 
+    private fun decodeMessagesFromThreadRead(
+        threadId: String,
+        threadObject: JsonObject,
+    ): List<CodexMessage> {
+        val turns = threadObject["turns"] as? JsonArray ?: return emptyList()
+        var orderIndex = 0
+        val messages = mutableListOf<CodexMessage>()
+
+        for (turnValue in turns) {
+            val turnObject = turnValue as? JsonObject ?: continue
+            val turnId = turnObject["id"].stringValueOrNull()
+            val items = turnObject["items"] as? JsonArray ?: continue
+
+            for (itemValue in items) {
+                val itemObject = itemValue as? JsonObject ?: continue
+                val itemType = normalizeItemType(itemObject["type"].stringValueOrNull()) ?: continue
+                val itemId = itemObject["id"].stringValueOrNull()
+                val decodedText = decodeItemDisplayText(itemObject)
+                if (decodedText.isBlank()) {
+                    continue
+                }
+
+                val messageRole = when (itemType) {
+                    "usermessage" -> CodexMessageRole.User
+                    "agentmessage", "assistantmessage" -> CodexMessageRole.Assistant
+                    "message" -> {
+                        val role = itemObject["role"].stringValueOrNull()?.lowercase().orEmpty()
+                        if (role.contains("user")) CodexMessageRole.User else CodexMessageRole.Assistant
+                    }
+                    else -> CodexMessageRole.System
+                }
+
+                val messageKind = when (itemType) {
+                    "reasoning" -> CodexMessageKind.Thinking
+                    "filechange", "toolcall", "diff" -> CodexMessageKind.FileChange
+                    "commandexecution" -> CodexMessageKind.CommandExecution
+                    "plan" -> CodexMessageKind.Plan
+                    else -> CodexMessageKind.Chat
+                }
+
+                messages += CodexMessage(
+                    id = itemId ?: "${threadId}_$orderIndex",
+                    threadId = threadId,
+                    role = messageRole,
+                    kind = messageKind,
+                    text = decodedText,
+                    createdAt = null,
+                    turnId = turnId,
+                    itemId = itemId,
+                    orderIndex = orderIndex,
+                )
+                orderIndex += 1
+            }
+        }
+
+        return messages
+    }
+
+    private fun decodeItemDisplayText(itemObject: JsonObject): String {
+        val contentItems = itemObject["content"] as? JsonArray ?: JsonArray(emptyList())
+        val textParts = buildList {
+            for (value in contentItems) {
+                val objectValue = value as? JsonObject ?: continue
+                val contentType = normalizeItemType(objectValue["type"].stringValueOrNull()).orEmpty()
+
+                when (contentType) {
+                    "text", "inputtext", "outputtext", "message" -> {
+                        objectValue["text"].stringValueOrNull()?.let(::add)
+                    }
+
+                    "skill" -> {
+                        val skillId = objectValue["id"].stringValueOrNull()
+                        val skillName = objectValue["name"].stringValueOrNull()
+                        val resolved = skillId ?: skillName
+                        if (!resolved.isNullOrBlank()) {
+                            add("\$$resolved")
+                        }
+                    }
+                }
+
+                val nestedDataText = (objectValue["data"] as? JsonObject)
+                    ?.get("text")
+                    .stringValueOrNull()
+                if (!nestedDataText.isNullOrBlank()) {
+                    add(nestedDataText)
+                }
+            }
+        }
+
+        if (textParts.isNotEmpty()) {
+            return textParts.joinToString("\n").trim()
+        }
+
+        return listOf(
+            itemObject["text"].stringValueOrNull(),
+            itemObject["message"].stringValueOrNull(),
+            itemObject["summary"].stringValueOrNull(),
+            itemObject["command"].stringValueOrNull(),
+            itemObject["title"].stringValueOrNull(),
+        ).firstOrNull { !it.isNullOrBlank() }?.trim().orEmpty()
+    }
+
+    private fun normalizeItemType(rawValue: String?): String? {
+        val normalized = rawValue
+            ?.trim()
+            ?.lowercase()
+            ?.replace("/", "")
+            ?.replace("_", "")
+            ?.replace("-", "")
+            ?.replace(" ", "")
+            .orEmpty()
+        return normalized.ifEmpty { null }
+    }
+
+    private fun JsonValue?.stringValueOrNull(): String? {
+        return (this as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+    }
+
     companion object {
         private const val CONNECTION_TIMEOUT_MILLIS = 12_000L
         private const val REQUEST_TIMEOUT_MILLIS = 15_000L
+        private const val DEFAULT_THREAD_LIMIT = 20
         private val PERMANENT_RELAY_CLOSE_CODES = setOf(4000, 4001, 4002, 4003)
+        private val THREAD_LIST_SOURCE_KINDS = listOf(
+            "cli",
+            "vscode",
+            "appServer",
+            "exec",
+            "unknown",
+        )
     }
 }

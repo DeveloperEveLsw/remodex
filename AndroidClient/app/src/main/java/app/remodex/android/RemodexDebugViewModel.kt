@@ -3,10 +3,13 @@ package app.remodex.android
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
 import app.remodex.android.core.transport.RemodexTransportClient
+import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexTransportState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,6 +26,11 @@ data class RemodexDebugUiState(
     val hostInfo: CodexHostInfo? = null,
     val supportsPlanCollaborationMode: Boolean = false,
     val sessionUrl: String? = null,
+    val threads: List<CodexThread> = emptyList(),
+    val selectedThreadId: String? = null,
+    val selectedMessages: List<CodexMessage> = emptyList(),
+    val isLoadingThreads: Boolean = false,
+    val isLoadingThread: Boolean = false,
     val isBusy: Boolean = false,
     val errorMessage: String? = null,
 )
@@ -118,6 +126,7 @@ class RemodexDebugViewModel : ViewModel() {
                 transport.connectWithRecovery(pairing = pairing)
             }.onSuccess { handshake ->
                 applyHandshake(handshake)
+                refreshThreads()
             }.onFailure { throwable ->
                 _uiState.update { current ->
                     current.copy(
@@ -135,8 +144,70 @@ class RemodexDebugViewModel : ViewModel() {
             _uiState.update { current ->
                 current.copy(
                     isBusy = false,
+                    threads = emptyList(),
+                    selectedThreadId = null,
+                    selectedMessages = emptyList(),
                     errorMessage = null,
                 )
+            }
+        }
+    }
+
+    fun refreshThreads() {
+        viewModelScope.launch {
+            _uiState.update { current ->
+                current.copy(
+                    isLoadingThreads = true,
+                    errorMessage = null,
+                )
+            }
+
+            runCatching {
+                transport.listThreads()
+            }.onSuccess { threads ->
+                _uiState.update { current ->
+                    val selectedThreadStillExists = current.selectedThreadId?.let { selectedId ->
+                        threads.any { it.id == selectedId }
+                    } == true
+                    current.copy(
+                        isLoadingThreads = false,
+                        threads = threads,
+                        selectedThreadId = current.selectedThreadId?.takeIf { selectedThreadStillExists },
+                        selectedMessages = if (selectedThreadStillExists) current.selectedMessages else emptyList(),
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    current.copy(
+                        isLoadingThreads = false,
+                        errorMessage = throwable.message,
+                    )
+                }
+            }
+        }
+    }
+
+    fun selectThread(threadId: String) {
+        viewModelScope.launch {
+            _uiState.update { current ->
+                current.copy(
+                    selectedThreadId = threadId,
+                    isLoadingThread = true,
+                    errorMessage = null,
+                )
+            }
+
+            runCatching {
+                transport.readThread(threadId = threadId, includeTurns = true)
+            }.onSuccess { threadResult ->
+                applyThreadRead(threadResult)
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    current.copy(
+                        isLoadingThread = false,
+                        errorMessage = throwable.message,
+                    )
+                }
             }
         }
     }
@@ -155,5 +226,25 @@ class RemodexDebugViewModel : ViewModel() {
 
     companion object {
         private const val APP_VERSION = "0.1.0"
+    }
+
+    private fun applyThreadRead(threadResult: RemodexThreadReadResult) {
+        _uiState.update { current ->
+            val updatedThreads = current.threads.toMutableList()
+            val existingIndex = updatedThreads.indexOfFirst { it.id == threadResult.thread.id }
+            if (existingIndex >= 0) {
+                updatedThreads[existingIndex] = threadResult.thread
+            } else {
+                updatedThreads.add(0, threadResult.thread)
+            }
+
+            current.copy(
+                isLoadingThread = false,
+                selectedThreadId = threadResult.thread.id,
+                selectedMessages = threadResult.messages,
+                threads = updatedThreads,
+                errorMessage = null,
+            )
+        }
     }
 }

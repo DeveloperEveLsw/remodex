@@ -1,6 +1,6 @@
 # Plan: Android Client + Multi-Host Runtime Expansion
 > Status: Living document
-> Last updated: 2026-03-10
+> Last updated: 2026-03-11
 > Scope: `remodex` bridge, relay, and new Android client
 
 ## Progress Snapshot
@@ -15,7 +15,10 @@
 - Done: Android `core-pairing` now parses QR payloads and normalizes relay session URLs
 - Done: Android `core-transport` now opens relay WebSockets, performs initialize fallback, and surfaces host info
 - Done: Android app shell now includes a manual pairing/connection debug screen for pre-camera verification
-- Pending verification: Android Gradle wrapper/build has not been run in this workspace because Gradle is unavailable in PATH
+- Done: Android transport now falls back from `mobile` to legacy `iphone` role for hosted relay compatibility
+- Done: Android debug shell now loads `thread/list` results and can inspect `thread/read(includeTurns=true)` history
+- Verified externally: Windows emulator build and hosted-relay handshake work against a WSL bridge host
+- Pending verification: latest `thread/list` and `thread/read` debug UI changes still need Windows build confirmation
 
 ## Goal
 
@@ -184,7 +187,7 @@ Tasks:
 - define modules:
   - `app`
   - `core-model`
-  - `core-rpc`
+  - `core-protocol`
   - `core-transport`
   - `core-storage`
   - `feature-onboarding`

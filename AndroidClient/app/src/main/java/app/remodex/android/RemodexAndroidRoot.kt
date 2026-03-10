@@ -26,6 +26,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexMessageKind
+import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.transport.RemodexTransportState
 
 @Composable
@@ -138,6 +142,55 @@ fun RemodexAndroidRoot() {
                         HostInfoSection(uiState.hostInfo)
                     }
                 }
+
+                item {
+                    DebugCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CardHeader(title = "Threads")
+                            OutlinedButton(
+                                onClick = viewModel::refreshThreads,
+                                enabled = !uiState.isLoadingThreads &&
+                                    uiState.connectionState is RemodexTransportState.Connected,
+                            ) {
+                                Text(if (uiState.isLoadingThreads) "Loading..." else "Refresh")
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        ThreadListSection(
+                            threads = uiState.threads,
+                            selectedThreadId = uiState.selectedThreadId,
+                            isLoadingThread = uiState.isLoadingThread,
+                            isLoadingThreads = uiState.isLoadingThreads,
+                            onSelectThread = viewModel::selectThread,
+                        )
+                    }
+                }
+
+                item {
+                    DebugCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp)
+                            .padding(bottom = 24.dp),
+                    ) {
+                        CardHeader(title = "Thread Detail")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        ThreadMessagesSection(
+                            threads = uiState.threads,
+                            selectedThreadId = uiState.selectedThreadId,
+                            messages = uiState.selectedMessages,
+                            isLoadingThread = uiState.isLoadingThread,
+                        )
+                    }
+                }
             }
         }
     }
@@ -219,6 +272,135 @@ private fun HostInfoSection(hostInfo: CodexHostInfo?) {
     )
 }
 
+@Composable
+private fun ThreadListSection(
+    threads: List<CodexThread>,
+    selectedThreadId: String?,
+    isLoadingThread: Boolean,
+    isLoadingThreads: Boolean,
+    onSelectThread: (String) -> Unit,
+) {
+    if (isLoadingThreads && threads.isEmpty()) {
+        Text(
+            text = "Loading threads from `thread/list`...",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
+    if (threads.isEmpty()) {
+        Text(
+            text = "No threads loaded yet. Connect first, then press Refresh.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        for (thread in threads.take(8)) {
+            val isSelected = thread.id == selectedThreadId
+            OutlinedButton(
+                onClick = { onSelectThread(thread.id) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isLoadingThread || isSelected,
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = thread.displayTitle,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                    )
+                    Text(
+                        text = "${thread.projectDisplayName} · ${thread.id}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThreadMessagesSection(
+    threads: List<CodexThread>,
+    selectedThreadId: String?,
+    messages: List<CodexMessage>,
+    isLoadingThread: Boolean,
+) {
+    val selectedThread = threads.firstOrNull { it.id == selectedThreadId }
+    if (selectedThread == null) {
+        Text(
+            text = "Choose a thread to load `thread/read(includeTurns=true)`.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
+    Text(
+        text = selectedThread.displayTitle,
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold,
+    )
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        text = selectedThread.id,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(modifier = Modifier.height(12.dp))
+
+    if (isLoadingThread) {
+        Text(
+            text = "Loading thread detail...",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
+    if (messages.isEmpty()) {
+        Text(
+            text = "No decoded messages yet for this thread.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        for (message in messages.takeLast(10)) {
+            Surface(
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.surfaceContainer,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = messageRoleLabel(message),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+        }
+    }
+}
+
 private fun connectionStateLabel(state: RemodexTransportState): String {
     return when (state) {
         RemodexTransportState.Disconnected -> "Disconnected"
@@ -229,6 +411,20 @@ private fun connectionStateLabel(state: RemodexTransportState): String {
         }
         is RemodexTransportState.Failed -> {
             if (state.isPermanent) "Failed permanently" else "Failed"
+        }
+    }
+}
+
+private fun messageRoleLabel(message: CodexMessage): String {
+    return when (message.role) {
+        CodexMessageRole.User -> "User"
+        CodexMessageRole.Assistant -> "Assistant"
+        CodexMessageRole.System -> when (message.kind) {
+            CodexMessageKind.Thinking -> "System · Thinking"
+            CodexMessageKind.FileChange -> "System · File Change"
+            CodexMessageKind.CommandExecution -> "System · Command"
+            CodexMessageKind.Plan -> "System · Plan"
+            else -> "System"
         }
     }
 }
