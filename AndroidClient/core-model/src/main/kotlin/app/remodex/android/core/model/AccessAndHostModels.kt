@@ -1,7 +1,10 @@
+@file:OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+
 package app.remodex.android.core.model
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonNames
 
 @Serializable
 enum class CodexAccessMode {
@@ -41,6 +44,7 @@ data class CodexHostCapabilities(
 @Serializable
 data class CodexHostInfo(
     val platform: String,
+    @JsonNames("displayName", "platformDisplayName")
     val displayName: String,
     val capabilities: CodexHostCapabilities = CodexHostCapabilities(),
 )
