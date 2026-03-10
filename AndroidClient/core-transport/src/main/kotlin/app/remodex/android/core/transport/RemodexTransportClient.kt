@@ -213,7 +213,7 @@ class RemodexTransportClient(
         limit: Int = DEFAULT_THREAD_LIMIT,
         archived: Boolean = false,
     ): List<CodexThread> {
-        val params = buildMap<String, JsonValue> {
+        val modernParams = buildMap<String, JsonValue> {
             put(
                 "sourceKinds",
                 JsonArray(
@@ -227,10 +227,37 @@ class RemodexTransportClient(
             }
         }
 
-        val response = sendRequest(
-            method = "thread/list",
-            params = JsonObject(params),
-        )
+        val response = try {
+            sendThreadListRequest(modernParams)
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldRetryThreadListWithLegacyParams(classified)) {
+                throw classified
+            }
+
+            val legacyParams = buildMap<String, JsonValue> {
+                put("limit", JsonPrimitive(limit))
+                if (archived) {
+                    put("archived", JsonPrimitive(true))
+                }
+            }
+
+            runCatching {
+                sendThreadListRequest(legacyParams)
+            }.getOrElse {
+                if (archived || legacyParams.isNotEmpty()) {
+                    sendThreadListRequest(
+                        if (archived) {
+                            mapOf("archived" to JsonPrimitive(true))
+                        } else {
+                            emptyMap()
+                        },
+                    )
+                } else {
+                    throw classified
+                }
+            }
+        }
 
         val resultObject = response.result as? JsonObject
             ?: throw RemodexTransportException(
@@ -245,6 +272,13 @@ class RemodexTransportClient(
             )
 
         return page.mapNotNull(::decodeThread)
+    }
+
+    private suspend fun sendThreadListRequest(params: Map<String, JsonValue>): RpcMessage {
+        return sendRequest(
+            method = "thread/list",
+            params = JsonObject(params),
+        )
     }
 
     suspend fun readThread(
@@ -500,6 +534,28 @@ class RemodexTransportClient(
         return message.contains("not materialized")
             || message.contains("materialized")
             || message.contains("no messages")
+    }
+
+    private fun shouldRetryThreadListWithLegacyParams(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600 && rpcError.code != -32602) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        return message.contains("invalid")
+            || message.contains("unexpected")
+            || message.contains("unknown")
+            || message.contains("unrecognized")
+            || message.contains("unsupported")
+            || message.contains("field")
+            || message.contains("sourcekinds")
+            || message.contains("cursor")
+            || message.contains("limit")
     }
 
     private suspend fun sendMessage(message: RpcMessage) {
