@@ -18,4 +18,6 @@ rootProject.name = "remodex-android"
 
 include(":app")
 include(":core-model")
+include(":core-pairing")
 include(":core-protocol")
+include(":core-transport")

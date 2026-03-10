@@ -12,6 +12,9 @@
 - Done: iOS client now connects with `mobile` role and surfaces host capability info in Settings
 - Done: `AndroidClient` scaffold added with `app`, `core-protocol`, and `core-model` modules
 - Done: Android core models now cover RPC, threads, messages, collaboration, approval, git, and revert DTOs
+- Done: Android `core-pairing` now parses QR payloads and normalizes relay session URLs
+- Done: Android `core-transport` now opens relay WebSockets, performs initialize fallback, and surfaces host info
+- Done: Android app shell now includes a manual pairing/connection debug screen for pre-camera verification
 - Pending verification: Android Gradle wrapper/build has not been run in this workspace because Gradle is unavailable in PATH
 
 ## Goal
