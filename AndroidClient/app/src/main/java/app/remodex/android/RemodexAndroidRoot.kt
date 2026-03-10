@@ -30,6 +30,7 @@ import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThread
+import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportState
 
 @Composable
@@ -140,6 +141,18 @@ fun RemodexAndroidRoot() {
                         CardHeader(title = "Host Info")
                         Spacer(modifier = Modifier.height(12.dp))
                         HostInfoSection(uiState.hostInfo)
+                    }
+                }
+
+                item {
+                    DebugCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp),
+                    ) {
+                        CardHeader(title = "Diagnostics")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        DiagnosticsSection(uiState.diagnostics)
                     }
                 }
 
@@ -269,6 +282,44 @@ private fun HostInfoSection(hostInfo: CodexHostInfo?) {
     KeyValueRow(
         "Desktop Routing",
         if (hostInfo.capabilities.desktopAppRoutingAvailable) "Available" else "Unavailable",
+    )
+}
+
+@Composable
+private fun DiagnosticsSection(diagnostics: RemodexTransportDiagnostics) {
+    KeyValueRow("Last Outbound", diagnostics.lastOutboundMethod ?: "None")
+    KeyValueRow("RPC Error Method", diagnostics.lastRpcErrorMethod ?: "None")
+    KeyValueRow("RPC Error Code", diagnostics.lastRpcErrorCode?.toString() ?: "None")
+    KeyValueRow("RPC Error Msg", diagnostics.lastRpcErrorMessage ?: "None")
+    KeyValueRow("thread/list Mode", diagnostics.lastThreadListStrategy ?: "None")
+    Spacer(modifier = Modifier.height(10.dp))
+    DebugBlock(label = "thread/list Params", value = diagnostics.lastThreadListParams)
+    Spacer(modifier = Modifier.height(10.dp))
+    DebugBlock(label = "Last Outbound Payload", value = diagnostics.lastOutboundPayload)
+    Spacer(modifier = Modifier.height(10.dp))
+    DebugBlock(label = "Last Inbound Payload", value = diagnostics.lastInboundPayload)
+    Spacer(modifier = Modifier.height(10.dp))
+    DebugBlock(label = "RPC Error Data", value = diagnostics.lastRpcErrorData)
+    if (diagnostics.recentEvents.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(10.dp))
+        DebugBlock(
+            label = "Recent Events",
+            value = diagnostics.recentEvents.joinToString(separator = "\n"),
+        )
+    }
+}
+
+@Composable
+private fun DebugBlock(label: String, value: String?) {
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        text = value ?: "None",
+        style = MaterialTheme.typography.bodySmall,
     )
 }
 

@@ -58,9 +58,13 @@ class RemodexTransportClient(
 ) {
     private val connectMutex = Mutex()
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<RpcMessage>>()
+    private val pendingRequestMethods = ConcurrentHashMap<String, String>()
 
     private val _state = MutableStateFlow<RemodexTransportState>(RemodexTransportState.Disconnected)
     val state: StateFlow<RemodexTransportState> = _state.asStateFlow()
+
+    private val _diagnostics = MutableStateFlow(RemodexTransportDiagnostics())
+    val diagnostics: StateFlow<RemodexTransportDiagnostics> = _diagnostics.asStateFlow()
 
     private val _notifications = MutableSharedFlow<RpcMessage>(extraBufferCapacity = 32)
     val notifications: SharedFlow<RpcMessage> = _notifications.asSharedFlow()
@@ -167,6 +171,7 @@ class RemodexTransportClient(
         val requestKey = idKey(requestId)
         val response = CompletableDeferred<RpcMessage>()
         pendingRequests[requestKey] = response
+        pendingRequestMethods[requestKey] = method
 
         try {
             sendMessage(
@@ -182,6 +187,7 @@ class RemodexTransportClient(
             }
         } catch (throwable: Throwable) {
             pendingRequests.remove(requestKey)
+            pendingRequestMethods.remove(requestKey)
             val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
             throw classified.withMethodContext(method)
         }
@@ -226,7 +232,7 @@ class RemodexTransportClient(
         }
 
         val response = try {
-            sendThreadListRequest(modernParams)
+            sendThreadListRequest(strategy = "modern", params = modernParams)
         } catch (throwable: Throwable) {
             val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
             if (!shouldRetryThreadListWithLegacyParams(classified)) {
@@ -241,22 +247,23 @@ class RemodexTransportClient(
             }
 
             runCatching {
-                sendThreadListRequest(legacyParams)
+                sendThreadListRequest(strategy = "legacy", params = legacyParams)
             }.getOrElse {
                 if (archived || legacyParams.isNotEmpty()) {
                     runCatching {
                         sendThreadListRequest(
-                            if (archived) {
+                            strategy = "minimal",
+                            params = if (archived) {
                                 mapOf("archived" to JsonPrimitive(true))
                             } else {
-                                emptyMap()
+                                emptyMap<String, JsonValue>()
                             },
                         )
                     }.getOrElse {
-                        sendThreadListRequest(null)
+                        sendThreadListRequest(strategy = "null-params", params = null)
                     }
                 } else {
-                    sendThreadListRequest(null)
+                    sendThreadListRequest(strategy = "null-params", params = null)
                 }
             }
         }
@@ -276,7 +283,18 @@ class RemodexTransportClient(
         return page.mapNotNull(::decodeThread)
     }
 
-    private suspend fun sendThreadListRequest(params: Map<String, JsonValue>?): RpcMessage {
+    private suspend fun sendThreadListRequest(
+        strategy: String,
+        params: Map<String, JsonValue>?,
+    ): RpcMessage {
+        updateDiagnostics { current ->
+            current.copy(
+                lastThreadListStrategy = strategy,
+                lastThreadListParams = params?.let(::JsonObject)?.toString() ?: "null",
+                recentEvents = (current.recentEvents + listOf("thread/list strategy=$strategy"))
+                    .takeLast(MAX_DIAGNOSTIC_EVENTS),
+            )
+        }
         return sendRequest(
             method = "thread/list",
             params = params?.let(::JsonObject),
@@ -568,6 +586,12 @@ class RemodexTransportClient(
             )
 
         val encoded = json.encodeToString(RpcMessage.serializer(), message)
+        updateDiagnostics { current ->
+            current.copy(
+                lastOutboundMethod = message.method,
+                lastOutboundPayload = encoded,
+            )
+        }
         if (!socket.send(encoded)) {
             throw RemodexTransportException(
                 kind = RemodexTransportFailureKind.Disconnected,
@@ -631,6 +655,9 @@ class RemodexTransportClient(
     }
 
     private fun handleIncomingText(text: String) {
+        updateDiagnostics { current ->
+            current.copy(lastInboundPayload = text)
+        }
         val message = runCatching {
             json.decodeFromString(RpcMessage.serializer(), text)
         }.getOrElse {
@@ -657,10 +684,23 @@ class RemodexTransportClient(
         }
 
         val responseId = message.id ?: return
-        val deferred = pendingRequests.remove(idKey(responseId)) ?: return
+        val requestKey = idKey(responseId)
+        val deferred = pendingRequests.remove(requestKey) ?: return
+        val requestMethod = pendingRequestMethods.remove(requestKey)
 
         val rpcError = message.error
         if (rpcError != null) {
+            updateDiagnostics { current ->
+                current.copy(
+                    lastRpcErrorMethod = requestMethod,
+                    lastRpcErrorCode = rpcError.code,
+                    lastRpcErrorMessage = rpcError.message,
+                    lastRpcErrorData = rpcError.data?.toString(),
+                    recentEvents = (current.recentEvents + listOf(
+                        "rpc-error ${requestMethod ?: "unknown"} code=${rpcError.code}",
+                    )).takeLast(MAX_DIAGNOSTIC_EVENTS),
+                )
+            }
             deferred.completeExceptionally(
                 RemodexTransportException(
                     kind = RemodexTransportFailureKind.Rpc,
@@ -741,9 +781,14 @@ class RemodexTransportClient(
     private fun failAllPendingRequests(error: Throwable) {
         val outstanding = pendingRequests.values.toList()
         pendingRequests.clear()
+        pendingRequestMethods.clear()
         outstanding.forEach { deferred ->
             deferred.completeExceptionally(error)
         }
+    }
+
+    private fun updateDiagnostics(transform: (RemodexTransportDiagnostics) -> RemodexTransportDiagnostics) {
+        _diagnostics.value = transform(_diagnostics.value)
     }
 
     private fun classifyClose(code: Int, reason: String?): RemodexTransportException {
@@ -961,6 +1006,7 @@ class RemodexTransportClient(
         private const val CONNECTION_TIMEOUT_MILLIS = 12_000L
         private const val REQUEST_TIMEOUT_MILLIS = 15_000L
         private const val DEFAULT_THREAD_LIMIT = 20
+        private const val MAX_DIAGNOSTIC_EVENTS = 12
         private val PERMANENT_RELAY_CLOSE_CODES = setOf(4000, 4001, 4002, 4003)
         private val THREAD_LIST_SOURCE_KINDS = listOf(
             "cli",

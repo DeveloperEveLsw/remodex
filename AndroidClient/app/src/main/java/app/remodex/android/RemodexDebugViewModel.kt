@@ -9,6 +9,7 @@ import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
 import app.remodex.android.core.transport.RemodexTransportClient
+import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexTransportState
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +27,7 @@ data class RemodexDebugUiState(
     val hostInfo: CodexHostInfo? = null,
     val supportsPlanCollaborationMode: Boolean = false,
     val sessionUrl: String? = null,
+    val diagnostics: RemodexTransportDiagnostics = RemodexTransportDiagnostics(),
     val threads: List<CodexThread> = emptyList(),
     val selectedThreadId: String? = null,
     val selectedMessages: List<CodexMessage> = emptyList(),
@@ -50,6 +52,14 @@ class RemodexDebugViewModel : ViewModel() {
                         hostInfo = connectedState?.hostInfo,
                         supportsPlanCollaborationMode = connectedState?.supportsPlanCollaborationMode ?: false,
                     )
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            transport.diagnostics.collect { diagnostics ->
+                _uiState.update { current ->
+                    current.copy(diagnostics = diagnostics)
                 }
             }
         }

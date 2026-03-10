@@ -50,6 +50,19 @@ data class RemodexThreadReadResult(
     val messages: List<CodexMessage> = emptyList(),
 )
 
+data class RemodexTransportDiagnostics(
+    val lastOutboundMethod: String? = null,
+    val lastOutboundPayload: String? = null,
+    val lastInboundPayload: String? = null,
+    val lastRpcErrorMethod: String? = null,
+    val lastRpcErrorCode: Int? = null,
+    val lastRpcErrorMessage: String? = null,
+    val lastRpcErrorData: String? = null,
+    val lastThreadListStrategy: String? = null,
+    val lastThreadListParams: String? = null,
+    val recentEvents: List<String> = emptyList(),
+)
+
 enum class RemodexTransportFailureKind {
     Timeout,
     Disconnected,
