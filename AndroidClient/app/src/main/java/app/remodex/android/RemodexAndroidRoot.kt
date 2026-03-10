@@ -162,6 +162,27 @@ fun RemodexAndroidRoot() {
                             .fillMaxWidth()
                             .padding(horizontal = 20.dp),
                     ) {
+                        CardHeader(title = "Turn Start")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        TurnStartSection(
+                            selectedThreadId = uiState.selectedThreadId,
+                            prompt = uiState.draftTurnInput,
+                            isSending = uiState.isStartingTurn,
+                            planSupported = uiState.supportsPlanCollaborationMode,
+                            lastStartedTurnId = uiState.lastStartedTurnId,
+                            lastTurnStartSummary = uiState.lastTurnStartSummary,
+                            onPromptChange = viewModel::updateDraftTurnInput,
+                            onSend = viewModel::startTurn,
+                        )
+                    }
+                }
+
+                item {
+                    DebugCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp),
+                    ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -306,6 +327,49 @@ private fun DiagnosticsSection(diagnostics: RemodexTransportDiagnostics) {
             label = "Recent Events",
             value = diagnostics.recentEvents.joinToString(separator = "\n"),
         )
+    }
+}
+
+@Composable
+private fun TurnStartSection(
+    selectedThreadId: String?,
+    prompt: String,
+    isSending: Boolean,
+    planSupported: Boolean,
+    lastStartedTurnId: String?,
+    lastTurnStartSummary: String?,
+    onPromptChange: (String) -> Unit,
+    onSend: () -> Unit,
+) {
+    KeyValueRow("Selected Thread", selectedThreadId ?: "None")
+    KeyValueRow("Plan Support", if (planSupported) "Supported" else "Not reported yet")
+    if (lastStartedTurnId != null) {
+        KeyValueRow("Last Turn ID", lastStartedTurnId)
+    }
+    if (lastTurnStartSummary != null) {
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = lastTurnStartSummary,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Spacer(modifier = Modifier.height(12.dp))
+    OutlinedTextField(
+        value = prompt,
+        onValueChange = onPromptChange,
+        modifier = Modifier.fillMaxWidth(),
+        minLines = 4,
+        placeholder = {
+            Text("Send a prompt to the selected thread using turn/start")
+        },
+    )
+    Spacer(modifier = Modifier.height(12.dp))
+    Button(
+        onClick = onSend,
+        enabled = selectedThreadId != null && !isSending,
+    ) {
+        Text(if (isSending) "Sending..." else "Send Turn")
     }
 }
 

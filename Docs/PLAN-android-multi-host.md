@@ -18,7 +18,10 @@
 - Done: Android transport now falls back from `mobile` to legacy `iphone` role for hosted relay compatibility
 - Done: Android debug shell now loads `thread/list` results and can inspect `thread/read(includeTurns=true)` history
 - Verified externally: Windows emulator build and hosted-relay handshake work against a WSL bridge host
-- Pending verification: latest `thread/list` and `thread/read` debug UI changes still need Windows build confirmation
+- Done: Android diagnostics panel now shows raw RPC payloads, error metadata, and thread-list fallback stages
+- Done: Android `collaborationMode/list` now probes with explicit params for newer Codex CLI builds
+- Done: Android debug shell now exposes a basic `turn/start` composer path with sandbox and approval fallback
+- Pending verification: latest `collaborationMode/list` and `turn/start` debug shell changes still need Windows build confirmation
 
 ## Goal
 

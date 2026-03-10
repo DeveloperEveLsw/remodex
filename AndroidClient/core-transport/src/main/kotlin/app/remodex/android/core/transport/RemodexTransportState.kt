@@ -3,6 +3,7 @@ package app.remodex.android.core.transport
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.protocol.RpcError
 import app.remodex.android.core.protocol.RpcMessage
 
@@ -48,6 +49,14 @@ data class RemodexHandshakeResult(
 data class RemodexThreadReadResult(
     val thread: CodexThread,
     val messages: List<CodexMessage> = emptyList(),
+)
+
+data class RemodexTurnStartResult(
+    val threadId: String,
+    val turnId: String? = null,
+    val collaborationMode: CodexCollaborationModeKind? = null,
+    val downgradedCollaborationMode: Boolean = false,
+    val response: RpcMessage,
 )
 
 data class RemodexTransportDiagnostics(

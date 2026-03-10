@@ -1,5 +1,7 @@
 package app.remodex.android.core.transport
 
+import app.remodex.android.core.model.CodexAccessMode
+import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
@@ -338,6 +340,96 @@ class RemodexTransportClient(
         )
     }
 
+    suspend fun listCollaborationModes(): List<CodexCollaborationModeKind> {
+        val response = runCatching {
+            sendRequest(
+                method = "collaborationMode/list",
+                params = JsonObject(emptyMap<String, JsonValue>()),
+            )
+        }.getOrElse { throwable ->
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldRetryCollaborationModeListWithoutParams(classified)) {
+                throw classified
+            }
+            sendRequest(method = "collaborationMode/list", params = null)
+        }
+
+        val result = response.result
+        val candidateArrays = buildList<JsonArray> {
+            if (result is JsonArray) {
+                add(result)
+            }
+
+            val resultObject = result as? JsonObject
+            listOf("modes", "collaborationModes", "items")
+                .mapNotNull { key -> resultObject?.get(key) as? JsonArray }
+                .forEach(::add)
+        }
+
+        val supportedModes = linkedSetOf<CodexCollaborationModeKind>()
+        for (candidateArray in candidateArrays) {
+            for (entry in candidateArray) {
+                when (entryModeName(entry)) {
+                    "default" -> supportedModes += CodexCollaborationModeKind.Default
+                    "plan" -> supportedModes += CodexCollaborationModeKind.Plan
+                }
+            }
+        }
+
+        return supportedModes.toList()
+    }
+
+    suspend fun startTurn(
+        threadId: String,
+        userInput: String,
+        accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
+        collaborationMode: CodexCollaborationModeKind? = null,
+    ): RemodexTurnStartResult {
+        val trimmedInput = userInput.trim()
+        if (trimmedInput.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "turn/start requires non-empty user input",
+            )
+        }
+
+        var effectiveCollaborationMode = collaborationMode
+        var downgradedCollaborationMode = false
+
+        while (true) {
+            val requestParams = buildTurnStartRequestParams(
+                threadId = threadId,
+                userInput = trimmedInput,
+                collaborationMode = effectiveCollaborationMode,
+            )
+
+            try {
+                val response = sendRequestWithSandboxFallback(
+                    method = "turn/start",
+                    baseParams = requestParams,
+                    accessMode = accessMode,
+                )
+                return RemodexTurnStartResult(
+                    threadId = threadId,
+                    turnId = extractTurnId(response.result),
+                    collaborationMode = effectiveCollaborationMode,
+                    downgradedCollaborationMode = downgradedCollaborationMode,
+                    response = response,
+                )
+            } catch (throwable: Throwable) {
+                val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+                if (effectiveCollaborationMode != null &&
+                    shouldRetryTurnStartWithoutCollaborationMode(classified)
+                ) {
+                    effectiveCollaborationMode = null
+                    downgradedCollaborationMode = true
+                    continue
+                }
+                throw classified
+            }
+        }
+    }
+
     private suspend fun sendThreadReadRequest(
         threadId: String,
         includeTurns: Boolean,
@@ -487,20 +579,7 @@ class RemodexTransportClient(
     }
 
     private suspend fun runtimeSupportsPlanCollaborationMode(): Boolean {
-        val response = sendRequest(method = "collaborationMode/list")
-        val result = response.result
-
-        if (result is JsonArray && result.any { entryModeName(it) == "plan" }) {
-            return true
-        }
-
-        val resultObject = result as? JsonObject ?: return false
-        val arrays = listOf("modes", "collaborationModes", "items")
-            .mapNotNull { key -> resultObject[key] as? JsonArray }
-
-        return arrays.any { entries ->
-            entries.any { entryModeName(it) == "plan" }
-        }
+        return listCollaborationModes().contains(CodexCollaborationModeKind.Plan)
     }
 
     private fun entryModeName(value: JsonValue): String? {
@@ -576,6 +655,215 @@ class RemodexTransportClient(
             || message.contains("sourcekinds")
             || message.contains("cursor")
             || message.contains("limit")
+    }
+
+    private fun shouldRetryCollaborationModeListWithoutParams(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600 && rpcError.code != -32602) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        return message.contains("params")
+            || message.contains("missing field")
+            || message.contains("invalid")
+    }
+
+    private suspend fun sendRequestWithApprovalPolicyFallback(
+        method: String,
+        baseParams: Map<String, JsonValue>,
+        accessMode: CodexAccessMode,
+    ): RpcMessage {
+        var lastError: Throwable? = null
+
+        for ((index, policy) in accessMode.approvalPolicyCandidates.withIndex()) {
+            val params = baseParams + ("approvalPolicy" to JsonPrimitive(policy))
+            try {
+                return sendRequest(method = method, params = JsonObject(params))
+            } catch (throwable: Throwable) {
+                lastError = throwable
+                val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+                val hasMorePolicies = index < accessMode.approvalPolicyCandidates.lastIndex
+                if (hasMorePolicies && shouldRetryWithApprovalPolicyFallback(classified)) {
+                    continue
+                }
+                throw classified
+            }
+        }
+
+        throw (lastError as? RemodexTransportException ?: classifyThrowable(lastError ?: IllegalStateException()))
+    }
+
+    private suspend fun sendRequestWithSandboxFallback(
+        method: String,
+        baseParams: Map<String, JsonValue>,
+        accessMode: CodexAccessMode,
+    ): RpcMessage {
+        val primaryParams = baseParams + ("sandboxPolicy" to runtimeSandboxPolicyObject(accessMode))
+        try {
+            return sendRequestWithApprovalPolicyFallback(
+                method = method,
+                baseParams = primaryParams,
+                accessMode = accessMode,
+            )
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldFallbackFromSandboxPolicy(classified)) {
+                throw classified
+            }
+        }
+
+        val legacyParams = baseParams + ("sandbox" to JsonPrimitive(accessMode.sandboxLegacyValue))
+        try {
+            return sendRequestWithApprovalPolicyFallback(
+                method = method,
+                baseParams = legacyParams,
+                accessMode = accessMode,
+            )
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldFallbackFromSandboxPolicy(classified)) {
+                throw classified
+            }
+        }
+
+        return sendRequestWithApprovalPolicyFallback(
+            method = method,
+            baseParams = baseParams,
+            accessMode = accessMode,
+        )
+    }
+
+    private fun runtimeSandboxPolicyObject(accessMode: CodexAccessMode): JsonValue {
+        return when (accessMode) {
+            CodexAccessMode.OnRequest -> JsonObject(
+                mapOf(
+                    "type" to JsonPrimitive("workspaceWrite"),
+                    "networkAccess" to JsonPrimitive(true),
+                ),
+            )
+
+            CodexAccessMode.FullAccess -> JsonObject(
+                mapOf(
+                    "type" to JsonPrimitive("dangerFullAccess"),
+                ),
+            )
+        }
+    }
+
+    private fun shouldRetryWithApprovalPolicyFallback(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600 && rpcError.code != -32602) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        return message.contains("approval")
+            || message.contains("unknown variant")
+            || message.contains("expected one of")
+            || message.contains("onrequest")
+            || message.contains("on-request")
+    }
+
+    private fun shouldFallbackFromSandboxPolicy(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600 && rpcError.code != -32602) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        if (message.contains("thread not found") || message.contains("unknown thread")) {
+            return false
+        }
+
+        return message.contains("invalid params")
+            || message.contains("invalid param")
+            || message.contains("unknown field")
+            || message.contains("unexpected field")
+            || message.contains("unrecognized field")
+            || message.contains("failed to parse")
+            || message.contains("unsupported")
+    }
+
+    private fun buildTurnStartRequestParams(
+        threadId: String,
+        userInput: String,
+        collaborationMode: CodexCollaborationModeKind?,
+    ): Map<String, JsonValue> {
+        val params = mutableMapOf<String, JsonValue>(
+            "threadId" to JsonPrimitive(threadId),
+            "input" to JsonArray(
+                listOf(
+                    JsonObject(
+                        mapOf(
+                            "type" to JsonPrimitive("text"),
+                            "text" to JsonPrimitive(userInput),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        buildCollaborationModePayload(collaborationMode)?.let { payload ->
+            params["collaborationMode"] = payload
+        }
+
+        return params
+    }
+
+    private fun buildCollaborationModePayload(
+        collaborationMode: CodexCollaborationModeKind?,
+    ): JsonValue? {
+        return when (collaborationMode) {
+            null,
+            CodexCollaborationModeKind.Default -> null
+
+            CodexCollaborationModeKind.Plan -> JsonObject(
+                mapOf(
+                    "mode" to JsonPrimitive("plan"),
+                ),
+            )
+        }
+    }
+
+    private fun shouldRetryTurnStartWithoutCollaborationMode(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        val message = rpcError.message.lowercase()
+        if (!message.contains("collaborationmode") && !message.contains("collaboration_mode")) {
+            return false
+        }
+
+        return message.contains("experimentalapi")
+            || message.contains("unsupported")
+            || message.contains("unknown")
+            || message.contains("unexpected")
+            || message.contains("unrecognized")
+            || message.contains("invalid")
+            || message.contains("field")
+            || message.contains("mode")
+    }
+
+    private fun extractTurnId(result: JsonValue?): String? {
+        val resultObject = result as? JsonObject ?: return null
+        return listOf("turnId", "turn_id")
+            .mapNotNull { key -> resultObject[key].stringValueOrNull() }
+            .firstOrNull()
     }
 
     private suspend fun sendMessage(message: RpcMessage) {

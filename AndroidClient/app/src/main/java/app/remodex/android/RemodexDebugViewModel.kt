@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexThread
+import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
@@ -31,6 +32,10 @@ data class RemodexDebugUiState(
     val threads: List<CodexThread> = emptyList(),
     val selectedThreadId: String? = null,
     val selectedMessages: List<CodexMessage> = emptyList(),
+    val draftTurnInput: String = "",
+    val isStartingTurn: Boolean = false,
+    val lastStartedTurnId: String? = null,
+    val lastTurnStartSummary: String? = null,
     val isLoadingThreads: Boolean = false,
     val isLoadingThread: Boolean = false,
     val isBusy: Boolean = false,
@@ -85,6 +90,15 @@ class RemodexDebugViewModel : ViewModel() {
         _uiState.update { current ->
             current.copy(
                 qrPayload = value,
+                errorMessage = null,
+            )
+        }
+    }
+
+    fun updateDraftTurnInput(value: String) {
+        _uiState.update { current ->
+            current.copy(
+                draftTurnInput = value,
                 errorMessage = null,
             )
         }
@@ -215,6 +229,63 @@ class RemodexDebugViewModel : ViewModel() {
                 _uiState.update { current ->
                     current.copy(
                         isLoadingThread = false,
+                        errorMessage = throwable.message,
+                    )
+                }
+            }
+        }
+    }
+
+    fun startTurn() {
+        viewModelScope.launch {
+            val currentState = _uiState.value
+            val selectedThreadId = currentState.selectedThreadId
+            if (selectedThreadId.isNullOrBlank()) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "Select a thread before sending a turn.")
+                }
+                return@launch
+            }
+
+            val trimmedInput = currentState.draftTurnInput.trim()
+            if (trimmedInput.isEmpty()) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "Enter a prompt before sending a turn.")
+                }
+                return@launch
+            }
+
+            _uiState.update { current ->
+                current.copy(
+                    isStartingTurn = true,
+                    errorMessage = null,
+                )
+            }
+
+            runCatching {
+                transport.startTurn(
+                    threadId = selectedThreadId,
+                    userInput = trimmedInput,
+                    accessMode = CodexAccessMode.OnRequest,
+                )
+            }.onSuccess { result ->
+                _uiState.update { current ->
+                    current.copy(
+                        draftTurnInput = "",
+                        isStartingTurn = false,
+                        lastStartedTurnId = result.turnId,
+                        lastTurnStartSummary = if (result.turnId != null) {
+                            "turn/start acknowledged: ${result.turnId}"
+                        } else {
+                            "turn/start acknowledged without immediate turnId"
+                        },
+                        errorMessage = null,
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    current.copy(
+                        isStartingTurn = false,
                         errorMessage = throwable.message,
                     )
                 }
