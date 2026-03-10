@@ -28,7 +28,7 @@ data class RemodexDebugUiState(
 )
 
 class RemodexDebugViewModel : ViewModel() {
-    private val transport = RemodexTransportClient(appVersion = BuildConfig.VERSION_NAME)
+    private val transport = RemodexTransportClient(appVersion = APP_VERSION)
     private val _uiState = MutableStateFlow(RemodexDebugUiState())
     val uiState: StateFlow<RemodexDebugUiState> = _uiState.asStateFlow()
 
@@ -153,4 +153,7 @@ class RemodexDebugViewModel : ViewModel() {
         }
     }
 
+    companion object {
+        private const val APP_VERSION = "0.1.0"
+    }
 }
