@@ -1,6 +1,6 @@
 # Plan: Android Client + Multi-Host Runtime Expansion
 > Status: Living document
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Scope: `remodex` bridge, relay, and new Android client
 
 ## Progress Snapshot
@@ -21,6 +21,7 @@
 - Done: Android diagnostics panel now shows raw RPC payloads, error metadata, and thread-list fallback stages
 - Done: Android `collaborationMode/list` now probes with explicit params for newer Codex CLI builds
 - Done: Android debug shell now exposes a basic `turn/start` composer path with sandbox and approval fallback
+- Done: Android shell layout now mirrors the original Remodex visual structure with sidebar, focused conversation pane, and bottom composer while preserving live debug controls
 - Pending verification: latest `collaborationMode/list` and `turn/start` debug shell changes still need Windows build confirmation
 
 ## Goal
