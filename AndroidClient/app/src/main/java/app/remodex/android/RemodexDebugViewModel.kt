@@ -9,6 +9,7 @@ import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
@@ -42,6 +43,12 @@ data class RemodexDebugUiState(
     val selectedAccessMode: CodexAccessMode = CodexAccessMode.OnRequest,
     val availableCollaborationModes: List<CodexCollaborationModeKind> = listOf(CodexCollaborationModeKind.Default),
     val selectedCollaborationMode: CodexCollaborationModeKind = CodexCollaborationModeKind.Default,
+    val currentGitBranch: String = "",
+    val gitDefaultBranch: String = "",
+    val availableGitBranchTargets: List<String> = emptyList(),
+    val isLoadingGitBranchTargets: Boolean = false,
+    val isSwitchingGitBranch: Boolean = false,
+    val gitRepoSync: GitRepoSyncResult? = null,
     val threads: List<CodexThread> = emptyList(),
     val conversation: RemodexConversationState = RemodexConversationState(),
     val draftTurnInput: String = "",
@@ -70,6 +77,10 @@ data class RemodexDebugUiState(
             ?.map { it.reasoningEffort.trim() }
             ?.filter { it.isNotEmpty() }
             .orEmpty()
+
+    val currentBranchLabel: String?
+        get() = currentGitBranch.trim().takeIf(String::isNotEmpty)
+            ?: gitDefaultBranch.trim().takeIf(String::isNotEmpty)
 }
 
 class RemodexDebugViewModel(
@@ -114,15 +125,25 @@ class RemodexDebugViewModel(
 
         viewModelScope.launch {
             transport.notifications.collect { message ->
+                var refreshGitStatusForActiveThread = false
                 _uiState.update { current ->
+                    val activeThreadId = current.activeThreadId
+                    val wasRunningActiveThread = current.conversation.threadHasActiveOrRunningTurn(activeThreadId)
+                    val updatedConversation = RemodexConversationReducer.reduce(
+                        conversation = current.conversation,
+                        message = message,
+                        knownThreadIds = current.threads.mapTo(linkedSetOf(), CodexThread::id),
+                    )
+                    val isRunningActiveThread = updatedConversation.threadHasActiveOrRunningTurn(activeThreadId)
+                    refreshGitStatusForActiveThread = wasRunningActiveThread && !isRunningActiveThread
+
                     current.copy(
                         lastNotificationMethod = message.method,
-                        conversation = RemodexConversationReducer.reduce(
-                            conversation = current.conversation,
-                            message = message,
-                            knownThreadIds = current.threads.mapTo(linkedSetOf(), CodexThread::id),
-                        ),
+                        conversation = updatedConversation,
                     )
+                }
+                if (refreshGitStatusForActiveThread) {
+                    refreshGitStatus()
                 }
             }
         }
@@ -265,6 +286,12 @@ class RemodexDebugViewModel(
                     isBusy = false,
                     isStartingThread = false,
                     isStartingTurn = false,
+                    currentGitBranch = "",
+                    gitDefaultBranch = "",
+                    availableGitBranchTargets = emptyList(),
+                    isLoadingGitBranchTargets = false,
+                    isSwitchingGitBranch = false,
+                    gitRepoSync = null,
                     threads = emptyList(),
                     conversation = RemodexConversationState(),
                     draftTurnInput = "",
@@ -331,6 +358,158 @@ class RemodexDebugViewModel(
         }
     }
 
+    fun refreshGitBranchTargets(threadId: String? = _uiState.value.activeThreadId) {
+        viewModelScope.launch {
+            val targetThreadId = threadId?.trim()?.takeIf(String::isNotEmpty)
+            val workingDirectory = selectedThreadWorkingDirectory(targetThreadId)
+            if (targetThreadId == null || workingDirectory == null) {
+                _uiState.update { current ->
+                    if (current.activeThreadId == targetThreadId) {
+                        current.withClearedGitBranchState()
+                    } else {
+                        current
+                    }
+                }
+                return@launch
+            }
+
+            _uiState.update { current ->
+                if (current.activeThreadId == targetThreadId) {
+                    current.copy(
+                        isLoadingGitBranchTargets = true,
+                        errorMessage = null,
+                    )
+                } else {
+                    current
+                }
+            }
+
+            runCatching {
+                transport.gitBranchesWithStatus(workingDirectory = workingDirectory)
+            }.onSuccess { result ->
+                _uiState.update { current ->
+                    if (current.activeThreadId != targetThreadId) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        currentGitBranch = result.currentBranch?.trim().orEmpty(),
+                        gitDefaultBranch = result.defaultBranch?.trim().orEmpty(),
+                        availableGitBranchTargets = result.branches
+                            .map(String::trim)
+                            .filter(String::isNotEmpty)
+                            .distinct(),
+                        gitRepoSync = result.status,
+                        isLoadingGitBranchTargets = false,
+                        errorMessage = null,
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    if (current.activeThreadId != targetThreadId) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        isLoadingGitBranchTargets = false,
+                        errorMessage = throwable.message,
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshGitStatus(threadId: String? = _uiState.value.activeThreadId) {
+        viewModelScope.launch {
+            val targetThreadId = threadId?.trim()?.takeIf(String::isNotEmpty) ?: return@launch
+            val workingDirectory = selectedThreadWorkingDirectory(targetThreadId) ?: return@launch
+
+            runCatching {
+                transport.gitStatus(workingDirectory = workingDirectory)
+            }.onSuccess { status ->
+                _uiState.update { current ->
+                    if (current.activeThreadId != targetThreadId) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        gitRepoSync = status,
+                        currentGitBranch = status.currentBranch?.trim().orEmpty()
+                            .ifEmpty { current.currentGitBranch },
+                    )
+                }
+            }
+        }
+    }
+
+    fun switchGitBranch(branch: String) {
+        viewModelScope.launch {
+            val normalizedBranch = branch.trim()
+            if (normalizedBranch.isEmpty()) {
+                return@launch
+            }
+
+            val currentState = _uiState.value
+            val activeThreadId = currentState.activeThreadId
+            if (activeThreadId.isNullOrBlank()) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "Select a thread before switching branches.")
+                }
+                return@launch
+            }
+
+            if (currentState.conversation.threadHasActiveOrRunningTurn(activeThreadId)) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "Wait for the active turn to finish before switching branches.")
+                }
+                return@launch
+            }
+
+            val workingDirectory = selectedThreadWorkingDirectory(activeThreadId)
+            if (workingDirectory == null) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "The selected local folder is not available for git actions.")
+                }
+                return@launch
+            }
+
+            _uiState.update { current ->
+                current.copy(
+                    isSwitchingGitBranch = true,
+                    errorMessage = null,
+                )
+            }
+
+            runCatching {
+                transport.gitCheckout(
+                    workingDirectory = workingDirectory,
+                    branch = normalizedBranch,
+                )
+            }.onSuccess { result ->
+                _uiState.update { current ->
+                    if (current.activeThreadId != activeThreadId) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        currentGitBranch = result.currentBranch.trim(),
+                        gitRepoSync = result.status,
+                        isSwitchingGitBranch = false,
+                        errorMessage = null,
+                    )
+                }
+                refreshGitBranchTargets(activeThreadId)
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    current.copy(
+                        isSwitchingGitBranch = false,
+                        errorMessage = throwable.message,
+                    )
+                }
+            }
+        }
+    }
+
     fun startThread() {
         viewModelScope.launch {
             val preferredProjectPath = _uiState.value.threads
@@ -351,6 +530,7 @@ class RemodexDebugViewModel(
                 )
             }.onSuccess { result ->
                 applyThreadStarted(result)
+                refreshGitBranchTargets(result.thread.id)
             }.onFailure { throwable ->
                 _uiState.update { current ->
                     current.copy(
@@ -627,6 +807,11 @@ class RemodexDebugViewModel(
                     .withActiveThread(threadId)
                     .markThreadAsViewed(threadId)
                     .withThreadLoading(threadId, isLoading = shouldLoadThreadHistory(current, threadId, forceHydration)),
+                currentGitBranch = "",
+                gitDefaultBranch = "",
+                availableGitBranchTargets = emptyList(),
+                gitRepoSync = null,
+                isLoadingGitBranchTargets = selectedThreadWorkingDirectory(threadId, current.threads) != null,
                 errorMessage = null,
             )
         }
@@ -636,6 +821,7 @@ class RemodexDebugViewModel(
             _uiState.update { current ->
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                    isLoadingGitBranchTargets = false,
                 )
             }
             return
@@ -657,6 +843,7 @@ class RemodexDebugViewModel(
             _uiState.update { current ->
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                    isLoadingGitBranchTargets = false,
                     errorMessage = throwable.message,
                 )
             }
@@ -664,6 +851,7 @@ class RemodexDebugViewModel(
         }
 
         if (!shouldLoadThreadHistory(_uiState.value, threadId, forceHydration)) {
+            refreshGitBranchTargets(threadId)
             _uiState.update { current ->
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
@@ -676,10 +864,12 @@ class RemodexDebugViewModel(
             transport.readThread(threadId = threadId, includeTurns = true)
         }.onSuccess { threadResult ->
             applyThreadRead(threadResult)
+            refreshGitBranchTargets(threadId)
         }.onFailure { throwable ->
             _uiState.update { current ->
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                    isLoadingGitBranchTargets = false,
                     errorMessage = throwable.message,
                 )
             }
@@ -692,6 +882,24 @@ class RemodexDebugViewModel(
         forceHydration: Boolean,
     ): Boolean {
         return forceHydration || !state.conversation.isHydratedThread(threadId)
+    }
+
+    private fun selectedThreadWorkingDirectory(threadId: String?): String? {
+        return selectedThreadWorkingDirectory(
+            threadId = threadId,
+            threads = _uiState.value.threads,
+        )
+    }
+
+    private fun selectedThreadWorkingDirectory(
+        threadId: String?,
+        threads: List<CodexThread>,
+    ): String? {
+        val normalizedThreadId = threadId?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        return threads.firstOrNull { it.id == normalizedThreadId }
+            ?.cwd
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
     }
 
     private fun normalizeRuntimeSelection(state: RemodexDebugUiState): RemodexDebugUiState {
@@ -844,6 +1052,17 @@ private fun CodexModelOption.displayTitle(): String {
         "gpt-5.1-codex-mini" -> "GPT-5.1-Codex-Mini"
         else -> displayName.ifBlank { model.ifBlank { id } }
     }
+}
+
+private fun RemodexDebugUiState.withClearedGitBranchState(): RemodexDebugUiState {
+    return copy(
+        currentGitBranch = "",
+        gitDefaultBranch = "",
+        availableGitBranchTargets = emptyList(),
+        isLoadingGitBranchTargets = false,
+        isSwitchingGitBranch = false,
+        gitRepoSync = null,
+    )
 }
 
 fun reasoningTitle(effort: String): String {

@@ -90,10 +90,7 @@ import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
-import app.remodex.android.core.protocol.arrayValue
-import app.remodex.android.core.protocol.intValue
-import app.remodex.android.core.protocol.objectValue
-import app.remodex.android.core.protocol.stringValue
+import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportState
 import java.time.Instant
@@ -101,7 +98,6 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.JsonObject
 
 private val RemodexColorScheme = lightColorScheme(
     background = Color(0xFFF4F3F0),
@@ -135,8 +131,6 @@ fun RemodexAndroidRoot() {
     var showDeveloperPanels by rememberSaveable { mutableStateOf(false) }
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
-    val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
-    val branchChoices = remember(selectedThread) { selectedThread?.availableBranchChoices().orEmpty() }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
@@ -187,13 +181,17 @@ fun RemodexAndroidRoot() {
                         },
                         onOpenSettings = { activePanel = SETTINGS_PANEL },
                         onOpenActionMenu = { activePanel = ACTION_MENU_PANEL },
-                        onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
+                        onOpenBranchPicker = {
+                            viewModel.refreshGitBranchTargets()
+                            activePanel = BRANCH_PICKER_PANEL
+                        },
                         onOpenModelPicker = { activePanel = MODEL_PICKER_PANEL },
                         onOpenReasoningPicker = { activePanel = REASONING_PICKER_PANEL },
                         onOpenAccessPicker = { activePanel = ACCESS_PICKER_PANEL },
                         onPromptChange = viewModel::updateDraftTurnInput,
                         onSendPrompt = viewModel::startTurn,
                         onStopTurn = viewModel::interruptTurn,
+                        onRefreshGitBranches = { viewModel.refreshGitBranchTargets() },
                     )
                 } else {
                     OnboardingState(
@@ -217,11 +215,14 @@ fun RemodexAndroidRoot() {
                 ACTION_MENU_PANEL -> ActionMenuSheet(
                     uiState = uiState,
                     showDeveloperPanels = showDeveloperPanels,
-                    branchLabel = gitChrome?.branch,
-                    branchChoices = branchChoices,
+                    branchLabel = uiState.currentBranchLabel,
+                    branchChoices = uiState.availableGitBranchTargets,
                     onDismiss = { activePanel = null },
                     onOpenSettings = { activePanel = SETTINGS_PANEL },
-                    onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
+                    onOpenBranchPicker = {
+                        viewModel.refreshGitBranchTargets()
+                        activePanel = BRANCH_PICKER_PANEL
+                    },
                     onRefreshThreads = {
                         activePanel = null
                         viewModel.refreshThreads()
@@ -241,9 +242,19 @@ fun RemodexAndroidRoot() {
                 )
 
                 BRANCH_PICKER_PANEL -> BranchPickerSheet(
-                    branchLabel = gitChrome?.branch,
-                    branchChoices = branchChoices,
+                    branchLabel = uiState.currentBranchLabel,
+                    defaultBranch = uiState.gitDefaultBranch,
+                    branchChoices = uiState.availableGitBranchTargets,
+                    isLoadingBranches = uiState.isLoadingGitBranchTargets,
+                    canSwitchBranches = selectedThread?.cwd?.isNotBlank() == true &&
+                        !uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id) &&
+                        !uiState.isSwitchingGitBranch,
                     selectedThread = selectedThread,
+                    onRefreshBranches = { viewModel.refreshGitBranchTargets() },
+                    onSelectBranch = { branch ->
+                        viewModel.switchGitBranch(branch)
+                        activePanel = null
+                    },
                     onDismiss = { activePanel = null },
                 )
 
@@ -721,6 +732,7 @@ private fun MainConversationPane(
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
+    onRefreshGitBranches: () -> Unit,
 ) {
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val selectedThreadRevision = uiState.conversation.messageRevisionFor(selectedThread?.id)
@@ -730,7 +742,6 @@ private fun MainConversationPane(
     }
     val isLoadingSelectedThread = uiState.conversation.isLoadingThread(selectedThread?.id)
     val isRunningSelectedThread = uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id)
-    val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
 
     Column(
         modifier = Modifier
@@ -751,7 +762,7 @@ private fun MainConversationPane(
                 ConversationTopBar(
                     selectedThread = selectedThread,
                     connectionState = uiState.connectionState,
-                    gitChrome = gitChrome,
+                    gitRepoSync = uiState.gitRepoSync,
                     onToggleDrawer = onToggleDrawer,
                     onOpenActionMenu = onOpenActionMenu,
                 )
@@ -793,7 +804,7 @@ private fun MainConversationPane(
                             modelLabel = uiState.selectedModelLabel,
                             reasoningLabel = uiState.selectedReasoningLabel,
                             accessLabel = uiState.selectedAccessMode.displayName,
-                            branchLabel = gitChrome?.branch,
+                            branchLabel = uiState.currentBranchLabel,
                             onOpenSettings = onOpenSettings,
                             onOpenBranchPicker = onOpenBranchPicker,
                             onOpenActionMenu = onOpenActionMenu,
@@ -803,6 +814,11 @@ private fun MainConversationPane(
                             onPromptChange = onPromptChange,
                             onSendPrompt = onSendPrompt,
                             onStopTurn = onStopTurn,
+                            onRefreshGitBranches = onRefreshGitBranches,
+                            branchChoices = uiState.availableGitBranchTargets,
+                            isLoadingBranches = uiState.isLoadingGitBranchTargets,
+                            isSwitchingBranches = uiState.isSwitchingGitBranch,
+                            isBranchSelectionEnabled = selectedThread?.cwd?.isNotBlank() == true && !isRunningSelectedThread,
                         )
                     }
                 }
@@ -815,7 +831,7 @@ private fun MainConversationPane(
 private fun ConversationTopBar(
     selectedThread: CodexThread?,
     connectionState: RemodexTransportState,
-    gitChrome: ThreadGitChrome?,
+    gitRepoSync: GitRepoSyncResult?,
     onToggleDrawer: () -> Unit,
     onOpenActionMenu: () -> Unit,
 ) {
@@ -855,8 +871,8 @@ private fun ConversationTopBar(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        gitChrome?.let { chrome ->
-            ConversationDiffStats(chrome = chrome)
+        gitRepoSync?.let { status ->
+            ConversationDiffStats(status = status)
         }
         Surface(
             shape = CircleShape,
@@ -878,32 +894,29 @@ private fun ConversationTopBar(
 }
 
 @Composable
-private fun ConversationDiffStats(chrome: ThreadGitChrome) {
+private fun ConversationDiffStats(status: GitRepoSyncResult) {
     Column(
         horizontalAlignment = Alignment.End,
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        if (chrome.additions != null || chrome.deletions != null) {
+        val diffTotals = status.repoDiffTotals
+        if (diffTotals != null && diffTotals.hasChanges) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                chrome.additions?.let { additions ->
-                    Text(
-                        text = "+$additions",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color(0xFF49AF63),
-                    )
-                }
-                chrome.deletions?.let { deletions ->
-                    Text(
-                        text = "-$deletions",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color(0xFFD35D5D),
-                    )
-                }
+                Text(
+                    text = "+${diffTotals.additions}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color(0xFF49AF63),
+                )
+                Text(
+                    text = "-${diffTotals.deletions}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color(0xFFD35D5D),
+                )
             }
         }
-        if (chrome.aheadCount > 0 || chrome.behindCount > 0) {
+        if (status.aheadCount > 0 || status.behindCount > 0) {
             Text(
-                text = "↑${chrome.aheadCount} ↓${chrome.behindCount}",
+                text = "↑${status.aheadCount} ↓${status.behindCount}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1442,12 +1455,18 @@ private fun ActionMenuSheet(
                 title = "Workspace",
                 rows = listOf(
                     MenuRowModel(
-                        title = branchLabel ?: "No branch",
+                        title = when {
+                            uiState.isSwitchingGitBranch -> "Switching..."
+                            uiState.isLoadingGitBranchTargets -> "Reloading branches..."
+                            !branchLabel.isNullOrBlank() -> branchLabel
+                            else -> "Branch"
+                        },
                         subtitle = when {
-                            branchChoices.isEmpty() -> "Current branch preview"
+                            uiState.isLoadingGitBranchTargets -> "Refreshing local branch state from the paired host"
+                            branchChoices.isEmpty() -> "Inspect local branch state and reload branch targets"
                             else -> "Browse ${branchChoices.size} known branch target(s)"
                         },
-                        onClick = if (branchChoices.isNotEmpty()) onOpenBranchPicker else null,
+                        onClick = onOpenBranchPicker,
                     ),
                 ),
             )
@@ -1488,10 +1507,17 @@ private fun ActionMenuSheet(
 @Composable
 private fun BranchPickerSheet(
     branchLabel: String?,
+    defaultBranch: String,
     branchChoices: List<String>,
+    isLoadingBranches: Boolean,
+    canSwitchBranches: Boolean,
     selectedThread: CodexThread?,
+    onRefreshBranches: () -> Unit,
+    onSelectBranch: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val normalizedDefaultBranch = defaultBranch.trim().takeIf(String::isNotEmpty)
+    val normalizedCurrentBranch = branchLabel?.trim()?.takeIf(String::isNotEmpty)
     SheetDialog(
         onDismiss = onDismiss,
         topPadding = 120.dp,
@@ -1510,9 +1536,19 @@ private fun BranchPickerSheet(
             SettingsSection(title = "Current Repository") {
                 GroupedRowsCard {
                     GroupedRow(
-                        label = branchLabel ?: "No branch detected",
+                        label = normalizedCurrentBranch ?: normalizedDefaultBranch ?: "Branch unavailable",
                         value = selectedThread?.projectDisplayName ?: "No project",
-                        supporting = selectedThread?.cwd ?: "Select a local conversation to inspect branch metadata.",
+                        supporting = selectedThread?.cwd ?: "Select a local conversation to inspect git state.",
+                    )
+                }
+            }
+            SettingsSection(title = "Bridge") {
+                GroupedRowsCard {
+                    GroupedRow(
+                        label = if (isLoadingBranches) "Reloading branch list" else "Reload branch list",
+                        value = if (isLoadingBranches) "Working" else "Refresh",
+                        supporting = "Reads git/branchesWithStatus from the paired host using the selected thread cwd.",
+                        onClick = if (isLoadingBranches) null else onRefreshBranches,
                     )
                 }
             }
@@ -1525,11 +1561,21 @@ private fun BranchPickerSheet(
                             }
                             GroupedRow(
                                 label = branch,
-                                value = if (branch == branchLabel) "Current" else "Read-only",
-                                supporting = if (branch == branchLabel) {
-                                    "This is the branch currently reported for the selected local thread."
+                                value = when {
+                                    branch == normalizedCurrentBranch -> "Current"
+                                    branch == normalizedDefaultBranch -> "Default"
+                                    else -> if (canSwitchBranches) "Switch" else "Unavailable"
+                                },
+                                supporting = when {
+                                    branch == normalizedCurrentBranch -> "This is the branch currently checked out for the selected local thread."
+                                    branch == normalizedDefaultBranch -> "This is the default branch reported by the host."
+                                    canSwitchBranches -> "Switch the selected local repository to this branch."
+                                    else -> "Branch switching is disabled while a turn is running or the local repo is unavailable."
+                                },
+                                onClick = if (canSwitchBranches && branch != normalizedCurrentBranch) {
+                                    { onSelectBranch(branch) }
                                 } else {
-                                    "Branch switching stays disabled until git actions are fully wired."
+                                    null
                                 },
                             )
                         }
@@ -1541,7 +1587,11 @@ private fun BranchPickerSheet(
                     color = Color(0xFFF2F0EC),
                 ) {
                     Text(
-                        text = "Branch metadata is available, but the current runtime has not reported any branch choices for this thread yet.",
+                        text = if (isLoadingBranches) {
+                            "Loading branch state from the paired host..."
+                        } else {
+                            "No branch targets have been reported for this local repository yet. Try reloading the branch list."
+                        },
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1959,7 +2009,19 @@ private fun ComposerArea(
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
+    onRefreshGitBranches: () -> Unit,
+    branchChoices: List<String>,
+    isLoadingBranches: Boolean,
+    isSwitchingBranches: Boolean,
+    isBranchSelectionEnabled: Boolean,
 ) {
+    val displayedBranchLabel = when {
+        isSwitchingBranches -> "Switching..."
+        isLoadingBranches -> "Reloading..."
+        !branchLabel.isNullOrBlank() -> branchLabel
+        branchChoices.isNotEmpty() -> "Branch"
+        else -> "No branch"
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -2051,8 +2113,14 @@ private fun ComposerArea(
             RuntimePill(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Outlined.FolderOpen,
-                label = branchLabel ?: "No branch",
-                onClick = onOpenBranchPicker,
+                label = displayedBranchLabel,
+                onClick = {
+                    if (!isBranchSelectionEnabled && branchChoices.isEmpty()) {
+                        onRefreshGitBranches()
+                    } else {
+                        onOpenBranchPicker()
+                    }
+                },
             )
         }
     }
@@ -2434,59 +2502,6 @@ private fun messageKindLabel(kind: CodexMessageKind): String {
     }
 }
 
-private data class ThreadGitChrome(
-    val branch: String? = null,
-    val additions: Int? = null,
-    val deletions: Int? = null,
-    val aheadCount: Int = 0,
-    val behindCount: Int = 0,
-)
-
-private fun CodexThread.gitChrome(): ThreadGitChrome? {
-    val metadataObject = metadata?.let(::JsonObject) ?: return null
-    val statusObject = metadataObject.findObject("status", "gitStatus", "repoStatus")
-    val diffObject = statusObject?.findObject("repoDiffTotals", "diff")
-        ?: metadataObject.findObject("repoDiffTotals", "diff")
-
-    val branch = statusObject?.findString("currentBranch", "branch", "current")
-        ?: metadataObject.findString("currentBranch", "branch", "current")
-    val additions = diffObject?.findInt("additions")
-    val deletions = diffObject?.findInt("deletions")
-    val aheadCount = statusObject?.findInt("ahead", "aheadCount")
-        ?: metadataObject.findInt("ahead", "aheadCount")
-        ?: 0
-    val behindCount = statusObject?.findInt("behind", "behindCount")
-        ?: metadataObject.findInt("behind", "behindCount")
-        ?: 0
-
-    if (branch == null && additions == null && deletions == null && aheadCount == 0 && behindCount == 0) {
-        return null
-    }
-
-    return ThreadGitChrome(
-        branch = branch,
-        additions = additions,
-        deletions = deletions,
-        aheadCount = aheadCount,
-        behindCount = behindCount,
-    )
-}
-
-private fun CodexThread.availableBranchChoices(): List<String> {
-    val metadataObject = metadata?.let(::JsonObject) ?: return emptyList()
-    val statusObject = metadataObject.findObject("status", "gitStatus", "repoStatus")
-    val candidateArrays = listOfNotNull(
-        metadataObject.findStringArray("branches", "availableBranches", "gitBranches", "branchTargets"),
-        statusObject?.findStringArray("branches", "availableBranches", "gitBranches", "branchTargets"),
-    )
-
-    return candidateArrays
-        .flatten()
-        .map(String::trim)
-        .filter(String::isNotEmpty)
-        .distinct()
-}
-
 private fun assistantKindTone(kind: CodexMessageKind): Color {
     return when (kind) {
         CodexMessageKind.Thinking -> Color(0xFFF1F3FA)
@@ -2503,24 +2518,6 @@ private fun formatMessageTimestamp(createdAt: Instant?): String? {
         return null
     }
     return MESSAGE_TIME_FORMATTER.format(createdAt.atZone(ZoneId.systemDefault()))
-}
-
-private fun JsonObject.findString(vararg keys: String): String? {
-    return keys.firstNotNullOfOrNull { key -> this[key]?.stringValue?.takeIf(String::isNotBlank) }
-}
-
-private fun JsonObject.findInt(vararg keys: String): Int? {
-    return keys.firstNotNullOfOrNull { key -> this[key]?.intValue }
-}
-
-private fun JsonObject.findObject(vararg keys: String): JsonObject? {
-    return keys.firstNotNullOfOrNull { key -> this[key]?.objectValue }
-}
-
-private fun JsonObject.findStringArray(vararg keys: String): List<String>? {
-    return keys.firstNotNullOfOrNull { key ->
-        this[key]?.arrayValue?.mapNotNull { element -> element.stringValue?.takeIf(String::isNotBlank) }
-    }
 }
 
 private val MESSAGE_TIME_FORMATTER: DateTimeFormatter =

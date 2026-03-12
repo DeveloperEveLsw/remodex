@@ -87,6 +87,19 @@
 - [ ] Clear badges when thread becomes active.
 - [ ] Keep active thread output in the timeline instead of unread state.
 
+## Runtime Controls And Sheet Binding
+
+- [ ] Bind composer model chip to real runtime state.
+- [ ] Bind composer reasoning chip to real runtime state.
+- [ ] Bind runtime/access pills to real request state instead of static labels.
+- [ ] Show real runtime defaults in settings instead of hardcoded placeholders.
+- [ ] Resolve branch state from the selected thread `cwd` instead of thread metadata.
+- [ ] Add Android `git/branchesWithStatus` parity for current/default/available branches.
+- [ ] Add Android `git/status` refresh parity for current branch and diff state updates.
+- [ ] Make branch picker render real branch choices returned by the host bridge.
+- [ ] Make action menu rows reflect real supported actions or explicit disabled state.
+- [ ] Keep onboarding CTA focused on connection setup / QR pairing flow.
+
 ## Reconnect And Stop Guardrails
 
 - [ ] Recover `activeTurnIdByThread` via `thread/read` when Stop needs it.
@@ -113,5 +126,7 @@
 - [ ] Assistant rows remain stable during streaming and completion.
 - [ ] Unread badges apply only to non-visible threads.
 - [ ] Reconnect does not break active turn visibility or interruptibility.
+- [ ] Visible runtime controls map to real Android state and request parameters.
+- [ ] Branch UI is sourced from host git RPC scoped by thread `cwd`, not from `thread/read` metadata.
 - [ ] Android main conversation screen reads as the same product as the iOS reference.
 - [ ] Android settings, onboarding, pickers, and menus align with the iOS reference set.

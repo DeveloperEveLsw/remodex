@@ -9,6 +9,9 @@ import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.model.GitBranchesWithStatusResult
+import app.remodex.android.core.model.GitCheckoutResult
+import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
@@ -311,6 +314,110 @@ open class RemodexTransportClient(
             ?: return emptyList()
 
         return page.mapNotNull(::decodeModelOption)
+    }
+
+    open suspend fun gitStatus(
+        workingDirectory: String,
+    ): GitRepoSyncResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/status requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/status",
+            params = JsonObject(
+                mapOf("cwd" to JsonPrimitive(normalizedWorkingDirectory)),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/status response missing payload",
+            )
+
+        return decodeGitRepoSyncResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/status returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitBranchesWithStatus(
+        workingDirectory: String,
+    ): GitBranchesWithStatusResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/branchesWithStatus requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/branchesWithStatus",
+            params = JsonObject(
+                mapOf("cwd" to JsonPrimitive(normalizedWorkingDirectory)),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/branchesWithStatus response missing payload",
+            )
+
+        return decodeGitBranchesWithStatusResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/branchesWithStatus returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitCheckout(
+        workingDirectory: String,
+        branch: String,
+    ): GitCheckoutResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        val normalizedBranch = branch.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/checkout requires a non-empty cwd",
+            )
+        }
+        if (normalizedBranch.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/checkout requires a non-empty branch",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/checkout",
+            params = JsonObject(
+                mapOf(
+                    "cwd" to JsonPrimitive(normalizedWorkingDirectory),
+                    "branch" to JsonPrimitive(normalizedBranch),
+                ),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/checkout response missing payload",
+            )
+
+        return decodeGitCheckoutResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/checkout returned an undecodable payload",
+            )
     }
 
     private suspend fun sendThreadListRequest(
@@ -1388,6 +1495,24 @@ open class RemodexTransportClient(
     private fun decodeModelOption(value: JsonValue): CodexModelOption? {
         return runCatching {
             json.decodeFromJsonElement(CodexModelOption.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitRepoSyncResult(value: JsonValue): GitRepoSyncResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitRepoSyncResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitBranchesWithStatusResult(value: JsonValue): GitBranchesWithStatusResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitBranchesWithStatusResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitCheckoutResult(value: JsonValue): GitCheckoutResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitCheckoutResult.serializer(), value)
         }.getOrNull()
     }
 

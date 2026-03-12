@@ -8,6 +8,10 @@ import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexReasoningEffortOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.model.GitBranchesWithStatusResult
+import app.remodex.android.core.model.GitCheckoutResult
+import app.remodex.android.core.model.GitDiffTotals
+import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.transport.RemodexThreadResumeResult
 import app.remodex.android.core.transport.RemodexThreadTurnStateSnapshot
 import app.remodex.android.core.transport.RemodexThreadReadResult
@@ -378,17 +382,96 @@ class RemodexDebugViewModelTests {
         assertEquals("turn-1", messages.single().turnId)
     }
 
+    @Test
+    fun selectThreadLoadsGitBranchStateFromHostBridgeUsingThreadCwd() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusResult = GitBranchesWithStatusResult(
+                branches = listOf("main", "feature/android"),
+                currentBranch = "feature/android",
+                defaultBranch = "main",
+                status = GitRepoSyncResult(
+                    currentBranch = "feature/android",
+                    aheadCount = 2,
+                    repoDiffTotals = GitDiffTotals(additions = 3, deletions = 1),
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals("/tmp/project", transport.lastGitWorkingDirectory)
+        assertEquals("feature/android", state.currentGitBranch)
+        assertEquals("main", state.gitDefaultBranch)
+        assertEquals(listOf("main", "feature/android"), state.availableGitBranchTargets)
+        assertEquals(2, state.gitRepoSync?.aheadCount)
+        assertEquals(listOf("thread/resume", "thread/read", "git/branchesWithStatus"), transport.recordedMethods.takeLast(3))
+    }
+
+    @Test
+    fun switchGitBranchUsesHostCheckoutAndRefreshesCurrentBranch() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusResult = GitBranchesWithStatusResult(
+                branches = listOf("main", "feature/android"),
+                currentBranch = "main",
+                defaultBranch = "main",
+                status = GitRepoSyncResult(currentBranch = "main"),
+            ),
+            gitCheckoutResult = GitCheckoutResult(
+                currentBranch = "feature/android",
+                status = GitRepoSyncResult(
+                    currentBranch = "feature/android",
+                    repoDiffTotals = GitDiffTotals(additions = 1, deletions = 0),
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.switchGitBranch("feature/android")
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals("feature/android", transport.lastCheckedOutBranch)
+        assertEquals("feature/android", state.currentGitBranch)
+        assertEquals(listOf("git/checkout", "git/branchesWithStatus"), transport.recordedMethods.takeLast(2))
+    }
+
     private class FakeTransportClient(
         private val readThreadResults: Map<String, RemodexThreadReadResult> = emptyMap(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
         private val modelOptions: List<CodexModelOption> = emptyList(),
+        private val gitBranchesWithStatusResult: GitBranchesWithStatusResult = GitBranchesWithStatusResult(),
+        private val gitStatusResult: GitRepoSyncResult = GitRepoSyncResult(),
+        private val gitCheckoutResult: GitCheckoutResult? = null,
     ) : RemodexTransportClient(appVersion = "test") {
         var lastPreferredProjectPath: String? = null
         var lastInterruptedTurnId: String? = null
         var lastStartTurnAccessMode: app.remodex.android.core.model.CodexAccessMode? = null
         var lastStartTurnModelIdentifier: String? = null
         var lastStartTurnReasoningEffort: String? = null
+        var lastGitWorkingDirectory: String? = null
+        var lastCheckedOutBranch: String? = null
         val recordedMethods = mutableListOf<String>()
 
         init {
@@ -449,6 +532,35 @@ class RemodexDebugViewModelTests {
         override suspend fun listCollaborationModes(): List<app.remodex.android.core.model.CodexCollaborationModeKind> {
             recordedMethods += "collaborationMode/list"
             return listOf(app.remodex.android.core.model.CodexCollaborationModeKind.Default)
+        }
+
+        override suspend fun gitBranchesWithStatus(
+            workingDirectory: String,
+        ): GitBranchesWithStatusResult {
+            recordedMethods += "git/branchesWithStatus"
+            lastGitWorkingDirectory = workingDirectory
+            return gitBranchesWithStatusResult
+        }
+
+        override suspend fun gitStatus(
+            workingDirectory: String,
+        ): GitRepoSyncResult {
+            recordedMethods += "git/status"
+            lastGitWorkingDirectory = workingDirectory
+            return gitStatusResult
+        }
+
+        override suspend fun gitCheckout(
+            workingDirectory: String,
+            branch: String,
+        ): GitCheckoutResult {
+            recordedMethods += "git/checkout"
+            lastGitWorkingDirectory = workingDirectory
+            lastCheckedOutBranch = branch
+            return gitCheckoutResult ?: GitCheckoutResult(
+                currentBranch = branch,
+                status = gitStatusResult.copy(currentBranch = branch),
+            )
         }
 
         override suspend fun startTurn(

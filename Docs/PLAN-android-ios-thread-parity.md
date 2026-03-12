@@ -5,15 +5,15 @@
 
 ## Progress Snapshot
 
-- In progress: architecture gap confirmed between iOS service-driven timeline state and Android snapshot-driven UI state
-- In progress: Android per-thread conversation store now owns `activeThreadId`, `messagesByThread`, and revision tokens
-- In progress: Android Compose timeline now renders from per-thread conversation state instead of `selectedMessages`
-- In progress: Android incoming notification reducer now handles basic turn and assistant lifecycle events
-- In progress: iOS UI reference set received and should drive the next Android visual pass
-- In progress: Android main conversation screen has been restyled toward the iOS top bar, transcript, and split-composer layout
-- In progress: Android secondary surfaces now follow the iOS grouped-card and lightweight sheet presentation for settings, onboarding, branch, and action menus
-- Pending: reconnect, unread badge, and stop-state parity with iOS guardrails
-- Pending: remaining parity gaps are now primarily behavioral rather than large visual mismatches
+- Completed: Android per-thread conversation store now owns `activeThreadId`, `messagesByThread`, and revision tokens
+- Completed: Android Compose timeline now renders from per-thread conversation state instead of `selectedMessages`
+- Completed: Android incoming notification reducer now handles basic turn and assistant lifecycle events
+- Completed: Android main conversation screen, onboarding landing, settings, action menu, and branch sheet now follow the current iOS visual direction
+- Pending: `prepareThreadForDisplay` parity is still incomplete around viewed-state, `thread/resume`, hydration merge, and reconnect recovery
+- Pending: sidebar unread/running/failed badge semantics are not wired yet
+- Pending: Stop recovery and reconnect guardrails are not wired yet
+- Pending: composer/runtime controls now partially drive real request state, but branch/git surfaces still do not follow the iOS `cwd -> git RPC -> host` flow
+- Pending: remaining parity gaps are now primarily behavioral and state-machine related
 
 ## Goal
 
@@ -45,13 +45,15 @@ Use the local reference set in `/home/lws19/codex_android/remodex/UI ref` togeth
 - Incoming assistant events update per-thread state immediately through `beginAssistantMessage`, `appendAssistantDelta`, and `completeAssistantMessage`.
 - Message mutations bump a thread-local revision token and refresh the active output cache.
 - Unread threads use badge state; the currently viewed thread updates its timeline instead of waiting for a later reload.
+- Branch state does not come from `thread/read` history or thread metadata. iOS resolves the selected thread's `cwd`, then uses `GitActionsService` to call `git/branchesWithStatus`, `git/status`, and `git/checkout` against the host bridge.
 
 ### Android current behavior
 
-- `RemodexDebugViewModel` stores `selectedMessages` inside UI state.
-- `selectThread()` fills `selectedMessages` only from `thread/read(includeTurns=true)`.
-- `transport.notifications` are currently recorded only as `lastNotificationMethod`; they do not mutate timeline state.
-- Compose timeline rendering reads `uiState.selectedMessages`, not a per-thread source of truth.
+- `RemodexDebugViewModel` now keeps thread-local conversation state under `conversation.activeThreadId`, `messagesByThread`, and revision tokens.
+- `transport.notifications` already feed `RemodexConversationReducer` and mutate the per-thread timeline.
+- `selectThread()` sets the active thread immediately, but it still behaves like a thin `thread/read(includeTurns=true)` wrapper instead of full iOS `prepareThreadForDisplay(threadId:)`.
+- `applyThreadRead(...)` still replaces thread history wholesale, so stale hydration can overwrite rows that were already created by live events.
+- composer controls and runtime pills are now partially connected to Android request state, but branch UI still reads like a visual shell because it is not yet backed by the iOS-style git RPC flow.
 
 ## Required End State
 
@@ -251,7 +253,29 @@ Exit criteria:
 - running thread state survives background/foreground transitions
 - the active thread does not silently lose interruptibility
 
-## 7. Verification And Regression Coverage
+## 7. Bind Runtime Controls And Secondary Surfaces
+
+Goal: convert the current visual shells into real runtime controls without regressing the iOS layout work.
+
+Tasks:
+
+- bind composer model and reasoning chips to Android state instead of hardcoded labels
+- surface actual runtime defaults in settings from host/runtime metadata where available
+- wire access/runtime controls so the values shown in composer and settings reflect real request parameters
+- resolve branch state from the selected thread `cwd`, not from thread metadata
+- add Android git service calls equivalent to iOS `git/branchesWithStatus`, `git/status`, and `git/checkout`
+- make the branch sheet/picker render real current/default/available branches returned by the host bridge
+- make the action menu call real actions where the Android transport already supports them, and keep unsupported actions explicitly disabled instead of pretending they work
+- keep onboarding CTA focused on local connection setup and QR pairing rather than a generic empty-state affordance
+
+Exit criteria:
+
+- the visible runtime values in composer, settings, and sheets come from state rather than hardcoded placeholders
+- branch label, branch choices, and branch refresh behavior come from git RPC results scoped by the selected thread `cwd`
+- unsupported actions are visually clear and not misleading
+- the Android UI no longer suggests that model/reasoning/branch controls are interactive when they are not
+
+## 8. Verification And Regression Coverage
 
 Goal: make the port durable.
 
@@ -270,7 +294,7 @@ Exit criteria:
 - the Android port has deterministic coverage for the state machine, not just transport calls
 - regressions in thread visibility or streaming merge behavior are caught without manual QA
 
-## 8. Port Main Conversation UI To iOS Visual Parity
+## 9. Port Main Conversation UI To iOS Visual Parity
 
 Goal: make the Android main conversation screen visually align with the iOS app now that the core state model is converging.
 
@@ -294,7 +318,7 @@ Exit criteria:
 - top bar, timeline, and composer align with the iOS layout hierarchy
 - no major Android-specific visual divergence remains in the primary conversation screen
 
-## 9. Port Menus, Sheets, And Settings To iOS Visual Parity
+## 10. Port Menus, Sheets, And Settings To iOS Visual Parity
 
 Goal: make secondary surfaces feel consistent with the iOS app instead of the current Android shell.
 
@@ -313,21 +337,16 @@ Exit criteria:
 
 ## Suggested Implementation Order
 
-1. Add the conversation store and selectors.
-2. Remove `selectedMessages` from primary UI rendering.
-3. Add assistant lifecycle mutation APIs.
-4. Add notification routing for assistant events.
-5. Port `prepareThreadForDisplay` semantics.
-6. Restyle the main conversation screen to the iOS reference.
-7. Add badge and viewed-state rules.
-8. Add stop and reconnect recovery.
-9. Fill in reasoning, plan, structured input, and other non-chat timeline item parity.
-10. Restyle settings, menus, sheets, and onboarding to the iOS reference.
-11. Expand tests until the state machine and visual behavior are covered.
+1. Finish `prepareThreadForDisplay` semantics and merge-safe hydration.
+2. Add badge and viewed-state rules.
+3. Add stop and reconnect recovery.
+4. Bind runtime controls and secondary sheets to real state/actions, including iOS-style git branch sourcing via `cwd`.
+5. Fill in reasoning, plan, structured input, and other non-chat timeline item parity.
+6. Expand tests until the state machine and visual behavior are covered.
 
 ## Deferred Until Core Parity Lands
 
-- visual polish beyond what is needed to support the new architecture
+- visual polish beyond what is needed to support the new architecture or unblock misleading placeholder controls
 - secondary timeline item types that are not required for immediate assistant streaming parity
 - broad module reshuffles unrelated to conversation state
 
@@ -340,6 +359,7 @@ This plan is complete only when all of the following are true:
 - Android preserves item-scoped assistant streaming and completion behavior.
 - Android preserves unread badge semantics for non-visible threads.
 - Android can recover active turn state after reconnect and still support Stop.
+- Android no longer ships misleading placeholder runtime controls; visible composer/settings values map to real state and requests, and branch UI is sourced from host git RPC rather than thread metadata.
 - Android main conversation UI, settings, onboarding, and lightweight sheets match the iOS reference set closely enough that they read as the same product.
 - Automated tests cover the main state transitions and merge edge cases.
 
