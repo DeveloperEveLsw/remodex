@@ -57,10 +57,10 @@ class RemodexDebugViewModelTests {
         advanceUntilIdle()
 
         val state = viewModel.uiState.value
-        assertEquals("thread-new", state.selectedThreadId)
+        assertEquals("thread-new", state.activeThreadId)
         assertEquals("thread-new", state.threads.first().id)
         assertEquals("New live thread ready: thread-n", state.lastTurnStartSummary)
-        assertTrue(state.selectedMessages.isEmpty())
+        assertTrue(state.conversation.messagesFor(state.activeThreadId).isEmpty())
     }
 
     @Test
@@ -110,17 +110,60 @@ class RemodexDebugViewModelTests {
         advanceUntilIdle()
 
         val state = viewModel.uiState.value
-        assertEquals("thread-new", state.selectedThreadId)
+        assertEquals("thread-new", state.activeThreadId)
         assertEquals("", state.draftTurnInput)
         assertEquals(
             "Continued on a new live thread after `thread-old` became stale.",
             state.lastTurnStartSummary,
         )
-        assertTrue(state.selectedMessages.isEmpty())
+        assertTrue(state.conversation.messagesFor(state.activeThreadId).isEmpty())
 
         val archivedThread = state.threads.first { it.id == "thread-old" }
         assertEquals(CodexThreadSyncState.ArchivedLocal, archivedThread.syncState)
         assertEquals("/tmp/project", transport.lastPreferredProjectPath)
+    }
+
+    @Test
+    fun selectThreadStoresHistoryInPerThreadConversationState() = runTest {
+        val thread = CodexThread(
+            id = "thread-history",
+            title = "History",
+            cwd = "/tmp/project",
+        )
+        val historyMessages = listOf(
+            CodexMessage(
+                id = "msg-1",
+                threadId = thread.id,
+                role = CodexMessageRole.User,
+                kind = CodexMessageKind.Chat,
+                text = "Prompt",
+            ),
+            CodexMessage(
+                id = "msg-2",
+                threadId = thread.id,
+                role = CodexMessageRole.Assistant,
+                kind = CodexMessageKind.Chat,
+                text = "Reply",
+            ),
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    messages = historyMessages,
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals(thread.id, state.activeThreadId)
+        assertEquals(historyMessages, state.conversation.messagesFor(thread.id))
+        assertTrue(!state.conversation.isLoadingThread(thread.id))
+        assertTrue(state.conversation.messageRevisionFor(thread.id) > 0)
     }
 
     private class FakeTransportClient(

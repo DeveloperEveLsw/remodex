@@ -1,7 +1,9 @@
 package app.remodex.android
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,22 +14,29 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DataObject
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Lan
 import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.Refresh
@@ -62,10 +71,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.remodex.android.core.model.CodexHostInfo
@@ -74,21 +83,29 @@ import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.protocol.intValue
+import app.remodex.android.core.protocol.objectValue
+import app.remodex.android.core.protocol.stringValue
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportState
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
 
 private val RemodexColorScheme = lightColorScheme(
-    background = Color(0xFFF1EFEB),
-    surface = Color(0xFFF6F4F0),
-    surfaceVariant = Color(0xFFE5E0D8),
-    onBackground = Color(0xFF151515),
-    onSurface = Color(0xFF111111),
-    onSurfaceVariant = Color(0xFF6E685E),
-    primary = Color(0xFF6961D8),
+    background = Color(0xFFF4F3F0),
+    surface = Color(0xFFFFFEFC),
+    surfaceVariant = Color(0xFFF5F3EF),
+    onBackground = Color(0xFF141414),
+    onSurface = Color(0xFF161616),
+    onSurfaceVariant = Color(0xFF8C887F),
+    primary = Color(0xFF57ACFF),
     onPrimary = Color(0xFFFFFFFF),
-    outline = Color(0xFFD7D0C7),
-    error = Color(0xFFC94D3F),
+    outline = Color(0xFFE6E2DB),
+    error = Color(0xFFD86358),
     onError = Color(0xFFFFFFFF),
 )
 
@@ -102,42 +119,13 @@ fun RemodexAndroidRoot() {
     val scope = rememberCoroutineScope()
     var showDeveloperPanels by rememberSaveable { mutableStateOf(false) }
 
-    MaterialTheme(
-        colorScheme = RemodexColorScheme,
-        typography = MaterialTheme.typography.copy(
-            headlineMedium = MaterialTheme.typography.headlineMedium.copy(
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-            ),
-            titleLarge = MaterialTheme.typography.titleLarge.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-            titleMedium = MaterialTheme.typography.titleMedium.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-            bodyLarge = MaterialTheme.typography.bodyLarge.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-            bodyMedium = MaterialTheme.typography.bodyMedium.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-            bodySmall = MaterialTheme.typography.bodySmall.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-            labelLarge = MaterialTheme.typography.labelLarge.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-            labelMedium = MaterialTheme.typography.labelMedium.copy(
-                fontFamily = FontFamily.Monospace,
-            ),
-        ),
-    ) {
+    MaterialTheme(colorScheme = RemodexColorScheme) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     brush = Brush.verticalGradient(
-                        colors = listOf(Color(0xFFF2F0EC), Color(0xFFE9E4DB)),
+                        colors = listOf(Color(0xFFF8F7F4), Color(0xFFEDEAE4)),
                     ),
                 ),
         ) {
@@ -262,7 +250,7 @@ private fun SidebarDrawer(
                     items(items = threads.take(8), key = { it.id }) { thread ->
                         ThreadDrawerRow(
                             thread = thread,
-                            isSelected = thread.id == uiState.selectedThreadId,
+                            isSelected = thread.id == uiState.activeThreadId,
                             onClick = { onSelectThread(thread.id) },
                         )
                     }
@@ -568,20 +556,27 @@ private fun MainConversationPane(
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
 ) {
-    val selectedThread = uiState.threads.firstOrNull { it.id == uiState.selectedThreadId }
+    val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
+    val selectedThreadRevision = uiState.conversation.messageRevisionFor(selectedThread?.id)
+    val selectedMessages = remember(selectedThread?.id, selectedThreadRevision) {
+        uiState.conversation.messagesFor(selectedThread?.id)
+            .sortedBy(CodexMessage::orderIndex)
+    }
+    val isLoadingSelectedThread = uiState.conversation.isLoadingThread(selectedThread?.id)
+    val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .padding(12.dp),
+            .padding(horizontal = 8.dp, vertical = 6.dp),
     ) {
         Surface(
             modifier = Modifier.fillMaxSize(),
-            shape = RoundedCornerShape(34.dp),
-            color = Color(0xF7FFFEFB),
-            shadowElevation = 16.dp,
+            shape = RoundedCornerShape(30.dp),
+            color = Color(0xFCFFFEFC),
+            shadowElevation = 6.dp,
         ) {
             Column(
                 modifier = Modifier.fillMaxSize(),
@@ -589,10 +584,11 @@ private fun MainConversationPane(
                 ConversationTopBar(
                     selectedThread = selectedThread,
                     connectionState = uiState.connectionState,
+                    gitChrome = gitChrome,
                     onToggleDrawer = onToggleDrawer,
                     onToggleDeveloperPanels = onToggleDeveloperPanels,
                 )
-                Divider(color = Color(0xFFDCD6CD))
+                Divider(color = Color(0xFFE7E3DD))
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -601,15 +597,14 @@ private fun MainConversationPane(
                     Column(
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        SelectedThreadSummary(
-                            selectedThread = selectedThread,
+                        ConversationStatusStrip(
                             hostInfo = uiState.hostInfo,
                             errorMessage = uiState.errorMessage,
                         )
                         ConversationTimeline(
                             selectedThread = selectedThread,
-                            messages = uiState.selectedMessages,
-                            isLoadingThread = uiState.isLoadingThread,
+                            messages = selectedMessages,
+                            isLoadingThread = isLoadingSelectedThread,
                             modifier = Modifier.weight(1f),
                         )
                         AnimatedVisibility(visible = showDeveloperPanels) {
@@ -621,9 +616,8 @@ private fun MainConversationPane(
                         ComposerArea(
                             prompt = uiState.draftTurnInput,
                             isSending = uiState.isStartingTurn || uiState.isStartingThread,
-                            selectedThreadId = uiState.selectedThreadId,
-                            lastStartedTurnId = uiState.lastStartedTurnId,
-                            lastTurnStartSummary = uiState.lastTurnStartSummary,
+                            selectedThreadId = uiState.activeThreadId,
+                            branchLabel = gitChrome?.branch,
                             onPromptChange = onPromptChange,
                             onSendPrompt = onSendPrompt,
                         )
@@ -638,19 +632,21 @@ private fun MainConversationPane(
 private fun ConversationTopBar(
     selectedThread: CodexThread?,
     connectionState: RemodexTransportState,
+    gitChrome: ThreadGitChrome?,
     onToggleDrawer: () -> Unit,
     onToggleDeveloperPanels: () -> Unit,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 16.dp),
+            .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Surface(
             shape = CircleShape,
-            color = Color(0xFFF0EDE8),
+            color = Color(0xFFF4F2EE),
+            border = BorderStroke(1.dp, Color(0xFFE7E3DC)),
         ) {
             IconButton(onClick = onToggleDrawer) {
                 Icon(
@@ -663,21 +659,26 @@ private fun ConversationTopBar(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = selectedThread?.displayTitle ?: "Remodex",
-                style = MaterialTheme.typography.titleLarge,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = selectedThread?.projectDisplayName ?: "Choose a conversation from the sidebar",
+                text = selectedThread?.cwd ?: "Choose a conversation from the sidebar",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        gitChrome?.let { chrome ->
+            ConversationDiffStats(chrome = chrome)
+        }
         Surface(
             shape = CircleShape,
-            color = Color(0xFFF0EDE8),
+            color = Color(0xFFF4F2EE),
+            border = BorderStroke(1.dp, Color(0xFFE7E3DC)),
         ) {
             IconButton(onClick = onToggleDeveloperPanels) {
                 Icon(
@@ -694,50 +695,65 @@ private fun ConversationTopBar(
 }
 
 @Composable
-private fun SelectedThreadSummary(
-    selectedThread: CodexThread?,
+private fun ConversationDiffStats(chrome: ThreadGitChrome) {
+    Column(
+        horizontalAlignment = Alignment.End,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        if (chrome.additions != null || chrome.deletions != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                chrome.additions?.let { additions ->
+                    Text(
+                        text = "+$additions",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFF49AF63),
+                    )
+                }
+                chrome.deletions?.let { deletions ->
+                    Text(
+                        text = "-$deletions",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFD35D5D),
+                    )
+                }
+            }
+        }
+        if (chrome.aheadCount > 0 || chrome.behindCount > 0) {
+            Text(
+                text = "↑${chrome.aheadCount} ↓${chrome.behindCount}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConversationStatusStrip(
     hostInfo: CodexHostInfo?,
     errorMessage: String?,
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 22.dp, vertical = 14.dp),
+            .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.Circle,
-                contentDescription = null,
-                tint = if (errorMessage == null) Color(0xFF5F9961) else MaterialTheme.colorScheme.error,
-                modifier = Modifier.width(10.dp),
+        hostInfo?.let {
+            InlineInfoBadge(
+                icon = Icons.Outlined.Circle,
+                label = "${it.displayName} linked",
+                iconTint = Color(0xFF5BA86A),
             )
-            Text(
-                text = hostInfo?.let { "${it.displayName} host linked" } ?: "Host not linked yet",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            selectedThread?.cwd?.let { cwd ->
-                Text(
-                    text = cwd,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
         }
         if (errorMessage != null) {
             Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = Color(0xFFF7E9E6),
+                shape = RoundedCornerShape(14.dp),
+                color = Color(0xFFFFF1EF),
             ) {
                 Text(
                     text = errorMessage,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -780,11 +796,11 @@ private fun ConversationTimeline(
 
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 22.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(22.dp),
         ) {
-            items(messages.takeLast(18), key = { it.id }) { message ->
-                MessageBubble(message = message)
+            items(messages, key = { it.id }) { message ->
+                TranscriptMessage(message = message)
             }
         }
     }
@@ -806,14 +822,14 @@ private fun EmptyConversationState(title: String, subtitle: String) {
             Icon(
                 imageVector = Icons.Outlined.DataObject,
                 contentDescription = null,
-                modifier = Modifier.padding(18.dp),
-                tint = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
         Text(
             text = title,
-            style = MaterialTheme.typography.titleLarge,
+            style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
         )
         Spacer(modifier = Modifier.height(8.dp))
@@ -827,54 +843,18 @@ private fun EmptyConversationState(title: String, subtitle: String) {
 }
 
 @Composable
-private fun MessageBubble(message: CodexMessage) {
+private fun TranscriptMessage(message: CodexMessage) {
     val isUser = message.role == CodexMessageRole.User
-    val bubbleColor = when {
-        isUser -> Color(0xFFE9E5DF)
-        message.kind == CodexMessageKind.FileChange -> Color(0xFFF0EEE8)
-        message.kind == CodexMessageKind.CommandExecution -> Color(0xFFEAE7F8)
-        else -> Color(0xFFF9F7F3)
-    }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (!isUser) {
-            Text(
-                text = messageRoleLabel(message),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-            )
-        }
-        Surface(
-            shape = RoundedCornerShape(
-                topStart = 20.dp,
-                topEnd = 20.dp,
-                bottomEnd = if (isUser) 8.dp else 20.dp,
-                bottomStart = if (isUser) 20.dp else 8.dp,
-            ),
-            color = bubbleColor,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth(0.92f)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (message.kind != CodexMessageKind.Chat) {
-                    Text(
-                        text = messageKindLabel(message.kind),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+        if (isUser) {
+            UserTranscriptBubble(message = message)
+        } else {
+            AssistantTranscriptBlock(message = message)
         }
     }
 }
@@ -919,102 +899,190 @@ private fun ComposerArea(
     prompt: String,
     isSending: Boolean,
     selectedThreadId: String?,
-    lastStartedTurnId: String?,
-    lastTurnStartSummary: String?,
+    branchLabel: String?,
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ComposerMetaPill(
-                    icon = Icons.Outlined.FolderOpen,
-                    label = selectedThreadId?.take(10)?.plus("...") ?: "No thread",
-                )
-                ComposerMetaPill(
-                    icon = Icons.AutoMirrored.Outlined.MenuBook,
-                    label = "Local",
-                )
-            }
-            lastStartedTurnId?.let {
-                Text(
-                    text = "Turn ${it.take(8)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
         Surface(
-            shape = RoundedCornerShape(26.dp),
-            color = Color(0xFFF9F7F3),
-            shadowElevation = 4.dp,
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFFF8F7F4),
+            border = BorderStroke(1.dp, Color(0xFFE8E4DE)),
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                OutlinedTextField(
+                BasicTextField(
                     value = prompt,
                     onValueChange = onPromptChange,
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 3,
-                    placeholder = {
-                        Text("Ask for follow-up changes")
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 56.dp),
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                        lineHeight = 22.sp,
+                    ),
+                    decorationBox = { innerTextField ->
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            if (prompt.isBlank()) {
+                                Text(
+                                    text = "Ask Remodex anything, @ to add files, $ for skills",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                )
+                            }
+                            innerTextField()
+                        }
                     },
-                    shape = RoundedCornerShape(20.dp),
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text(
-                        text = lastTurnStartSummary ?: "GPT-5.4 · High",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
+                    MinimalIconChip(
+                        icon = Icons.Outlined.Add,
+                        contentDescription = "Add attachment or context",
                     )
-                    Button(
-                        onClick = onSendPrompt,
+                    MinimalControlChip(label = "GPT-5.4")
+                    MinimalControlChip(label = "Extra High")
+                    MinimalIconChip(
+                        icon = Icons.Outlined.Code,
+                        contentDescription = "Quick tools",
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    SendActionButton(
                         enabled = selectedThreadId != null && !isSending,
-                        shape = CircleShape,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary,
-                        ),
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Outlined.Send,
-                            contentDescription = null,
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(if (isSending) "Sending..." else "Send")
-                    }
+                        onClick = onSendPrompt,
+                    )
                 }
             }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            RuntimePill(
+                modifier = Modifier.weight(1f),
+                icon = Icons.AutoMirrored.Outlined.MenuBook,
+                label = "Local",
+            )
+            RuntimePill(
+                modifier = Modifier.weight(1f),
+                icon = Icons.Outlined.SettingsEthernet,
+                label = "On-Request",
+            )
+            RuntimePill(
+                modifier = Modifier.weight(1f),
+                icon = Icons.Outlined.FolderOpen,
+                label = branchLabel ?: "No branch",
+            )
         }
     }
 }
 
 @Composable
-private fun ComposerMetaPill(
+private fun MinimalIconChip(
+    icon: ImageVector,
+    contentDescription: String?,
+    onClick: (() -> Unit)? = null,
+) {
+    Surface(
+        shape = CircleShape,
+        color = Color(0xFFF1EFEB),
+        border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .then(
+                    if (onClick != null) {
+                        Modifier.clickable(onClick = onClick)
+                    } else {
+                        Modifier
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                modifier = Modifier.width(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MinimalControlChip(label: String) {
+    Surface(
+        shape = CircleShape,
+        color = Color(0xFFF1EFEB),
+        border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Icon(
+                imageVector = Icons.Outlined.KeyboardArrowDown,
+                contentDescription = null,
+                modifier = Modifier.width(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SendActionButton(
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        shape = CircleShape,
+        color = if (enabled) MaterialTheme.colorScheme.primary else Color(0xFFE3E0DB),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clickable(enabled = enabled, onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.Send,
+                contentDescription = "Send prompt",
+                tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.width(16.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RuntimePill(
+    modifier: Modifier = Modifier,
     icon: ImageVector,
     label: String,
 ) {
     Surface(
-        shape = CircleShape,
-        color = Color(0xFFF0ECE5),
+        modifier = modifier,
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xFFF4F2EE),
+        border = BorderStroke(1.dp, Color(0xFFE6E2DB)),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
@@ -1031,6 +1099,127 @@ private fun ComposerMetaPill(
                 text = label,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun InlineInfoBadge(
+    icon: ImageVector,
+    label: String,
+    iconTint: Color? = null,
+) {
+    val resolvedIconTint = iconTint ?: MaterialTheme.colorScheme.onSurfaceVariant
+    Surface(
+        shape = CircleShape,
+        color = Color(0xFFF5F3EF),
+        border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.width(12.dp),
+                tint = resolvedIconTint,
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun UserTranscriptBubble(message: CodexMessage) {
+    Surface(
+        modifier = Modifier.widthIn(max = 240.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xFFF1F1F1),
+    ) {
+        Text(
+            text = message.text,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+    MessageMetaRow(
+        message = message,
+        leadingIcon = null,
+    )
+}
+
+@Composable
+private fun AssistantTranscriptBlock(message: CodexMessage) {
+    Column(
+        modifier = Modifier.widthIn(max = 340.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (message.kind != CodexMessageKind.Chat) {
+            Surface(
+                shape = CircleShape,
+                color = assistantKindTone(message.kind),
+            ) {
+                Text(
+                    text = messageKindLabel(message.kind),
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Text(
+            text = message.text,
+            style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp),
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        MessageMetaRow(
+            message = message,
+            leadingIcon = Icons.Outlined.ContentCopy,
+        )
+    }
+}
+
+@Composable
+private fun MessageMetaRow(
+    message: CodexMessage,
+    leadingIcon: ImageVector?,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        leadingIcon?.let {
+            Icon(
+                imageVector = it,
+                contentDescription = null,
+                modifier = Modifier.width(13.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.76f),
+            )
+        }
+        formatMessageTimestamp(message.createdAt)?.let { formatted ->
+            Text(
+                text = formatted,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (message.isStreaming) {
+            Text(
+                text = "Streaming",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
     }
@@ -1128,3 +1317,74 @@ private fun messageKindLabel(kind: CodexMessageKind): String {
         CodexMessageKind.UserInputPrompt -> "Approval"
     }
 }
+
+private data class ThreadGitChrome(
+    val branch: String? = null,
+    val additions: Int? = null,
+    val deletions: Int? = null,
+    val aheadCount: Int = 0,
+    val behindCount: Int = 0,
+)
+
+private fun CodexThread.gitChrome(): ThreadGitChrome? {
+    val metadataObject = metadata?.let(::JsonObject) ?: return null
+    val statusObject = metadataObject.findObject("status", "gitStatus", "repoStatus")
+    val diffObject = statusObject?.findObject("repoDiffTotals", "diff")
+        ?: metadataObject.findObject("repoDiffTotals", "diff")
+
+    val branch = statusObject?.findString("currentBranch", "branch", "current")
+        ?: metadataObject.findString("currentBranch", "branch", "current")
+    val additions = diffObject?.findInt("additions")
+    val deletions = diffObject?.findInt("deletions")
+    val aheadCount = statusObject?.findInt("ahead", "aheadCount")
+        ?: metadataObject.findInt("ahead", "aheadCount")
+        ?: 0
+    val behindCount = statusObject?.findInt("behind", "behindCount")
+        ?: metadataObject.findInt("behind", "behindCount")
+        ?: 0
+
+    if (branch == null && additions == null && deletions == null && aheadCount == 0 && behindCount == 0) {
+        return null
+    }
+
+    return ThreadGitChrome(
+        branch = branch,
+        additions = additions,
+        deletions = deletions,
+        aheadCount = aheadCount,
+        behindCount = behindCount,
+    )
+}
+
+private fun assistantKindTone(kind: CodexMessageKind): Color {
+    return when (kind) {
+        CodexMessageKind.Thinking -> Color(0xFFF1F3FA)
+        CodexMessageKind.FileChange -> Color(0xFFF4F1EB)
+        CodexMessageKind.CommandExecution -> Color(0xFFF1F4F8)
+        CodexMessageKind.Plan -> Color(0xFFF3F2F8)
+        CodexMessageKind.UserInputPrompt -> Color(0xFFFFF3EE)
+        CodexMessageKind.Chat -> Color.Transparent
+    }
+}
+
+private fun formatMessageTimestamp(createdAt: Instant?): String? {
+    if (createdAt == null) {
+        return null
+    }
+    return MESSAGE_TIME_FORMATTER.format(createdAt.atZone(ZoneId.systemDefault()))
+}
+
+private fun JsonObject.findString(vararg keys: String): String? {
+    return keys.firstNotNullOfOrNull { key -> this[key]?.stringValue?.takeIf(String::isNotBlank) }
+}
+
+private fun JsonObject.findInt(vararg keys: String): Int? {
+    return keys.firstNotNullOfOrNull { key -> this[key]?.intValue }
+}
+
+private fun JsonObject.findObject(vararg keys: String): JsonObject? {
+    return keys.firstNotNullOfOrNull { key -> this[key]?.objectValue }
+}
+
+private val MESSAGE_TIME_FORMATTER: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("h:mm a", Locale.US)

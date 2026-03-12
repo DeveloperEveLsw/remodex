@@ -2,10 +2,9 @@ package app.remodex.android
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import app.remodex.android.core.model.CodexHostInfo
-import app.remodex.android.core.model.CodexMessage
-import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexAccessMode
+import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
@@ -33,18 +32,19 @@ data class RemodexDebugUiState(
     val sessionUrl: String? = null,
     val diagnostics: RemodexTransportDiagnostics = RemodexTransportDiagnostics(),
     val threads: List<CodexThread> = emptyList(),
-    val selectedThreadId: String? = null,
-    val selectedMessages: List<CodexMessage> = emptyList(),
+    val conversation: RemodexConversationState = RemodexConversationState(),
     val draftTurnInput: String = "",
     val isStartingThread: Boolean = false,
     val isStartingTurn: Boolean = false,
     val lastStartedTurnId: String? = null,
     val lastTurnStartSummary: String? = null,
     val isLoadingThreads: Boolean = false,
-    val isLoadingThread: Boolean = false,
     val isBusy: Boolean = false,
     val errorMessage: String? = null,
-)
+) {
+    val activeThreadId: String?
+        get() = conversation.activeThreadId
+}
 
 class RemodexDebugViewModel(
     private val transport: RemodexTransportClient = RemodexTransportClient(appVersion = APP_VERSION),
@@ -77,7 +77,14 @@ class RemodexDebugViewModel(
         viewModelScope.launch {
             transport.notifications.collect { message ->
                 _uiState.update { current ->
-                    current.copy(lastNotificationMethod = message.method)
+                    current.copy(
+                        lastNotificationMethod = message.method,
+                        conversation = RemodexConversationReducer.reduce(
+                            conversation = current.conversation,
+                            message = message,
+                            knownThreadIds = current.threads.mapTo(linkedSetOf(), CodexThread::id),
+                        ),
+                    )
                 }
             }
         }
@@ -176,8 +183,7 @@ class RemodexDebugViewModel(
                     isStartingThread = false,
                     isStartingTurn = false,
                     threads = emptyList(),
-                    selectedThreadId = null,
-                    selectedMessages = emptyList(),
+                    conversation = RemodexConversationState(),
                     draftTurnInput = "",
                     lastStartedTurnId = null,
                     lastTurnStartSummary = null,
@@ -204,14 +210,10 @@ class RemodexDebugViewModel(
                         localThreads = current.threads,
                         serverThreads = threads,
                     )
-                    val selectedThreadStillExists = current.selectedThreadId?.let { selectedId ->
-                        mergedThreads.any { it.id == selectedId }
-                    } == true
                     current.copy(
                         isLoadingThreads = false,
                         threads = mergedThreads,
-                        selectedThreadId = current.selectedThreadId?.takeIf { selectedThreadStillExists },
-                        selectedMessages = if (selectedThreadStillExists) current.selectedMessages else emptyList(),
+                        conversation = current.conversation.pruneToThreads(mergedThreads.mapTo(linkedSetOf(), CodexThread::id)),
                     )
                 }
             }.onFailure { throwable ->
@@ -228,7 +230,7 @@ class RemodexDebugViewModel(
     fun startThread() {
         viewModelScope.launch {
             val preferredProjectPath = _uiState.value.threads
-                .firstOrNull { it.id == _uiState.value.selectedThreadId }
+                .firstOrNull { it.id == _uiState.value.activeThreadId }
                 ?.cwd
 
             _uiState.update { current ->
@@ -260,8 +262,9 @@ class RemodexDebugViewModel(
         viewModelScope.launch {
             _uiState.update { current ->
                 current.copy(
-                    selectedThreadId = threadId,
-                    isLoadingThread = true,
+                    conversation = current.conversation
+                        .withActiveThread(threadId)
+                        .withThreadLoading(threadId, isLoading = true),
                     errorMessage = null,
                 )
             }
@@ -273,7 +276,7 @@ class RemodexDebugViewModel(
             }.onFailure { throwable ->
                 _uiState.update { current ->
                     current.copy(
-                        isLoadingThread = false,
+                        conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
                         errorMessage = throwable.message,
                     )
                 }
@@ -284,7 +287,7 @@ class RemodexDebugViewModel(
     fun startTurn() {
         viewModelScope.launch {
             val currentState = _uiState.value
-            val selectedThreadId = currentState.selectedThreadId
+            val selectedThreadId = currentState.activeThreadId
             if (selectedThreadId.isNullOrBlank()) {
                 _uiState.update { current ->
                     current.copy(errorMessage = "Select a thread before sending a turn.")
@@ -349,8 +352,9 @@ class RemodexDebugViewModel(
         _uiState.update { current ->
             current.copy(
                 threads = upsertThread(current.threads, result.thread),
-                selectedThreadId = result.thread.id,
-                selectedMessages = emptyList(),
+                conversation = current.conversation
+                    .withActiveThread(result.thread.id)
+                    .withThreadMessages(result.thread.id, emptyList()),
                 draftTurnInput = "",
                 isStartingThread = false,
                 lastStartedTurnId = null,
@@ -370,11 +374,9 @@ class RemodexDebugViewModel(
                 updatedThreads = upsertThread(updatedThreads, activeThread)
             }
 
-            val didSwitchThreads = result.threadId != current.selectedThreadId
             current.copy(
                 threads = updatedThreads,
-                selectedThreadId = result.threadId,
-                selectedMessages = if (didSwitchThreads) emptyList() else current.selectedMessages,
+                conversation = current.conversation.withActiveThread(result.threadId),
                 draftTurnInput = "",
                 isStartingTurn = false,
                 lastStartedTurnId = result.turnId,
@@ -387,9 +389,10 @@ class RemodexDebugViewModel(
     private fun applyThreadRead(threadResult: RemodexThreadReadResult) {
         _uiState.update { current ->
             current.copy(
-                isLoadingThread = false,
-                selectedThreadId = threadResult.thread.id,
-                selectedMessages = threadResult.messages,
+                conversation = current.conversation
+                    .withActiveThread(threadResult.thread.id)
+                    .withThreadMessages(threadResult.thread.id, threadResult.messages)
+                    .withThreadLoading(threadResult.thread.id, isLoading = false),
                 threads = upsertThread(current.threads, threadResult.thread),
                 errorMessage = null,
             )
