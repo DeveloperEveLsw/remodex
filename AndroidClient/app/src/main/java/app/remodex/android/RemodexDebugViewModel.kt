@@ -797,7 +797,7 @@ private fun CodexModelOption.displayTitle(): String {
     }
 }
 
-private fun reasoningTitle(effort: String): String {
+fun reasoningTitle(effort: String): String {
     return when (effort.trim().lowercase()) {
         "minimal", "low" -> "Low"
         "medium" -> "Medium"
