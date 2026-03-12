@@ -51,11 +51,26 @@ data class RemodexThreadReadResult(
     val messages: List<CodexMessage> = emptyList(),
 )
 
+data class RemodexThreadStartResult(
+    val thread: CodexThread,
+    val response: RpcMessage,
+)
+
+data class RemodexThreadResumeResult(
+    val threadId: String,
+    val thread: CodexThread? = null,
+    val response: RpcMessage,
+)
+
 data class RemodexTurnStartResult(
+    val requestedThreadId: String,
     val threadId: String,
     val turnId: String? = null,
     val collaborationMode: CodexCollaborationModeKind? = null,
     val downgradedCollaborationMode: Boolean = false,
+    val activeThread: CodexThread? = null,
+    val archivedThreadId: String? = null,
+    val continuationSummary: String? = null,
     val response: RpcMessage,
 )
 

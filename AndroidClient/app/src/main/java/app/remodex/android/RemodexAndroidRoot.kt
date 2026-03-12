@@ -150,6 +150,10 @@ fun RemodexAndroidRoot() {
                         uiState = uiState,
                         showDeveloperPanels = showDeveloperPanels,
                         onToggleDeveloperPanels = { showDeveloperPanels = !showDeveloperPanels },
+                        onNewChat = {
+                            viewModel.startThread()
+                            scope.launch { drawerState.close() }
+                        },
                         onRefreshThreads = viewModel::refreshThreads,
                         onSelectThread = { threadId ->
                             viewModel.selectThread(threadId)
@@ -185,6 +189,7 @@ private fun SidebarDrawer(
     uiState: RemodexDebugUiState,
     showDeveloperPanels: Boolean,
     onToggleDeveloperPanels: () -> Unit,
+    onNewChat: () -> Unit,
     onRefreshThreads: () -> Unit,
     onSelectThread: (String) -> Unit,
     onParsePairingPayload: () -> Unit,
@@ -218,12 +223,14 @@ private fun SidebarDrawer(
             NavigationDrawerItem(
                 label = {
                     Text(
-                        text = "New Chat",
+                        text = if (uiState.isStartingThread) "Creating..." else "New Chat",
                         style = MaterialTheme.typography.labelLarge,
                     )
                 },
                 selected = false,
-                onClick = {},
+                onClick = onNewChat,
+                enabled = !uiState.isStartingThread &&
+                    uiState.connectionState is RemodexTransportState.Connected,
                 icon = {
                     Icon(
                         imageVector = Icons.Outlined.Add,
@@ -607,7 +614,7 @@ private fun MainConversationPane(
                         }
                         ComposerArea(
                             prompt = uiState.draftTurnInput,
-                            isSending = uiState.isStartingTurn,
+                            isSending = uiState.isStartingTurn || uiState.isStartingThread,
                             selectedThreadId = uiState.selectedThreadId,
                             lastStartedTurnId = uiState.lastStartedTurnId,
                             lastTurnStartSummary = uiState.lastTurnStartSummary,

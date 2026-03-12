@@ -7,6 +7,7 @@ import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThread
+import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
@@ -46,7 +47,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 
-class RemodexTransportClient(
+open class RemodexTransportClient(
     private val appVersion: String = "0.1.0",
     private val clientName: String = "remodex_android",
     private val clientTitle: String = "Remodex Android",
@@ -164,7 +165,7 @@ class RemodexTransportClient(
         }
     }
 
-    suspend fun sendRequest(
+    protected open suspend fun sendRequest(
         method: String,
         params: JsonValue? = null,
         timeoutMillis: Long = REQUEST_TIMEOUT_MILLIS,
@@ -215,7 +216,7 @@ class RemodexTransportClient(
         sendMessage(RpcMessage.failure(id = id, error = RpcError(code = code, message = message, data = data)))
     }
 
-    suspend fun listThreads(
+    open suspend fun listThreads(
         limit: Int = DEFAULT_THREAD_LIMIT,
         archived: Boolean = false,
     ): List<CodexThread> {
@@ -303,7 +304,7 @@ class RemodexTransportClient(
         )
     }
 
-    suspend fun readThread(
+    open suspend fun readThread(
         threadId: String,
         includeTurns: Boolean = true,
     ): RemodexThreadReadResult {
@@ -337,6 +338,58 @@ class RemodexTransportClient(
         return RemodexThreadReadResult(
             thread = thread,
             messages = if (includeTurns) decodeMessagesFromThreadRead(threadId, threadObject) else emptyList(),
+        )
+    }
+
+    open suspend fun startThread(
+        preferredProjectPath: String? = null,
+        accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
+    ): RemodexThreadStartResult {
+        val normalizedPreferredProjectPath = CodexThread.normalizeProjectPath(preferredProjectPath)
+        val response = sendRequestWithSandboxFallback(
+            method = "thread/start",
+            baseParams = buildThreadStartRequestParams(normalizedPreferredProjectPath),
+            accessMode = accessMode,
+        )
+        val thread = decodeThreadFromThreadEnvelope(
+            response = response,
+            method = "thread/start",
+            preferredProjectPath = normalizedPreferredProjectPath,
+        )
+        return RemodexThreadStartResult(
+            thread = thread,
+            response = response,
+        )
+    }
+
+    open suspend fun resumeThread(
+        threadId: String,
+        accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
+    ): RemodexThreadResumeResult {
+        val normalizedThreadId = threadId.trim()
+        if (normalizedThreadId.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "thread/resume requires a non-empty threadId",
+            )
+        }
+
+        val response = sendRequestWithSandboxFallback(
+            method = "thread/resume",
+            baseParams = buildThreadResumeRequestParams(normalizedThreadId),
+            accessMode = accessMode,
+        )
+
+        val resultObject = response.result as? JsonObject
+        val threadObject = resultObject?.get("thread") as? JsonObject
+        val resumedThread = threadObject
+            ?.let(::decodeThread)
+            ?.copy(syncState = CodexThreadSyncState.Live)
+
+        return RemodexThreadResumeResult(
+            threadId = normalizedThreadId,
+            thread = resumedThread,
+            response = response,
         )
     }
 
@@ -379,13 +432,21 @@ class RemodexTransportClient(
         return supportedModes.toList()
     }
 
-    suspend fun startTurn(
+    open suspend fun startTurn(
         threadId: String,
         userInput: String,
         accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
         collaborationMode: CodexCollaborationModeKind? = null,
+        preferredProjectPath: String? = null,
     ): RemodexTurnStartResult {
+        val normalizedThreadId = threadId.trim()
         val trimmedInput = userInput.trim()
+        if (normalizedThreadId.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "turn/start requires a non-empty threadId",
+            )
+        }
         if (trimmedInput.isEmpty()) {
             throw RemodexTransportException(
                 kind = RemodexTransportFailureKind.Protocol,
@@ -393,40 +454,59 @@ class RemodexTransportClient(
             )
         }
 
-        var effectiveCollaborationMode = collaborationMode
-        var downgradedCollaborationMode = false
+        val normalizedPreferredProjectPath = CodexThread.normalizeProjectPath(preferredProjectPath)
 
-        while (true) {
-            val requestParams = buildTurnStartRequestParams(
-                threadId = threadId,
-                userInput = trimmedInput,
-                collaborationMode = effectiveCollaborationMode,
-            )
-
-            try {
-                val response = sendRequestWithSandboxFallback(
-                    method = "turn/start",
-                    baseParams = requestParams,
-                    accessMode = accessMode,
-                )
-                return RemodexTurnStartResult(
-                    threadId = threadId,
-                    turnId = extractTurnId(response.result),
-                    collaborationMode = effectiveCollaborationMode,
-                    downgradedCollaborationMode = downgradedCollaborationMode,
-                    response = response,
-                )
-            } catch (throwable: Throwable) {
-                val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
-                if (effectiveCollaborationMode != null &&
-                    shouldRetryTurnStartWithoutCollaborationMode(classified)
-                ) {
-                    effectiveCollaborationMode = null
-                    downgradedCollaborationMode = true
-                    continue
-                }
+        val resumedThread = try {
+            resumeThread(
+                threadId = normalizedThreadId,
+                accessMode = accessMode,
+            ).thread
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldTreatAsThreadNotFound(classified)) {
                 throw classified
             }
+
+            return startTurnOnContinuationThread(
+                requestedThreadId = normalizedThreadId,
+                userInput = trimmedInput,
+                accessMode = accessMode,
+                collaborationMode = collaborationMode,
+                preferredProjectPath = normalizedPreferredProjectPath,
+                ensureContinuationResumed = true,
+            )
+        }
+
+        try {
+            val turnStart = sendTurnStartRequest(
+                threadId = normalizedThreadId,
+                userInput = trimmedInput,
+                accessMode = accessMode,
+                collaborationMode = collaborationMode,
+            )
+            return RemodexTurnStartResult(
+                requestedThreadId = normalizedThreadId,
+                threadId = normalizedThreadId,
+                turnId = turnStart.turnId,
+                collaborationMode = turnStart.collaborationMode,
+                downgradedCollaborationMode = turnStart.downgradedCollaborationMode,
+                activeThread = resumedThread,
+                response = turnStart.response,
+            )
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldTreatAsThreadNotFound(classified)) {
+                throw classified
+            }
+
+            return startTurnOnContinuationThread(
+                requestedThreadId = normalizedThreadId,
+                userInput = trimmedInput,
+                accessMode = accessMode,
+                collaborationMode = collaborationMode,
+                preferredProjectPath = normalizedPreferredProjectPath,
+                ensureContinuationResumed = false,
+            )
         }
     }
 
@@ -738,6 +818,88 @@ class RemodexTransportClient(
         )
     }
 
+    private suspend fun startTurnOnContinuationThread(
+        requestedThreadId: String,
+        userInput: String,
+        accessMode: CodexAccessMode,
+        collaborationMode: CodexCollaborationModeKind?,
+        preferredProjectPath: String?,
+        ensureContinuationResumed: Boolean,
+    ): RemodexTurnStartResult {
+        val startedThread = startThread(
+            preferredProjectPath = preferredProjectPath,
+            accessMode = accessMode,
+        ).thread
+        val continuationThread = if (ensureContinuationResumed) {
+            resumeThread(
+                threadId = startedThread.id,
+                accessMode = accessMode,
+            ).thread ?: startedThread
+        } else {
+            startedThread
+        }
+        val turnStart = sendTurnStartRequest(
+            threadId = continuationThread.id,
+            userInput = userInput,
+            accessMode = accessMode,
+            collaborationMode = collaborationMode,
+        )
+
+        return RemodexTurnStartResult(
+            requestedThreadId = requestedThreadId,
+            threadId = continuationThread.id,
+            turnId = turnStart.turnId,
+            collaborationMode = turnStart.collaborationMode,
+            downgradedCollaborationMode = turnStart.downgradedCollaborationMode,
+            activeThread = continuationThread,
+            archivedThreadId = requestedThreadId,
+            continuationSummary = "Continued on a new live thread after `$requestedThreadId` became stale.",
+            response = turnStart.response,
+        )
+    }
+
+    private suspend fun sendTurnStartRequest(
+        threadId: String,
+        userInput: String,
+        accessMode: CodexAccessMode,
+        collaborationMode: CodexCollaborationModeKind?,
+    ): TurnStartRequestResult {
+        var effectiveCollaborationMode = collaborationMode
+        var downgradedCollaborationMode = false
+
+        while (true) {
+            val requestParams = buildTurnStartRequestParams(
+                threadId = threadId,
+                userInput = userInput,
+                collaborationMode = effectiveCollaborationMode,
+            )
+
+            try {
+                val response = sendRequestWithSandboxFallback(
+                    method = "turn/start",
+                    baseParams = requestParams,
+                    accessMode = accessMode,
+                )
+                return TurnStartRequestResult(
+                    turnId = extractTurnId(response.result),
+                    collaborationMode = effectiveCollaborationMode,
+                    downgradedCollaborationMode = downgradedCollaborationMode,
+                    response = response,
+                )
+            } catch (throwable: Throwable) {
+                val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+                if (effectiveCollaborationMode != null &&
+                    shouldRetryTurnStartWithoutCollaborationMode(classified)
+                ) {
+                    effectiveCollaborationMode = null
+                    downgradedCollaborationMode = true
+                    continue
+                }
+                throw classified
+            }
+        }
+    }
+
     private fun runtimeSandboxPolicyObject(accessMode: CodexAccessMode): JsonValue {
         return when (accessMode) {
             CodexAccessMode.OnRequest -> JsonObject(
@@ -797,6 +959,22 @@ class RemodexTransportClient(
             || message.contains("unsupported")
     }
 
+    private fun buildThreadStartRequestParams(
+        preferredProjectPath: String?,
+    ): Map<String, JsonValue> {
+        val params = mutableMapOf<String, JsonValue>()
+        preferredProjectPath?.let { params["cwd"] = JsonPrimitive(it) }
+        return params
+    }
+
+    private fun buildThreadResumeRequestParams(
+        threadId: String,
+    ): Map<String, JsonValue> {
+        return mutableMapOf(
+            "threadId" to JsonPrimitive(threadId),
+        )
+    }
+
     private fun buildTurnStartRequestParams(
         threadId: String,
         userInput: String,
@@ -821,6 +999,44 @@ class RemodexTransportClient(
         }
 
         return params
+    }
+
+    private fun decodeThreadFromThreadEnvelope(
+        response: RpcMessage,
+        method: String,
+        preferredProjectPath: String? = null,
+    ): CodexThread {
+        val resultObject = response.result as? JsonObject
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "$method response missing payload",
+            )
+        val threadObject = resultObject["thread"] as? JsonObject
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "$method response missing thread payload",
+            )
+        val decodedThread = decodeThread(threadObject)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "$method returned an undecodable thread",
+            )
+
+        return applyPreferredProjectFallback(
+            thread = decodedThread.copy(syncState = CodexThreadSyncState.Live),
+            preferredProjectPath = preferredProjectPath,
+        )
+    }
+
+    private fun applyPreferredProjectFallback(
+        thread: CodexThread,
+        preferredProjectPath: String?,
+    ): CodexThread {
+        return if (thread.normalizedProjectPath == null && preferredProjectPath != null) {
+            thread.copy(cwd = preferredProjectPath)
+        } else {
+            thread
+        }
     }
 
     private fun buildCollaborationModePayload(
@@ -857,6 +1073,14 @@ class RemodexTransportClient(
             || message.contains("invalid")
             || message.contains("field")
             || message.contains("mode")
+    }
+
+    private fun shouldTreatAsThreadNotFound(error: RemodexTransportException): Boolean {
+        val message = (error.rpcError?.message ?: error.message).lowercase()
+        if (message.contains("not materialized") || message.contains("not yet materialized")) {
+            return false
+        }
+        return message.contains("thread not found") || message.contains("unknown thread")
     }
 
     private fun extractTurnId(result: JsonValue?): String? {
@@ -1289,6 +1513,13 @@ class RemodexTransportClient(
     private fun JsonValue?.stringValueOrNull(): String? {
         return (this as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
     }
+
+    private data class TurnStartRequestResult(
+        val turnId: String?,
+        val collaborationMode: CodexCollaborationModeKind?,
+        val downgradedCollaborationMode: Boolean,
+        val response: RpcMessage,
+    )
 
     companion object {
         private const val CONNECTION_TIMEOUT_MILLIS = 12_000L
