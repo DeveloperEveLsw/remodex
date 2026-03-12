@@ -1,6 +1,7 @@
 package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import org.junit.Assert.assertEquals
@@ -66,5 +67,51 @@ class RemodexConversationStateTests {
         )
 
         assertEquals(CodexThreadRunBadgeState.Running, conversation.threadRunBadgeState(threadId))
+    }
+
+    @Test
+    fun appendUserMessageAndConfirmDeliveryKeepsUserRowVisibleBeforeHydration() {
+        val threadId = "thread-1"
+        val messageId = "msg-pending"
+
+        val conversation = RemodexConversationState()
+            .appendUserMessage(
+                threadId = threadId,
+                text = "Ship it",
+                messageId = messageId,
+            )
+            .markMessageDeliveryState(
+                threadId = threadId,
+                messageId = messageId,
+                deliveryState = CodexMessageDeliveryState.Confirmed,
+                turnId = "turn-1",
+            )
+
+        val message = conversation.messagesFor(threadId).single()
+        assertEquals(CodexMessageRole.User, message.role)
+        assertEquals("Ship it", message.text)
+        assertEquals(CodexMessageDeliveryState.Confirmed, message.deliveryState)
+        assertEquals("turn-1", message.turnId)
+    }
+
+    @Test
+    fun moveMessageToThreadCarriesPendingUserRowToContinuationThread() {
+        val conversation = RemodexConversationState()
+            .appendUserMessage(
+                threadId = "thread-old",
+                text = "Continue from here",
+                messageId = "msg-pending",
+            )
+            .moveMessageToThread(
+                sourceThreadId = "thread-old",
+                targetThreadId = "thread-new",
+                messageId = "msg-pending",
+            )
+
+        assertTrue(conversation.messagesFor("thread-old").isEmpty())
+        val movedMessage = conversation.messagesFor("thread-new").single()
+        assertEquals("thread-new", movedMessage.threadId)
+        assertEquals("Continue from here", movedMessage.text)
+        assertEquals(CodexMessageDeliveryState.Pending, movedMessage.deliveryState)
     }
 }

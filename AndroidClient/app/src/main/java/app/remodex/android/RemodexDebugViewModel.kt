@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
@@ -23,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 data class RemodexDebugUiState(
     val qrPayload: String = "",
@@ -385,8 +387,17 @@ class RemodexDebugViewModel(
                 return@launch
             }
 
+            val pendingMessageId = UUID.randomUUID().toString()
+
             _uiState.update { current ->
                 current.copy(
+                    conversation = current.conversation
+                        .withActiveThread(selectedThreadId)
+                        .appendUserMessage(
+                            threadId = selectedThreadId,
+                            text = trimmedInput,
+                            messageId = pendingMessageId,
+                        ),
                     isStartingTurn = true,
                     errorMessage = null,
                 )
@@ -407,10 +418,19 @@ class RemodexDebugViewModel(
                     reasoningEffort = currentState.selectedReasoningEffort,
                 )
             }.onSuccess { result ->
-                applyTurnStarted(result)
+                applyTurnStarted(
+                    result = result,
+                    pendingMessageId = pendingMessageId,
+                    requestedThreadId = selectedThreadId,
+                )
             }.onFailure { throwable ->
                 _uiState.update { current ->
                     current.copy(
+                        conversation = current.conversation.markMessageDeliveryState(
+                            threadId = selectedThreadId,
+                            messageId = pendingMessageId,
+                            deliveryState = CodexMessageDeliveryState.Failed,
+                        ),
                         isStartingTurn = false,
                         errorMessage = throwable.message,
                     )
@@ -507,7 +527,11 @@ class RemodexDebugViewModel(
         }
     }
 
-    private fun applyTurnStarted(result: RemodexTurnStartResult) {
+    private fun applyTurnStarted(
+        result: RemodexTurnStartResult,
+        pendingMessageId: String? = null,
+        requestedThreadId: String = result.requestedThreadId,
+    ) {
         _uiState.update { current ->
             var updatedThreads = current.threads
             result.archivedThreadId?.let { archivedThreadId ->
@@ -517,9 +541,34 @@ class RemodexDebugViewModel(
                 updatedThreads = upsertThread(updatedThreads, activeThread)
             }
 
+            var updatedConversation = current.conversation
+            val resolvedPendingThreadId = if (pendingMessageId != null && requestedThreadId != result.threadId) {
+                updatedConversation = updatedConversation.moveMessageToThread(
+                    sourceThreadId = requestedThreadId,
+                    targetThreadId = result.threadId,
+                    messageId = pendingMessageId,
+                )
+                result.threadId
+            } else {
+                requestedThreadId
+            }
+            val resolvedTurnId = result.turnId ?: updatedConversation.activeTurnIdByThread[result.threadId]
+            if (pendingMessageId != null) {
+                updatedConversation = updatedConversation.markMessageDeliveryState(
+                    threadId = resolvedPendingThreadId,
+                    messageId = pendingMessageId,
+                    deliveryState = if (resolvedTurnId == null) {
+                        CodexMessageDeliveryState.Pending
+                    } else {
+                        CodexMessageDeliveryState.Confirmed
+                    },
+                    turnId = resolvedTurnId,
+                )
+            }
+
             current.copy(
                 threads = updatedThreads,
-                conversation = current.conversation
+                conversation = updatedConversation
                     .withActiveThread(result.threadId)
                     .withTurnStarted(result.threadId, result.turnId),
                 draftTurnInput = "",

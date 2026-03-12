@@ -253,6 +253,88 @@ data class RemodexConversationState(
             .withThreadHydrated(normalizedThreadId)
     }
 
+    fun appendUserMessage(
+        threadId: String,
+        text: String,
+        messageId: String = UUID.randomUUID().toString(),
+        turnId: String? = null,
+        deliveryState: CodexMessageDeliveryState = CodexMessageDeliveryState.Pending,
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val trimmedText = text.trim()
+        if (trimmedText.isEmpty()) {
+            return this
+        }
+
+        val existingMessages = messagesFor(normalizedThreadId)
+        val nextMessages = existingMessages + CodexMessage(
+            id = messageId,
+            threadId = normalizedThreadId,
+            role = CodexMessageRole.User,
+            text = trimmedText,
+            createdAt = Instant.now(),
+            turnId = normalizeThreadId(turnId),
+            deliveryState = deliveryState,
+            orderIndex = nextOrderIndex(existingMessages),
+        )
+        return replaceThreadMessages(normalizedThreadId, nextMessages)
+    }
+
+    fun markMessageDeliveryState(
+        threadId: String,
+        messageId: String,
+        deliveryState: CodexMessageDeliveryState,
+        turnId: String? = null,
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        if (messageId.isBlank()) {
+            return this
+        }
+
+        val existingMessages = messagesFor(normalizedThreadId)
+        val messageIndex = existingMessages.indexOfLast { it.id == messageId }
+        if (messageIndex < 0) {
+            return this
+        }
+
+        val updatedMessages = existingMessages.toMutableList()
+        val existingMessage = updatedMessages[messageIndex]
+        updatedMessages[messageIndex] = existingMessage.copy(
+            deliveryState = deliveryState,
+            turnId = existingMessage.turnId ?: normalizeThreadId(turnId),
+        )
+        return replaceThreadMessages(normalizedThreadId, updatedMessages)
+    }
+
+    fun moveMessageToThread(
+        sourceThreadId: String,
+        targetThreadId: String,
+        messageId: String,
+    ): RemodexConversationState {
+        val normalizedSourceThreadId = normalizeThreadId(sourceThreadId) ?: return this
+        val normalizedTargetThreadId = normalizeThreadId(targetThreadId) ?: return this
+        if (normalizedSourceThreadId == normalizedTargetThreadId || messageId.isBlank()) {
+            return this
+        }
+
+        val sourceMessages = messagesFor(normalizedSourceThreadId)
+        val sourceIndex = sourceMessages.indexOfLast { it.id == messageId }
+        if (sourceIndex < 0) {
+            return this
+        }
+
+        val movedMessage = sourceMessages[sourceIndex]
+        val nextSourceMessages = sourceMessages.toMutableList().apply { removeAt(sourceIndex) }
+        val targetMessages = messagesFor(normalizedTargetThreadId)
+        val nextTargetMessages = targetMessages + movedMessage.copy(
+            threadId = normalizedTargetThreadId,
+            orderIndex = nextOrderIndex(targetMessages),
+        )
+
+        return replaceThreadMessages(normalizedSourceThreadId, nextSourceMessages.withSequentialOrderIndices())
+            .replaceThreadMessages(normalizedTargetThreadId, nextTargetMessages.withSequentialOrderIndices())
+    }
+
     fun beginAssistantMessage(threadId: String, turnId: String, itemId: String? = null): RemodexConversationState {
         val normalizedThreadId = normalizeThreadId(threadId) ?: return this
         val normalizedTurnId = normalizeThreadId(turnId) ?: return this

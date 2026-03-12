@@ -1,6 +1,7 @@
 package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
@@ -121,7 +122,11 @@ class RemodexDebugViewModelTests {
             "Continued on a new live thread after `thread-old` became stale.",
             state.lastTurnStartSummary,
         )
-        assertTrue(state.conversation.messagesFor(state.activeThreadId).isEmpty())
+        val continuedMessages = state.conversation.messagesFor(state.activeThreadId)
+        assertEquals(1, continuedMessages.size)
+        assertEquals(CodexMessageRole.User, continuedMessages.single().role)
+        assertEquals("Continue from here", continuedMessages.single().text)
+        assertEquals(CodexMessageDeliveryState.Confirmed, continuedMessages.single().deliveryState)
 
         val archivedThread = state.threads.first { it.id == "thread-old" }
         assertEquals(CodexThreadSyncState.ArchivedLocal, archivedThread.syncState)
@@ -336,6 +341,41 @@ class RemodexDebugViewModelTests {
         assertEquals(app.remodex.android.core.model.CodexAccessMode.FullAccess, transport.lastStartTurnAccessMode)
         assertEquals("gpt-5.4", transport.lastStartTurnModelIdentifier)
         assertEquals("high", transport.lastStartTurnReasoningEffort)
+    }
+
+    @Test
+    fun startTurnShowsUserMessageImmediatelyInConversationState() = runTest {
+        val thread = CodexThread(
+            id = "thread-live",
+            title = "Live",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-1",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.updateDraftTurnInput("Ship it")
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        val messages = viewModel.uiState.value.conversation.messagesFor(thread.id)
+        assertEquals(1, messages.size)
+        assertEquals(CodexMessageRole.User, messages.single().role)
+        assertEquals("Ship it", messages.single().text)
+        assertEquals(CodexMessageDeliveryState.Confirmed, messages.single().deliveryState)
+        assertEquals("turn-1", messages.single().turnId)
     }
 
     private class FakeTransportClient(
