@@ -201,6 +201,8 @@ private fun SidebarDrawer(
         uiState.threads.groupBy { it.projectDisplayName }
             .toSortedMap(compareBy<String> { it.equals("No Project", ignoreCase = true) }.thenBy { it.lowercase() })
     }
+    val canStartNewChat = !uiState.isStartingThread &&
+        uiState.connectionState is RemodexTransportState.Connected
 
     Surface(
         modifier = Modifier
@@ -225,16 +227,20 @@ private fun SidebarDrawer(
                     Text(
                         text = if (uiState.isStartingThread) "Creating..." else "New Chat",
                         style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.alpha(if (canStartNewChat) 1f else 0.5f),
                     )
                 },
                 selected = false,
-                onClick = onNewChat,
-                enabled = !uiState.isStartingThread &&
-                    uiState.connectionState is RemodexTransportState.Connected,
+                onClick = {
+                    if (canStartNewChat) {
+                        onNewChat()
+                    }
+                },
                 icon = {
                     Icon(
                         imageVector = Icons.Outlined.Add,
                         contentDescription = null,
+                        modifier = Modifier.alpha(if (canStartNewChat) 1f else 0.5f),
                     )
                 },
                 colors = NavigationDrawerItemDefaults.colors(
