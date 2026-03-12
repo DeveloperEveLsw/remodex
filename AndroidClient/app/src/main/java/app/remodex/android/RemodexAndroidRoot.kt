@@ -69,6 +69,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -121,13 +122,14 @@ fun RemodexAndroidRoot() {
     val viewModel: RemodexDebugViewModel = viewModel()
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val drawerState = androidx.compose.material3.rememberDrawerState(
-        initialValue = androidx.compose.material3.DrawerValue.Open,
+        initialValue = androidx.compose.material3.DrawerValue.Closed,
     )
     val scope = rememberCoroutineScope()
     var showDeveloperPanels by rememberSaveable { mutableStateOf(false) }
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
+    val isConnected = uiState.connectionState is RemodexTransportState.Connected
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
         Box(
@@ -166,20 +168,28 @@ fun RemodexAndroidRoot() {
                 },
                 modifier = Modifier.fillMaxSize(),
             ) {
-                MainConversationPane(
-                    uiState = uiState,
-                    showDeveloperPanels = showDeveloperPanels,
-                    onToggleDrawer = {
-                        scope.launch {
-                            if (drawerState.isOpen) drawerState.close() else drawerState.open()
-                        }
-                    },
-                    onOpenSettings = { activePanel = SETTINGS_PANEL },
-                    onOpenActionMenu = { activePanel = ACTION_MENU_PANEL },
-                    onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
-                    onPromptChange = viewModel::updateDraftTurnInput,
-                    onSendPrompt = viewModel::startTurn,
-                )
+                if (isConnected) {
+                    MainConversationPane(
+                        uiState = uiState,
+                        showDeveloperPanels = showDeveloperPanels,
+                        onToggleDrawer = {
+                            scope.launch {
+                                if (drawerState.isOpen) drawerState.close() else drawerState.open()
+                            }
+                        },
+                        onOpenSettings = { activePanel = SETTINGS_PANEL },
+                        onOpenActionMenu = { activePanel = ACTION_MENU_PANEL },
+                        onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
+                        onPromptChange = viewModel::updateDraftTurnInput,
+                        onSendPrompt = viewModel::startTurn,
+                    )
+                } else {
+                    OnboardingState(
+                        onOpenSetup = {
+                            scope.launch { drawerState.open() }
+                        },
+                    )
+                }
             }
 
             when (activePanel) {
@@ -656,10 +666,8 @@ private fun MainConversationPane(
                         )
                         ConversationTimeline(
                             selectedThread = selectedThread,
-                            connectionState = uiState.connectionState,
                             messages = selectedMessages,
                             isLoadingThread = isLoadingSelectedThread,
-                            onOpenSidebar = onToggleDrawer,
                             modifier = Modifier.weight(1f),
                         )
                         AnimatedVisibility(visible = showDeveloperPanels) {
@@ -823,22 +831,16 @@ private fun ConversationStatusStrip(
 @Composable
 private fun ConversationTimeline(
     selectedThread: CodexThread?,
-    connectionState: RemodexTransportState,
     messages: List<CodexMessage>,
     isLoadingThread: Boolean,
-    onOpenSidebar: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxWidth()) {
         if (selectedThread == null) {
-            if (connectionState is RemodexTransportState.Connected) {
-                EmptyConversationState(
-                    title = "Open or create a conversation",
-                    subtitle = "Use the sidebar to jump between local threads, or create a new chat to start streaming into this timeline.",
-                )
-            } else {
-                OnboardingState(onOpenSidebar = onOpenSidebar)
-            }
+            EmptyConversationState(
+                title = "Open or create a conversation",
+                subtitle = "Use the sidebar to jump between local threads, or create a new chat to start streaming into this timeline.",
+            )
             return
         }
 
@@ -907,82 +909,177 @@ private fun EmptyConversationState(title: String, subtitle: String) {
 }
 
 @Composable
-private fun OnboardingState(onOpenSidebar: () -> Unit) {
+private fun OnboardingState(onOpenSetup: () -> Unit) {
     val steps = listOf(
         "Install the package" to "npm install -g remodex",
         "Start Remodex on your Mac" to "remodex up",
-        "Paste or scan the pairing payload" to "Open the sidebar and connect to your local bridge.",
+        "Scan the QR code" to "Open connection setup and pair with your local bridge.",
     )
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 26.dp, vertical = 28.dp),
-        verticalArrangement = Arrangement.Center,
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 28.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        item {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 460.dp)
+                .verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(22.dp),
+        ) {
+            OnboardingHero()
+            Surface(
+                shape = CircleShape,
+                color = Color(0xFF111111),
+            ) {
+                Box(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = ">_",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                    )
+                }
+            }
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = "Remodex",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "Control your local Codex session from Android.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Column(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Surface(
-                    shape = CircleShape,
-                    color = Color(0xFF111111),
-                ) {
-                    Box(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = ">_",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White,
-                        )
-                    }
-                }
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Text(
-                        text = "Remodex",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Text(
-                        text = "Control your local Codex session from Android.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                steps.forEachIndexed { index, (title, command) ->
+                    OnboardingStepCard(
+                        number = index + 1,
+                        title = title,
+                        detail = command,
                     )
                 }
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    steps.forEachIndexed { index, (title, command) ->
-                        OnboardingStepCard(
-                            number = index + 1,
-                            title = title,
-                            detail = command,
-                        )
-                    }
-                }
-                Button(
-                    onClick = onOpenSidebar,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF111111),
-                        contentColor = Color.White,
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 8.dp),
-                ) {
-                    Text("Open Sidebar")
-                }
-                InlineInfoBadge(
-                    icon = Icons.Outlined.SettingsEthernet,
-                    label = "Local-first pairing only",
+            }
+            Button(
+                onClick = onOpenSetup,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF111111),
+                    contentColor = Color.White,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            ) {
+                Text("Scan QR Code")
+            }
+            InlineInfoBadge(
+                icon = Icons.Outlined.SettingsEthernet,
+                label = "End-to-end encrypted",
+            )
+        }
+    }
+}
+
+@Composable
+private fun OnboardingHero() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(188.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HeroPhoneCard(
+            modifier = Modifier
+                .weight(1f)
+                .alpha(0.78f),
+            rotation = -12f,
+            title = "Diff",
+            lines = listOf(
+                "codex_connection.swift",
+                "+ restore reconnect state",
+                "+ keep stop visible",
+                "- flatten placeholder rows",
+            ),
+        )
+        HeroPhoneCard(
+            modifier = Modifier.weight(1.1f),
+            rotation = 0f,
+            title = "Remodex",
+            lines = listOf(
+                "Local relay linked",
+                "Analyze project thoroughly",
+                "assistant stream connected",
+                "timeline updates live",
+            ),
+        )
+        HeroPhoneCard(
+            modifier = Modifier
+                .weight(1f)
+                .alpha(0.78f),
+            rotation = 12f,
+            title = "Threads",
+            lines = listOf(
+                "New Chat",
+                "Hello",
+                "Workspace sync",
+                "Archived Chats",
+            ),
+        )
+    }
+}
+
+@Composable
+private fun HeroPhoneCard(
+    modifier: Modifier = Modifier,
+    rotation: Float,
+    title: String,
+    lines: List<String>,
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(28.dp),
+        color = Color(0xFFFFFEFC),
+        shadowElevation = 10.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer { rotationZ = rotation }
+                .padding(horizontal = 12.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            lines.forEachIndexed { index, line ->
+                Text(
+                    text = line,
+                    style = if (index == 0) {
+                        MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium)
+                    } else {
+                        MaterialTheme.typography.bodySmall
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }
