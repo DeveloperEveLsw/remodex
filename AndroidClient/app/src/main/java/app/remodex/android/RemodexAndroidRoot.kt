@@ -23,9 +23,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.automirrored.outlined.Send
@@ -74,6 +76,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.remodex.android.core.model.CodexHostInfo
@@ -108,6 +112,10 @@ private val RemodexColorScheme = lightColorScheme(
     onError = Color(0xFFFFFFFF),
 )
 
+private const val SETTINGS_PANEL = "settings"
+private const val ACTION_MENU_PANEL = "action-menu"
+private const val BRANCH_PICKER_PANEL = "branch-picker"
+
 @Composable
 fun RemodexAndroidRoot() {
     val viewModel: RemodexDebugViewModel = viewModel()
@@ -117,6 +125,9 @@ fun RemodexAndroidRoot() {
     )
     val scope = rememberCoroutineScope()
     var showDeveloperPanels by rememberSaveable { mutableStateOf(false) }
+    var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
+    val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
+    val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
         Box(
@@ -136,6 +147,7 @@ fun RemodexAndroidRoot() {
                     SidebarDrawer(
                         uiState = uiState,
                         showDeveloperPanels = showDeveloperPanels,
+                        onOpenSettings = { activePanel = SETTINGS_PANEL },
                         onToggleDeveloperPanels = { showDeveloperPanels = !showDeveloperPanels },
                         onNewChat = {
                             viewModel.startThread()
@@ -162,9 +174,44 @@ fun RemodexAndroidRoot() {
                             if (drawerState.isOpen) drawerState.close() else drawerState.open()
                         }
                     },
-                    onToggleDeveloperPanels = { showDeveloperPanels = !showDeveloperPanels },
+                    onOpenSettings = { activePanel = SETTINGS_PANEL },
+                    onOpenActionMenu = { activePanel = ACTION_MENU_PANEL },
+                    onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
                     onPromptChange = viewModel::updateDraftTurnInput,
                     onSendPrompt = viewModel::startTurn,
+                )
+            }
+
+            when (activePanel) {
+                SETTINGS_PANEL -> SettingsSheet(
+                    uiState = uiState,
+                    onDismiss = { activePanel = null },
+                    onDisconnect = viewModel::disconnect,
+                )
+
+                ACTION_MENU_PANEL -> ActionMenuSheet(
+                    showDeveloperPanels = showDeveloperPanels,
+                    branchLabel = gitChrome?.branch,
+                    onDismiss = { activePanel = null },
+                    onOpenSettings = { activePanel = SETTINGS_PANEL },
+                    onRefreshThreads = {
+                        activePanel = null
+                        viewModel.refreshThreads()
+                    },
+                    onStartThread = {
+                        activePanel = null
+                        viewModel.startThread()
+                    },
+                    onToggleDeveloperPanels = {
+                        showDeveloperPanels = !showDeveloperPanels
+                        activePanel = null
+                    },
+                )
+
+                BRANCH_PICKER_PANEL -> BranchPickerSheet(
+                    branchLabel = gitChrome?.branch,
+                    selectedThread = selectedThread,
+                    onDismiss = { activePanel = null },
                 )
             }
         }
@@ -175,6 +222,7 @@ fun RemodexAndroidRoot() {
 private fun SidebarDrawer(
     uiState: RemodexDebugUiState,
     showDeveloperPanels: Boolean,
+    onOpenSettings: () -> Unit,
     onToggleDeveloperPanels: () -> Unit,
     onNewChat: () -> Unit,
     onRefreshThreads: () -> Unit,
@@ -207,7 +255,7 @@ private fun SidebarDrawer(
                 .padding(horizontal = 16.dp, vertical = 18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            SidebarHeader()
+            SidebarHeader(onOpenSettings = onOpenSettings)
             SearchStrip()
             NavigationDrawerItem(
                 label = {
@@ -272,7 +320,7 @@ private fun SidebarDrawer(
 }
 
 @Composable
-private fun SidebarHeader() {
+private fun SidebarHeader(onOpenSettings: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -306,6 +354,10 @@ private fun SidebarHeader() {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        Spacer(modifier = Modifier.weight(1f))
+        TextButton(onClick = onOpenSettings) {
+            Text("Settings")
         }
     }
 }
@@ -551,7 +603,9 @@ private fun MainConversationPane(
     uiState: RemodexDebugUiState,
     showDeveloperPanels: Boolean,
     onToggleDrawer: () -> Unit,
-    onToggleDeveloperPanels: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenActionMenu: () -> Unit,
+    onOpenBranchPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
 ) {
@@ -585,7 +639,7 @@ private fun MainConversationPane(
                     connectionState = uiState.connectionState,
                     gitChrome = gitChrome,
                     onToggleDrawer = onToggleDrawer,
-                    onToggleDeveloperPanels = onToggleDeveloperPanels,
+                    onOpenActionMenu = onOpenActionMenu,
                 )
                 Divider(color = Color(0xFFE7E3DD))
                 Box(
@@ -602,8 +656,10 @@ private fun MainConversationPane(
                         )
                         ConversationTimeline(
                             selectedThread = selectedThread,
+                            connectionState = uiState.connectionState,
                             messages = selectedMessages,
                             isLoadingThread = isLoadingSelectedThread,
+                            onOpenSidebar = onToggleDrawer,
                             modifier = Modifier.weight(1f),
                         )
                         AnimatedVisibility(visible = showDeveloperPanels) {
@@ -617,6 +673,9 @@ private fun MainConversationPane(
                             isSending = uiState.isStartingTurn || uiState.isStartingThread,
                             selectedThreadId = uiState.activeThreadId,
                             branchLabel = gitChrome?.branch,
+                            onOpenSettings = onOpenSettings,
+                            onOpenBranchPicker = onOpenBranchPicker,
+                            onOpenActionMenu = onOpenActionMenu,
                             onPromptChange = onPromptChange,
                             onSendPrompt = onSendPrompt,
                         )
@@ -633,7 +692,7 @@ private fun ConversationTopBar(
     connectionState: RemodexTransportState,
     gitChrome: ThreadGitChrome?,
     onToggleDrawer: () -> Unit,
-    onToggleDeveloperPanels: () -> Unit,
+    onOpenActionMenu: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -679,10 +738,10 @@ private fun ConversationTopBar(
             color = Color(0xFFF4F2EE),
             border = BorderStroke(1.dp, Color(0xFFE7E3DC)),
         ) {
-            IconButton(onClick = onToggleDeveloperPanels) {
+            IconButton(onClick = onOpenActionMenu) {
                 Icon(
                     imageVector = Icons.Outlined.Tune,
-                    contentDescription = "Toggle diagnostics",
+                    contentDescription = "Open action menu",
                     tint = when (connectionState) {
                         is RemodexTransportState.Connected -> MaterialTheme.colorScheme.primary
                         else -> MaterialTheme.colorScheme.onSurface
@@ -764,16 +823,22 @@ private fun ConversationStatusStrip(
 @Composable
 private fun ConversationTimeline(
     selectedThread: CodexThread?,
+    connectionState: RemodexTransportState,
     messages: List<CodexMessage>,
     isLoadingThread: Boolean,
+    onOpenSidebar: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxWidth()) {
         if (selectedThread == null) {
-            EmptyConversationState(
-                title = "Connect, then open a conversation",
-                subtitle = "The Android shell now follows the original Remodex information architecture: sidebar threads, a focused timeline, and a bottom composer ready for live turns.",
-            )
+            if (connectionState is RemodexTransportState.Connected) {
+                EmptyConversationState(
+                    title = "Open or create a conversation",
+                    subtitle = "Use the sidebar to jump between local threads, or create a new chat to start streaming into this timeline.",
+                )
+            } else {
+                OnboardingState(onOpenSidebar = onOpenSidebar)
+            }
             return
         }
 
@@ -842,6 +907,585 @@ private fun EmptyConversationState(title: String, subtitle: String) {
 }
 
 @Composable
+private fun OnboardingState(onOpenSidebar: () -> Unit) {
+    val steps = listOf(
+        "Install the package" to "npm install -g remodex",
+        "Start Remodex on your Mac" to "remodex up",
+        "Paste or scan the pairing payload" to "Open the sidebar and connect to your local bridge.",
+    )
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 26.dp, vertical = 28.dp),
+        verticalArrangement = Arrangement.Center,
+    ) {
+        item {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = Color(0xFF111111),
+                ) {
+                    Box(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = ">_",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                        )
+                    }
+                }
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "Remodex",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "Control your local Codex session from Android.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    steps.forEachIndexed { index, (title, command) ->
+                        OnboardingStepCard(
+                            number = index + 1,
+                            title = title,
+                            detail = command,
+                        )
+                    }
+                }
+                Button(
+                    onClick = onOpenSidebar,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF111111),
+                        contentColor = Color.White,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) {
+                    Text("Open Sidebar")
+                }
+                InlineInfoBadge(
+                    icon = Icons.Outlined.SettingsEthernet,
+                    label = "Local-first pairing only",
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OnboardingStepCard(
+    number: Int,
+    title: String,
+    detail: String,
+) {
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = Color(0xFFF2F0EC),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = Color(0xFF111111),
+            ) {
+                Box(
+                    modifier = Modifier.size(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = number.toString(),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.White,
+                    )
+                }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                )
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFFFFFEFC),
+                ) {
+                    Text(
+                        text = detail,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSheet(
+    uiState: RemodexDebugUiState,
+    onDismiss: () -> Unit,
+    onDisconnect: () -> Unit,
+) {
+    SheetDialog(
+        onDismiss = onDismiss,
+        topPadding = 48.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            SheetHeader(
+                title = "Settings",
+                actionLabel = "Close",
+                onAction = onDismiss,
+            )
+            SettingsSection(
+                title = "Archived Chats",
+            ) {
+                GroupedRowsCard {
+                    GroupedRow(
+                        label = "Archived Chats",
+                        value = "Local only",
+                        supporting = "Archive state is preserved per thread inside the local workspace.",
+                    )
+                }
+            }
+            SettingsSection(title = "Appearance") {
+                GroupedRowsCard {
+                    GroupedRow(
+                        label = "Font",
+                        value = "System",
+                        supporting = "Keep body text native and code rows monospace, matching the iOS reference hierarchy.",
+                    )
+                }
+            }
+            SettingsSection(title = "Notifications") {
+                GroupedRowsCard {
+                    GroupedRow(
+                        label = "Status",
+                        value = if (uiState.connectionState is RemodexTransportState.Connected) "Authorized" else "Unavailable",
+                        supporting = "Local alerts can be surfaced once background run completion wiring lands.",
+                    )
+                }
+            }
+            SettingsSection(title = "Runtime Defaults") {
+                GroupedRowsCard {
+                    GroupedRow(label = "Model", value = "GPT-5.4")
+                    GroupedDivider()
+                    GroupedRow(label = "Reasoning", value = "Extra High")
+                    GroupedDivider()
+                    GroupedRow(label = "Speed", value = "Normal")
+                    GroupedDivider()
+                    GroupedRow(label = "Access", value = "On-Request")
+                }
+            }
+            SettingsSection(title = "Connection") {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color(0xFFF2F0EC),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            text = "Status: ${connectionStateLabel(uiState.connectionState).lowercase()}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "Security: local relay pairing",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color(0xFF63A76B),
+                        )
+                        uiState.hostInfo?.displayName?.let { hostName ->
+                            Text(
+                                text = "Trusted Host: $hostName",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onDisconnect,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error,
+                            ),
+                        ) {
+                            Text("Disconnect")
+                        }
+                    }
+                }
+            }
+            SettingsSection(title = "About") {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color(0xFFF2F0EC),
+                ) {
+                    Text(
+                        text = "Chats stay local-first between Android and your paired host. Relay metadata and runtime defaults remain scoped to the current local session.",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActionMenuSheet(
+    showDeveloperPanels: Boolean,
+    branchLabel: String?,
+    onDismiss: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onRefreshThreads: () -> Unit,
+    onStartThread: () -> Unit,
+    onToggleDeveloperPanels: () -> Unit,
+) {
+    FloatingSheetDialog(onDismiss = onDismiss) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            GroupedMenuSection(
+                title = "Conversation",
+                rows = listOf(
+                    MenuRowModel("New Chat", "Create a fresh local thread", onStartThread),
+                    MenuRowModel("Refresh Threads", "Reload thread metadata", onRefreshThreads),
+                    MenuRowModel("Settings", "Open runtime defaults and connection info", onOpenSettings),
+                ),
+            )
+            GroupedMenuSection(
+                title = "Workspace",
+                rows = listOf(
+                    MenuRowModel(
+                        title = branchLabel ?: "No branch",
+                        subtitle = "Current branch preview",
+                        onClick = null,
+                    ),
+                ),
+            )
+            GroupedMenuSection(
+                title = "Developer",
+                rows = listOf(
+                    MenuRowModel(
+                        title = if (showDeveloperPanels) "Hide Diagnostics" else "Show Diagnostics",
+                        subtitle = "Toggle the local transport debug panel",
+                        onClick = onToggleDeveloperPanels,
+                    ),
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun BranchPickerSheet(
+    branchLabel: String?,
+    selectedThread: CodexThread?,
+    onDismiss: () -> Unit,
+) {
+    SheetDialog(
+        onDismiss = onDismiss,
+        topPadding = 120.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            SheetHeader(
+                title = "Branch",
+                actionLabel = "Done",
+                onAction = onDismiss,
+            )
+            SettingsSection(title = "Current Repository") {
+                GroupedRowsCard {
+                    GroupedRow(
+                        label = branchLabel ?: "No branch detected",
+                        value = selectedThread?.projectDisplayName ?: "No project",
+                        supporting = selectedThread?.cwd ?: "Select a local conversation to inspect branch metadata.",
+                    )
+                }
+            }
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = Color(0xFFF2F0EC),
+            ) {
+                Text(
+                    text = "Branch switching UI now follows the iOS grouped-sheet pattern. Actual branch mutations stay deferred until runtime actions are wired.",
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetDialog(
+    onDismiss: () -> Unit,
+    topPadding: androidx.compose.ui.unit.Dp,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0x3D000000))
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = topPadding),
+                shape = RoundedCornerShape(30.dp),
+                color = Color(0xFFFBFAF7),
+                shadowElevation = 14.dp,
+            ) {
+                Column(content = content)
+            }
+        }
+    }
+}
+
+@Composable
+private fun FloatingSheetDialog(
+    onDismiss: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0x24000000))
+                .padding(horizontal = 22.dp, vertical = 84.dp),
+            contentAlignment = Alignment.TopCenter,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 420.dp),
+                shape = RoundedCornerShape(28.dp),
+                color = Color(0xFFFBFAF7),
+                shadowElevation = 18.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                    content = content,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetHeader(
+    title: String,
+    actionLabel: String,
+    onAction: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Spacer(modifier = Modifier.width(56.dp))
+        Text(
+            text = title,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        TextButton(onClick = onAction) {
+            Text(actionLabel)
+        }
+    }
+}
+
+@Composable
+private fun SettingsSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(title = title)
+        content()
+    }
+}
+
+@Composable
+private fun SectionLabel(title: String) {
+    Text(
+        text = title.uppercase(),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+    )
+}
+
+@Composable
+private fun GroupedRowsCard(content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = Color(0xFFF2F0EC),
+    ) {
+        Column(content = content)
+    }
+}
+
+@Composable
+private fun GroupedDivider() {
+    Divider(
+        modifier = Modifier.padding(horizontal = 16.dp),
+        color = Color(0xFFE6E1DA),
+    )
+}
+
+@Composable
+private fun GroupedRow(
+    label: String,
+    value: String? = null,
+    supporting: String? = null,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (value != null) {
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = Color(0xFF57ACFF),
+                )
+            }
+        }
+        supporting?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private data class MenuRowModel(
+    val title: String,
+    val subtitle: String,
+    val onClick: (() -> Unit)?,
+)
+
+@Composable
+private fun GroupedMenuSection(
+    title: String,
+    rows: List<MenuRowModel>,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = title,
+            modifier = Modifier.padding(horizontal = 6.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Surface(
+            shape = RoundedCornerShape(22.dp),
+            color = Color(0xFFF2F0EC),
+        ) {
+            Column {
+                rows.forEachIndexed { index, row ->
+                    if (index > 0) {
+                        Divider(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            color = Color(0xFFE6E1DA),
+                        )
+                    }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (row.onClick != null) {
+                                    Modifier.clickable(onClick = row.onClick)
+                                } else {
+                                    Modifier
+                                },
+                            )
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = row.title,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = if (row.onClick != null) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                        Text(
+                            text = row.subtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun TranscriptMessage(message: CodexMessage) {
     val isUser = message.role == CodexMessageRole.User
 
@@ -899,6 +1543,9 @@ private fun ComposerArea(
     isSending: Boolean,
     selectedThreadId: String?,
     branchLabel: String?,
+    onOpenSettings: () -> Unit,
+    onOpenBranchPicker: () -> Unit,
+    onOpenActionMenu: () -> Unit,
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
 ) {
@@ -949,11 +1596,18 @@ private fun ComposerArea(
                         icon = Icons.Outlined.Add,
                         contentDescription = "Add attachment or context",
                     )
-                    MinimalControlChip(label = "GPT-5.4")
-                    MinimalControlChip(label = "Extra High")
+                    MinimalControlChip(
+                        label = "GPT-5.4",
+                        onClick = onOpenSettings,
+                    )
+                    MinimalControlChip(
+                        label = "Extra High",
+                        onClick = onOpenSettings,
+                    )
                     MinimalIconChip(
                         icon = Icons.Outlined.Code,
                         contentDescription = "Quick tools",
+                        onClick = onOpenActionMenu,
                     )
                     Spacer(modifier = Modifier.weight(1f))
                     SendActionButton(
@@ -971,16 +1625,19 @@ private fun ComposerArea(
                 modifier = Modifier.weight(1f),
                 icon = Icons.AutoMirrored.Outlined.MenuBook,
                 label = "Local",
+                onClick = onOpenSettings,
             )
             RuntimePill(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Outlined.SettingsEthernet,
                 label = "On-Request",
+                onClick = onOpenSettings,
             )
             RuntimePill(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Outlined.FolderOpen,
                 label = branchLabel ?: "No branch",
+                onClick = onOpenBranchPicker,
             )
         }
     }
@@ -1020,14 +1677,25 @@ private fun MinimalIconChip(
 }
 
 @Composable
-private fun MinimalControlChip(label: String) {
+private fun MinimalControlChip(
+    label: String,
+    onClick: (() -> Unit)? = null,
+) {
     Surface(
         shape = CircleShape,
         color = Color(0xFFF1EFEB),
         border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            modifier = Modifier
+                .then(
+                    if (onClick != null) {
+                        Modifier.clickable(onClick = onClick)
+                    } else {
+                        Modifier
+                    },
+                )
+                .padding(horizontal = 10.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
@@ -1076,6 +1744,7 @@ private fun RuntimePill(
     modifier: Modifier = Modifier,
     icon: ImageVector,
     label: String,
+    onClick: (() -> Unit)? = null,
 ) {
     Surface(
         modifier = modifier,
@@ -1084,7 +1753,15 @@ private fun RuntimePill(
         border = BorderStroke(1.dp, Color(0xFFE6E2DB)),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = Modifier
+                .then(
+                    if (onClick != null) {
+                        Modifier.clickable(onClick = onClick)
+                    } else {
+                        Modifier
+                    },
+                )
+                .padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {

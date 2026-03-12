@@ -71,13 +71,13 @@
 
 ## Settings, Menus, And Secondary UI Parity
 
-- [ ] Match iOS settings screen grouped-card structure.
-- [ ] Match iOS settings section labels and spacing.
-- [ ] Match iOS connection/status card styling.
-- [ ] Match iOS onboarding step layout and single primary CTA emphasis.
-- [ ] Match iOS branch picker grouped list presentation.
-- [ ] Match iOS action menu grouped sheet presentation.
-- [ ] Keep secondary surfaces lightweight instead of default Material-heavy.
+- [x] Match iOS settings screen grouped-card structure.
+- [x] Match iOS settings section labels and spacing.
+- [x] Match iOS connection/status card styling.
+- [x] Match iOS onboarding step layout and single primary CTA emphasis.
+- [x] Match iOS branch picker grouped list presentation.
+- [x] Match iOS action menu grouped sheet presentation.
+- [x] Keep secondary surfaces lightweight instead of default Material-heavy.
 
 ## Sidebar And Badge Semantics
 

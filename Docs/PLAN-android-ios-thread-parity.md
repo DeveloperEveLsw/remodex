@@ -11,8 +11,9 @@
 - In progress: Android incoming notification reducer now handles basic turn and assistant lifecycle events
 - In progress: iOS UI reference set received and should drive the next Android visual pass
 - In progress: Android main conversation screen has been restyled toward the iOS top bar, transcript, and split-composer layout
+- In progress: Android secondary surfaces now follow the iOS grouped-card and lightweight sheet presentation for settings, onboarding, branch, and action menus
 - Pending: reconnect, unread badge, and stop-state parity with iOS guardrails
-- Pending: settings, menus, onboarding, and remaining secondary surfaces still diverge visually from iOS
+- Pending: remaining parity gaps are now primarily behavioral rather than large visual mismatches
 
 ## Goal
 
