@@ -375,7 +375,7 @@ private fun ThreadDrawerRow(
         icon = {
             Icon(
                 imageVector = if (thread.syncState == CodexThreadSyncState.ArchivedLocal) {
-                    Icons.Outlined.MenuBook
+                    Icons.AutoMirrored.Outlined.MenuBook
                 } else {
                     Icons.Outlined.FolderOpen
                 },
