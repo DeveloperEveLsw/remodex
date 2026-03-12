@@ -165,6 +165,82 @@ class RemodexTransportClientLifecycleTests {
         assertEquals("/tmp/project", (threadStartParams["cwd"] as JsonPrimitive).content)
     }
 
+    @Test
+    fun interruptTurnRetriesWithSnakeCaseParamsWhenServerRejectsCamelCase() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("turn/interrupt") {
+                    throw RemodexTransportException(
+                        kind = RemodexTransportFailureKind.Rpc,
+                        message = "RPC error -32602: unknown field turnId",
+                        rpcError = RpcError(code = -32602, message = "unknown field turnId"),
+                    )
+                },
+                ScriptedStep("turn/interrupt") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(emptyMap()),
+                    )
+                },
+            ),
+        )
+
+        transport.interruptTurn(
+            turnId = "turn-1",
+            threadId = "thread-1",
+        )
+
+        assertEquals(listOf("turn/interrupt", "turn/interrupt"), transport.recordedMethods)
+
+        val firstParams = transport.recordedParams[0].second as JsonObject
+        val secondParams = transport.recordedParams[1].second as JsonObject
+        assertEquals("turn-1", (firstParams["turnId"] as JsonPrimitive).content)
+        assertEquals("thread-1", (firstParams["threadId"] as JsonPrimitive).content)
+        assertEquals("turn-1", (secondParams["turn_id"] as JsonPrimitive).content)
+        assertEquals("thread-1", (secondParams["thread_id"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun startTurnIncludesRuntimeModelAndReasoningPayload() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/resume") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-live", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("turn/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-1"))),
+                    )
+                },
+            ),
+        )
+
+        transport.startTurn(
+            threadId = "thread-live",
+            userInput = "hello world",
+            collaborationMode = app.remodex.android.core.model.CodexCollaborationModeKind.Plan,
+            modelIdentifier = "gpt-5.4",
+            reasoningEffort = "high",
+        )
+
+        val resumeParams = transport.recordedParams[0].second as JsonObject
+        val turnStartParams = transport.recordedParams[1].second as JsonObject
+
+        assertEquals("gpt-5.4", (resumeParams["model"] as JsonPrimitive).content)
+        assertEquals("gpt-5.4", (turnStartParams["model"] as JsonPrimitive).content)
+        assertEquals("high", (turnStartParams["effort"] as JsonPrimitive).content)
+
+        val collaboration = turnStartParams["collaborationMode"] as JsonObject
+        assertEquals("plan", (collaboration["mode"] as JsonPrimitive).content)
+        val settings = collaboration["settings"] as JsonObject
+        assertEquals("gpt-5.4", (settings["model"] as JsonPrimitive).content)
+        assertEquals("high", (settings["reasoning_effort"] as JsonPrimitive).content)
+    }
+
     private data class ScriptedStep(
         val expectedMethod: String,
         val action: (JsonValue?) -> RpcMessage,

@@ -3,7 +3,9 @@ package app.remodex.android
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import app.remodex.android.core.model.CodexAccessMode
+import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.pairing.RemodexPairingParser
@@ -11,6 +13,7 @@ import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
 import app.remodex.android.core.transport.RemodexTransportClient
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
+import app.remodex.android.core.transport.RemodexTransportException
 import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportState
@@ -31,6 +34,12 @@ data class RemodexDebugUiState(
     val supportsPlanCollaborationMode: Boolean = false,
     val sessionUrl: String? = null,
     val diagnostics: RemodexTransportDiagnostics = RemodexTransportDiagnostics(),
+    val availableModels: List<CodexModelOption> = emptyList(),
+    val selectedModelId: String? = null,
+    val selectedReasoningEffort: String? = null,
+    val selectedAccessMode: CodexAccessMode = CodexAccessMode.OnRequest,
+    val availableCollaborationModes: List<CodexCollaborationModeKind> = listOf(CodexCollaborationModeKind.Default),
+    val selectedCollaborationMode: CodexCollaborationModeKind = CodexCollaborationModeKind.Default,
     val threads: List<CodexThread> = emptyList(),
     val conversation: RemodexConversationState = RemodexConversationState(),
     val draftTurnInput: String = "",
@@ -44,6 +53,21 @@ data class RemodexDebugUiState(
 ) {
     val activeThreadId: String?
         get() = conversation.activeThreadId
+
+    val selectedModelOption: CodexModelOption?
+        get() = availableModels.firstOrNull { it.id == selectedModelId || it.model == selectedModelId }
+
+    val selectedModelLabel: String
+        get() = selectedModelOption?.displayTitle() ?: "Select model"
+
+    val selectedReasoningLabel: String
+        get() = selectedReasoningEffort?.let(::reasoningTitle) ?: "Select reasoning"
+
+    val availableReasoningEffortsForSelectedModel: List<String>
+        get() = selectedModelOption?.supportedReasoningEfforts
+            ?.map { it.reasoningEffort.trim() }
+            ?.filter { it.isNotEmpty() }
+            .orEmpty()
 }
 
 class RemodexDebugViewModel(
@@ -55,6 +79,7 @@ class RemodexDebugViewModel(
     init {
         viewModelScope.launch {
             transport.state.collect { state ->
+                val previousState = _uiState.value.connectionState
                 _uiState.update { current ->
                     val connectedState = state as? RemodexTransportState.Connected
                     current.copy(
@@ -62,6 +87,17 @@ class RemodexDebugViewModel(
                         hostInfo = connectedState?.hostInfo,
                         supportsPlanCollaborationMode = connectedState?.supportsPlanCollaborationMode ?: false,
                     )
+                }
+
+                val isNewInitializedConnection = state is RemodexTransportState.Connected &&
+                    state.isInitialized &&
+                    (previousState !is RemodexTransportState.Connected || !previousState.isInitialized)
+                if (isNewInitializedConnection) {
+                    val activeThreadId = _uiState.value.activeThreadId
+                    refreshRuntimeOptions()
+                    if (!activeThreadId.isNullOrBlank()) {
+                        prepareThreadForDisplay(activeThreadId, forceHydration = true)
+                    }
                 }
             }
         }
@@ -116,6 +152,50 @@ class RemodexDebugViewModel(
         }
     }
 
+    fun selectRuntimeModel(modelId: String?) {
+        _uiState.update { current ->
+            normalizeRuntimeSelection(
+                current.copy(
+                    selectedModelId = modelId?.trim()?.takeIf(String::isNotEmpty),
+                    errorMessage = null,
+                ),
+            )
+        }
+    }
+
+    fun selectRuntimeReasoningEffort(reasoningEffort: String?) {
+        _uiState.update { current ->
+            normalizeRuntimeSelection(
+                current.copy(
+                    selectedReasoningEffort = reasoningEffort?.trim()?.takeIf(String::isNotEmpty),
+                    errorMessage = null,
+                ),
+            )
+        }
+    }
+
+    fun selectAccessMode(accessMode: CodexAccessMode) {
+        _uiState.update { current ->
+            current.copy(
+                selectedAccessMode = accessMode,
+                errorMessage = null,
+            )
+        }
+    }
+
+    fun selectCollaborationMode(mode: CodexCollaborationModeKind) {
+        _uiState.update { current ->
+            current.copy(
+                selectedCollaborationMode = if (current.availableCollaborationModes.contains(mode)) {
+                    mode
+                } else {
+                    CodexCollaborationModeKind.Default
+                },
+                errorMessage = null,
+            )
+        }
+    }
+
     fun parsePairingPayload() {
         runCatching {
             RemodexPairingParser.parse(_uiState.value.qrPayload)
@@ -162,6 +242,7 @@ class RemodexDebugViewModel(
                 transport.connectWithRecovery(pairing = pairing)
             }.onSuccess { handshake ->
                 applyHandshake(handshake)
+                refreshRuntimeOptions()
                 refreshThreads()
             }.onFailure { throwable ->
                 _uiState.update { current ->
@@ -227,6 +308,27 @@ class RemodexDebugViewModel(
         }
     }
 
+    fun refreshRuntimeOptions() {
+        viewModelScope.launch {
+            val modelsResult = runCatching { transport.listModels() }.getOrDefault(emptyList())
+            val collaborationModesResult = runCatching { transport.listCollaborationModes() }
+                .getOrDefault(listOf(CodexCollaborationModeKind.Default))
+                .ifEmpty { listOf(CodexCollaborationModeKind.Default) }
+
+            _uiState.update { current ->
+                normalizeRuntimeSelection(
+                    current.copy(
+                        availableModels = modelsResult,
+                        availableCollaborationModes = collaborationModesResult.distinct(),
+                        selectedCollaborationMode = current.selectedCollaborationMode
+                            .takeIf(collaborationModesResult::contains)
+                            ?: CodexCollaborationModeKind.Default,
+                    ),
+                )
+            }
+        }
+    }
+
     fun startThread() {
         viewModelScope.launch {
             val preferredProjectPath = _uiState.value.threads
@@ -243,7 +345,7 @@ class RemodexDebugViewModel(
             runCatching {
                 transport.startThread(
                     preferredProjectPath = preferredProjectPath,
-                    accessMode = CodexAccessMode.OnRequest,
+                    accessMode = _uiState.value.selectedAccessMode,
                 )
             }.onSuccess { result ->
                 applyThreadStarted(result)
@@ -260,27 +362,7 @@ class RemodexDebugViewModel(
 
     fun selectThread(threadId: String) {
         viewModelScope.launch {
-            _uiState.update { current ->
-                current.copy(
-                    conversation = current.conversation
-                        .withActiveThread(threadId)
-                        .withThreadLoading(threadId, isLoading = true),
-                    errorMessage = null,
-                )
-            }
-
-            runCatching {
-                transport.readThread(threadId = threadId, includeTurns = true)
-            }.onSuccess { threadResult ->
-                applyThreadRead(threadResult)
-            }.onFailure { throwable ->
-                _uiState.update { current ->
-                    current.copy(
-                        conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
-                        errorMessage = throwable.message,
-                    )
-                }
-            }
+            prepareThreadForDisplay(threadId)
         }
     }
 
@@ -314,10 +396,15 @@ class RemodexDebugViewModel(
                 transport.startTurn(
                     threadId = selectedThreadId,
                     userInput = trimmedInput,
-                    accessMode = CodexAccessMode.OnRequest,
+                    accessMode = currentState.selectedAccessMode,
+                    collaborationMode = currentState.selectedCollaborationMode.takeUnless {
+                        it == CodexCollaborationModeKind.Default
+                    },
                     preferredProjectPath = currentState.threads
                         .firstOrNull { it.id == selectedThreadId }
                         ?.cwd,
+                    modelIdentifier = currentState.selectedModelOption?.model,
+                    reasoningEffort = currentState.selectedReasoningEffort,
                 )
             }.onSuccess { result ->
                 applyTurnStarted(result)
@@ -327,6 +414,62 @@ class RemodexDebugViewModel(
                         isStartingTurn = false,
                         errorMessage = throwable.message,
                     )
+                }
+            }
+        }
+    }
+
+    fun interruptTurn() {
+        viewModelScope.launch {
+            val threadId = _uiState.value.activeThreadId
+            if (threadId.isNullOrBlank()) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "Select a running thread before stopping a turn.")
+                }
+                return@launch
+            }
+
+            val resolvedTurnId = resolveInterruptibleTurnId(threadId = threadId)
+            if (resolvedTurnId == null) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "No active turn is available to interrupt.")
+                }
+                return@launch
+            }
+
+            runCatching {
+                transport.interruptTurn(
+                    turnId = resolvedTurnId,
+                    threadId = threadId,
+                )
+            }.onSuccess {
+                _uiState.update { current ->
+                    current.copy(errorMessage = null)
+                }
+            }.onFailure { throwable ->
+                if (shouldRetryInterruptWithRefreshedTurnId(throwable)) {
+                    val refreshedTurnId = resolveInterruptibleTurnId(threadId = threadId, forceRefresh = true)
+                    if (refreshedTurnId != null && refreshedTurnId != resolvedTurnId) {
+                        runCatching {
+                            transport.interruptTurn(
+                                turnId = refreshedTurnId,
+                                threadId = threadId,
+                            )
+                        }.onSuccess {
+                            _uiState.update { current ->
+                                current.copy(errorMessage = null)
+                            }
+                        }.onFailure { refreshThrowable ->
+                            _uiState.update { current ->
+                                current.copy(errorMessage = refreshThrowable.message)
+                            }
+                        }
+                        return@launch
+                    }
+                }
+
+                _uiState.update { current ->
+                    current.copy(errorMessage = throwable.message)
                 }
             }
         }
@@ -376,7 +519,9 @@ class RemodexDebugViewModel(
 
             current.copy(
                 threads = updatedThreads,
-                conversation = current.conversation.withActiveThread(result.threadId),
+                conversation = current.conversation
+                    .withActiveThread(result.threadId)
+                    .withTurnStarted(result.threadId, result.turnId),
                 draftTurnInput = "",
                 isStartingTurn = false,
                 lastStartedTurnId = result.turnId,
@@ -391,12 +536,180 @@ class RemodexDebugViewModel(
             current.copy(
                 conversation = current.conversation
                     .withActiveThread(threadResult.thread.id)
-                    .withThreadMessages(threadResult.thread.id, threadResult.messages)
+                    .markThreadAsViewed(threadResult.thread.id)
+                    .withRefreshedInFlightTurnState(threadResult.thread.id, threadResult.turnStateSnapshot)
+                    .mergeHydratedThreadMessages(threadResult.thread.id, threadResult.messages)
                     .withThreadLoading(threadResult.thread.id, isLoading = false),
                 threads = upsertThread(current.threads, threadResult.thread),
                 errorMessage = null,
             )
         }
+    }
+
+    private suspend fun resolveInterruptibleTurnId(
+        threadId: String,
+        forceRefresh: Boolean = false,
+    ): String? {
+        val localTurnId = _uiState.value.conversation.activeTurnIdByThread[threadId]
+        if (!forceRefresh && !localTurnId.isNullOrBlank()) {
+            return localTurnId
+        }
+
+        val threadResult = runCatching {
+            transport.readThread(threadId = threadId, includeTurns = true)
+        }.getOrElse { throwable ->
+            _uiState.update { current ->
+                current.copy(errorMessage = throwable.message)
+            }
+            return null
+        }
+
+        applyThreadRead(threadResult)
+        return threadResult.turnStateSnapshot.interruptibleTurnId ?: threadResult.turnStateSnapshot.latestTurnId
+    }
+
+    private suspend fun prepareThreadForDisplay(
+        threadId: String,
+        forceHydration: Boolean = false,
+    ) {
+        _uiState.update { current ->
+            current.copy(
+                conversation = current.conversation
+                    .withActiveThread(threadId)
+                    .markThreadAsViewed(threadId)
+                    .withThreadLoading(threadId, isLoading = shouldLoadThreadHistory(current, threadId, forceHydration)),
+                errorMessage = null,
+            )
+        }
+
+        val isConnected = (_uiState.value.connectionState as? RemodexTransportState.Connected)?.isInitialized == true
+        if (!isConnected) {
+            _uiState.update { current ->
+                current.copy(
+                    conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                )
+            }
+            return
+        }
+
+        runCatching {
+            transport.resumeThread(
+                threadId = threadId,
+                accessMode = _uiState.value.selectedAccessMode,
+                modelIdentifier = _uiState.value.selectedModelOption?.model,
+            )
+        }.onSuccess { resumeResult ->
+            resumeResult.thread?.let { resumedThread ->
+                _uiState.update { current ->
+                    current.copy(threads = upsertThread(current.threads, resumedThread))
+                }
+            }
+        }.onFailure { throwable ->
+            _uiState.update { current ->
+                current.copy(
+                    conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                    errorMessage = throwable.message,
+                )
+            }
+            return
+        }
+
+        if (!shouldLoadThreadHistory(_uiState.value, threadId, forceHydration)) {
+            _uiState.update { current ->
+                current.copy(
+                    conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                )
+            }
+            return
+        }
+
+        runCatching {
+            transport.readThread(threadId = threadId, includeTurns = true)
+        }.onSuccess { threadResult ->
+            applyThreadRead(threadResult)
+        }.onFailure { throwable ->
+            _uiState.update { current ->
+                current.copy(
+                    conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                    errorMessage = throwable.message,
+                )
+            }
+        }
+    }
+
+    private fun shouldLoadThreadHistory(
+        state: RemodexDebugUiState,
+        threadId: String,
+        forceHydration: Boolean,
+    ): Boolean {
+        return forceHydration || !state.conversation.isHydratedThread(threadId)
+    }
+
+    private fun normalizeRuntimeSelection(state: RemodexDebugUiState): RemodexDebugUiState {
+        val resolvedModel = selectResolvedModel(
+            availableModels = state.availableModels,
+            selectedModelId = state.selectedModelId,
+        )
+        val resolvedModelId = resolvedModel?.id?.takeIf(String::isNotBlank)
+            ?: resolvedModel?.model?.takeIf(String::isNotBlank)
+        val supportedReasoning = resolvedModel?.supportedReasoningEfforts
+            ?.map { it.reasoningEffort.trim() }
+            ?.filter { it.isNotEmpty() }
+            .orEmpty()
+
+        val resolvedReasoning = when {
+            supportedReasoning.isEmpty() -> null
+            state.selectedReasoningEffort != null && supportedReasoning.contains(state.selectedReasoningEffort) -> state.selectedReasoningEffort
+            !resolvedModel?.defaultReasoningEffort.isNullOrBlank() &&
+                supportedReasoning.contains(resolvedModel?.defaultReasoningEffort) -> resolvedModel?.defaultReasoningEffort
+            supportedReasoning.contains("medium") -> "medium"
+            else -> supportedReasoning.firstOrNull()
+        }
+        val availableCollaborationModes = state.availableCollaborationModes
+            .ifEmpty { listOf(CodexCollaborationModeKind.Default) }
+            .distinct()
+        val selectedCollaborationMode = state.selectedCollaborationMode
+            .takeIf(availableCollaborationModes::contains)
+            ?: CodexCollaborationModeKind.Default
+
+        return state.copy(
+            selectedModelId = resolvedModelId,
+            selectedReasoningEffort = resolvedReasoning,
+            availableCollaborationModes = availableCollaborationModes,
+            selectedCollaborationMode = selectedCollaborationMode,
+        )
+    }
+
+    private fun shouldRetryInterruptWithRefreshedTurnId(throwable: Throwable): Boolean {
+        val classified = throwable as? RemodexTransportException ?: return false
+        val message = classified.message.lowercase()
+        val hints = listOf(
+            "turn not found",
+            "no active turn",
+            "not in progress",
+            "not interruptible",
+            "already completed",
+            "already stopped",
+        )
+        return hints.any(message::contains)
+    }
+
+    private fun selectResolvedModel(
+        availableModels: List<CodexModelOption>,
+        selectedModelId: String?,
+    ): CodexModelOption? {
+        if (availableModels.isEmpty()) {
+            return null
+        }
+
+        val normalizedSelectedId = selectedModelId?.trim()?.takeIf(String::isNotEmpty)
+        if (normalizedSelectedId != null) {
+            availableModels.firstOrNull { it.id == normalizedSelectedId || it.model == normalizedSelectedId }?.let {
+                return it
+            }
+        }
+
+        return availableModels.firstOrNull(CodexModelOption::isDefault) ?: availableModels.first()
     }
 
     private fun buildTurnStartSummary(result: RemodexTurnStartResult): String {
@@ -468,5 +781,34 @@ class RemodexDebugViewModel(
         }
 
         return merged
+    }
+}
+
+private fun CodexModelOption.displayTitle(): String {
+    val normalizedModel = model.trim().lowercase()
+    return when (normalizedModel) {
+        "gpt-5.3-codex" -> "GPT-5.3-Codex"
+        "gpt-5.2-codex" -> "GPT-5.2-Codex"
+        "gpt-5.1-codex-max" -> "GPT-5.1-Codex-Max"
+        "gpt-5.4" -> "GPT-5.4"
+        "gpt-5.2" -> "GPT-5.2"
+        "gpt-5.1-codex-mini" -> "GPT-5.1-Codex-Mini"
+        else -> displayName.ifBlank { model.ifBlank { id } }
+    }
+}
+
+private fun reasoningTitle(effort: String): String {
+    return when (effort.trim().lowercase()) {
+        "minimal", "low" -> "Low"
+        "medium" -> "Medium"
+        "high" -> "High"
+        "xhigh", "extra_high", "extra-high", "very_high", "very-high" -> "Extra High"
+        else -> effort.trim()
+            .split("_", "-")
+            .filter { it.isNotBlank() }
+            .joinToString(" ") { token ->
+                token.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            }
+            .ifBlank { effort }
     }
 }

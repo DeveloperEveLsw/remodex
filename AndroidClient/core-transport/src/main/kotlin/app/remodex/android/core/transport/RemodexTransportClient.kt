@@ -6,6 +6,7 @@ import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.pairing.RemodexPairingPayload
@@ -286,6 +287,32 @@ open class RemodexTransportClient(
         return page.mapNotNull(::decodeThread)
     }
 
+    open suspend fun listModels(
+        limit: Int = 50,
+    ): List<CodexModelOption> {
+        val response = sendRequest(
+            method = "model/list",
+            params = JsonObject(
+                mapOf(
+                    "cursor" to kotlinx.serialization.json.JsonNull,
+                    "limit" to JsonPrimitive(limit),
+                    "includeHidden" to JsonPrimitive(false),
+                ),
+            ),
+        )
+
+        val resultObject = response.result as? JsonObject
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "model/list response missing payload",
+            )
+
+        val page = (resultObject["items"] ?: resultObject["data"] ?: resultObject["models"]) as? JsonArray
+            ?: return emptyList()
+
+        return page.mapNotNull(::decodeModelOption)
+    }
+
     private suspend fun sendThreadListRequest(
         strategy: String,
         params: Map<String, JsonValue>?,
@@ -338,6 +365,7 @@ open class RemodexTransportClient(
         return RemodexThreadReadResult(
             thread = thread,
             messages = if (includeTurns) decodeMessagesFromThreadRead(threadId, threadObject) else emptyList(),
+            turnStateSnapshot = extractThreadTurnStateSnapshot(threadObject),
         )
     }
 
@@ -365,6 +393,7 @@ open class RemodexTransportClient(
     open suspend fun resumeThread(
         threadId: String,
         accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
+        modelIdentifier: String? = null,
     ): RemodexThreadResumeResult {
         val normalizedThreadId = threadId.trim()
         if (normalizedThreadId.isEmpty()) {
@@ -376,7 +405,10 @@ open class RemodexTransportClient(
 
         val response = sendRequestWithSandboxFallback(
             method = "thread/resume",
-            baseParams = buildThreadResumeRequestParams(normalizedThreadId),
+            baseParams = buildThreadResumeRequestParams(
+                threadId = normalizedThreadId,
+                modelIdentifier = modelIdentifier,
+            ),
             accessMode = accessMode,
         )
 
@@ -393,7 +425,40 @@ open class RemodexTransportClient(
         )
     }
 
-    suspend fun listCollaborationModes(): List<CodexCollaborationModeKind> {
+    open suspend fun interruptTurn(
+        turnId: String,
+        threadId: String? = null,
+    ) {
+        val normalizedTurnId = turnId.trim()
+        if (normalizedTurnId.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "turn/interrupt requires a non-empty turnId",
+            )
+        }
+
+        val normalizedThreadId = threadId?.trim()?.takeIf(String::isNotEmpty)
+
+        try {
+            sendInterruptRequest(
+                turnId = normalizedTurnId,
+                threadId = normalizedThreadId,
+                useSnakeCaseParams = false,
+            )
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (!shouldRetryInterruptWithSnakeCaseParams(classified)) {
+                throw classified
+            }
+            sendInterruptRequest(
+                turnId = normalizedTurnId,
+                threadId = normalizedThreadId,
+                useSnakeCaseParams = true,
+            )
+        }
+    }
+
+    open suspend fun listCollaborationModes(): List<CodexCollaborationModeKind> {
         val response = runCatching {
             sendRequest(
                 method = "collaborationMode/list",
@@ -438,6 +503,8 @@ open class RemodexTransportClient(
         accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
         collaborationMode: CodexCollaborationModeKind? = null,
         preferredProjectPath: String? = null,
+        modelIdentifier: String? = null,
+        reasoningEffort: String? = null,
     ): RemodexTurnStartResult {
         val normalizedThreadId = threadId.trim()
         val trimmedInput = userInput.trim()
@@ -460,6 +527,7 @@ open class RemodexTransportClient(
             resumeThread(
                 threadId = normalizedThreadId,
                 accessMode = accessMode,
+                modelIdentifier = modelIdentifier,
             ).thread
         } catch (throwable: Throwable) {
             val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
@@ -474,6 +542,8 @@ open class RemodexTransportClient(
                 collaborationMode = collaborationMode,
                 preferredProjectPath = normalizedPreferredProjectPath,
                 ensureContinuationResumed = true,
+                modelIdentifier = modelIdentifier,
+                reasoningEffort = reasoningEffort,
             )
         }
 
@@ -483,6 +553,8 @@ open class RemodexTransportClient(
                 userInput = trimmedInput,
                 accessMode = accessMode,
                 collaborationMode = collaborationMode,
+                modelIdentifier = modelIdentifier,
+                reasoningEffort = reasoningEffort,
             )
             return RemodexTurnStartResult(
                 requestedThreadId = normalizedThreadId,
@@ -506,6 +578,8 @@ open class RemodexTransportClient(
                 collaborationMode = collaborationMode,
                 preferredProjectPath = normalizedPreferredProjectPath,
                 ensureContinuationResumed = false,
+                modelIdentifier = modelIdentifier,
+                reasoningEffort = reasoningEffort,
             )
         }
     }
@@ -522,6 +596,24 @@ open class RemodexTransportClient(
                     "includeTurns" to JsonPrimitive(includeTurns),
                 ),
             ),
+        )
+    }
+
+    private suspend fun sendInterruptRequest(
+        turnId: String,
+        threadId: String?,
+        useSnakeCaseParams: Boolean,
+    ) {
+        val params = buildMap<String, JsonValue> {
+            put(if (useSnakeCaseParams) "turn_id" else "turnId", JsonPrimitive(turnId))
+            if (threadId != null) {
+                put(if (useSnakeCaseParams) "thread_id" else "threadId", JsonPrimitive(threadId))
+            }
+        }
+
+        sendRequest(
+            method = "turn/interrupt",
+            params = JsonObject(params),
         )
     }
 
@@ -753,6 +845,21 @@ open class RemodexTransportClient(
             || message.contains("invalid")
     }
 
+    private fun shouldRetryInterruptWithSnakeCaseParams(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600 && rpcError.code != -32602) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        val hints = listOf("turnid", "threadid", "turn_id", "thread_id", "unknown field", "missing field", "invalid")
+        return hints.any(message::contains)
+    }
+
     private suspend fun sendRequestWithApprovalPolicyFallback(
         method: String,
         baseParams: Map<String, JsonValue>,
@@ -825,6 +932,8 @@ open class RemodexTransportClient(
         collaborationMode: CodexCollaborationModeKind?,
         preferredProjectPath: String?,
         ensureContinuationResumed: Boolean,
+        modelIdentifier: String?,
+        reasoningEffort: String?,
     ): RemodexTurnStartResult {
         val startedThread = startThread(
             preferredProjectPath = preferredProjectPath,
@@ -834,6 +943,7 @@ open class RemodexTransportClient(
             resumeThread(
                 threadId = startedThread.id,
                 accessMode = accessMode,
+                modelIdentifier = modelIdentifier,
             ).thread ?: startedThread
         } else {
             startedThread
@@ -843,6 +953,8 @@ open class RemodexTransportClient(
             userInput = userInput,
             accessMode = accessMode,
             collaborationMode = collaborationMode,
+            modelIdentifier = modelIdentifier,
+            reasoningEffort = reasoningEffort,
         )
 
         return RemodexTurnStartResult(
@@ -863,6 +975,8 @@ open class RemodexTransportClient(
         userInput: String,
         accessMode: CodexAccessMode,
         collaborationMode: CodexCollaborationModeKind?,
+        modelIdentifier: String?,
+        reasoningEffort: String?,
     ): TurnStartRequestResult {
         var effectiveCollaborationMode = collaborationMode
         var downgradedCollaborationMode = false
@@ -872,6 +986,8 @@ open class RemodexTransportClient(
                 threadId = threadId,
                 userInput = userInput,
                 collaborationMode = effectiveCollaborationMode,
+                modelIdentifier = modelIdentifier,
+                reasoningEffort = reasoningEffort,
             )
 
             try {
@@ -969,16 +1085,23 @@ open class RemodexTransportClient(
 
     private fun buildThreadResumeRequestParams(
         threadId: String,
+        modelIdentifier: String?,
     ): Map<String, JsonValue> {
-        return mutableMapOf(
+        return mutableMapOf<String, JsonValue>(
             "threadId" to JsonPrimitive(threadId),
-        )
+        ).apply {
+            if (!modelIdentifier.isNullOrBlank()) {
+                this["model"] = JsonPrimitive(modelIdentifier)
+            }
+        }
     }
 
     private fun buildTurnStartRequestParams(
         threadId: String,
         userInput: String,
         collaborationMode: CodexCollaborationModeKind?,
+        modelIdentifier: String?,
+        reasoningEffort: String?,
     ): Map<String, JsonValue> {
         val params = mutableMapOf<String, JsonValue>(
             "threadId" to JsonPrimitive(threadId),
@@ -994,7 +1117,18 @@ open class RemodexTransportClient(
             ),
         )
 
-        buildCollaborationModePayload(collaborationMode)?.let { payload ->
+        if (!modelIdentifier.isNullOrBlank()) {
+            params["model"] = JsonPrimitive(modelIdentifier)
+        }
+        if (!reasoningEffort.isNullOrBlank()) {
+            params["effort"] = JsonPrimitive(reasoningEffort)
+        }
+
+        buildCollaborationModePayload(
+            collaborationMode = collaborationMode,
+            modelIdentifier = modelIdentifier,
+            reasoningEffort = reasoningEffort,
+        )?.let { payload ->
             params["collaborationMode"] = payload
         }
 
@@ -1041,6 +1175,8 @@ open class RemodexTransportClient(
 
     private fun buildCollaborationModePayload(
         collaborationMode: CodexCollaborationModeKind?,
+        modelIdentifier: String?,
+        reasoningEffort: String?,
     ): JsonValue? {
         return when (collaborationMode) {
             null,
@@ -1049,6 +1185,19 @@ open class RemodexTransportClient(
             CodexCollaborationModeKind.Plan -> JsonObject(
                 mapOf(
                     "mode" to JsonPrimitive("plan"),
+                    "settings" to JsonObject(
+                        mapOf(
+                            "model" to JsonPrimitive(modelIdentifier ?: ""),
+                            "reasoning_effort" to (
+                                if (reasoningEffort.isNullOrBlank()) {
+                                    kotlinx.serialization.json.JsonNull
+                                } else {
+                                    JsonPrimitive(reasoningEffort)
+                                }
+                            ),
+                            "developer_instructions" to kotlinx.serialization.json.JsonNull,
+                        ),
+                    ),
                 ),
             )
         }
@@ -1233,6 +1382,12 @@ open class RemodexTransportClient(
     private fun decodeThread(value: JsonValue): CodexThread? {
         return runCatching {
             json.decodeFromJsonElement(CodexThread.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeModelOption(value: JsonValue): CodexModelOption? {
+        return runCatching {
+            json.decodeFromJsonElement(CodexModelOption.serializer(), value)
         }.getOrNull()
     }
 
@@ -1452,6 +1607,72 @@ open class RemodexTransportClient(
         }
 
         return messages
+    }
+
+    private fun extractThreadTurnStateSnapshot(threadObject: JsonObject): RemodexThreadTurnStateSnapshot {
+        val turns = threadObject["turns"] as? JsonArray ?: return RemodexThreadTurnStateSnapshot()
+        val latestTurnObject = turns.lastOrNull() as? JsonObject ?: return RemodexThreadTurnStateSnapshot()
+        val latestTurnId = latestTurnObject["id"].stringValueOrNull()
+            ?: latestTurnObject["turnId"].stringValueOrNull()
+            ?: latestTurnObject["turn_id"].stringValueOrNull()
+        val latestStatus = normalizedTurnStatus(latestTurnObject)
+
+        if (!isInterruptibleTurnStatus(latestStatus)) {
+            return RemodexThreadTurnStateSnapshot(
+                latestTurnId = latestTurnId,
+            )
+        }
+
+        if (latestTurnId != null) {
+            return RemodexThreadTurnStateSnapshot(
+                interruptibleTurnId = latestTurnId,
+                latestTurnId = latestTurnId,
+            )
+        }
+
+        return RemodexThreadTurnStateSnapshot(
+            hasInterruptibleTurnWithoutId = true,
+            latestTurnId = latestTurnId,
+        )
+    }
+
+    private fun normalizedTurnStatus(turnObject: JsonObject): String? {
+        val status = turnObject["status"].stringValueOrNull()
+            ?: turnObject["turnStatus"].stringValueOrNull()
+            ?: turnObject["turn_status"].stringValueOrNull()
+
+        return status
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+            ?.replace("_", "")
+            ?.replace("-", "")
+            ?.lowercase()
+    }
+
+    private fun isInterruptibleTurnStatus(status: String?): Boolean {
+        if (status == null) {
+            return true
+        }
+
+        if (status.contains("inprogress")
+            || status.contains("running")
+            || status.contains("pending")
+            || status.contains("started")
+        ) {
+            return true
+        }
+
+        if (status.contains("complete")
+            || status.contains("failed")
+            || status.contains("error")
+            || status.contains("interrupt")
+            || status.contains("cancel")
+            || status.contains("stopped")
+        ) {
+            return false
+        }
+
+        return true
     }
 
     private fun decodeItemDisplayText(itemObject: JsonObject): String {

@@ -1,5 +1,6 @@
 package app.remodex.android
 
+import app.remodex.android.core.model.CodexTurnTerminalState
 import app.remodex.android.core.protocol.RpcMessage
 import app.remodex.android.core.protocol.arrayValue
 import app.remodex.android.core.protocol.objectValue
@@ -91,7 +92,11 @@ object RemodexConversationReducer {
             turnIdHint = turnId,
         ) ?: return conversation
 
-        return conversation.withTurnCompleted(threadId = threadId, turnId = turnId)
+        return conversation.withTurnCompleted(
+            threadId = threadId,
+            turnId = turnId,
+            terminalState = parseTurnTerminalState(paramsObject, eventObject),
+        )
     }
 
     private fun reduceItemStarted(
@@ -241,6 +246,82 @@ object RemodexConversationReducer {
             paramsObject["text"]?.stringValue,
             eventObject?.get("text")?.stringValue,
         ).orEmpty()
+    }
+
+    private fun parseTurnTerminalState(
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+    ): CodexTurnTerminalState {
+        if (extractFailureMessage(paramsObject, eventObject) != null) {
+            return CodexTurnTerminalState.Failed
+        }
+
+        val turnObject = paramsObject["turn"]?.objectValue
+        val statusObject = turnObject?.get("status")?.objectValue
+            ?: paramsObject["status"]?.objectValue
+            ?: eventObject?.get("status")?.objectValue
+
+        val rawStatus = firstNonBlank(
+            turnObject?.get("status")?.stringValue,
+            paramsObject["status"]?.stringValue,
+            eventObject?.get("status")?.stringValue,
+            statusObject?.get("type")?.stringValue,
+            statusObject?.get("statusType")?.stringValue,
+            statusObject?.get("status_type")?.stringValue,
+        ).orEmpty()
+
+        val normalizedStatus = rawStatus
+            .trim()
+            .lowercase()
+            .replace("_", "")
+            .replace("-", "")
+            .replace(" ", "")
+
+        if (normalizedStatus.contains("cancel")
+            || normalizedStatus.contains("abort")
+            || normalizedStatus.contains("interrupt")
+            || normalizedStatus.contains("stopped")
+        ) {
+            return CodexTurnTerminalState.Stopped
+        }
+        if (normalizedStatus.contains("fail") || normalizedStatus.contains("error")) {
+            return CodexTurnTerminalState.Failed
+        }
+        return CodexTurnTerminalState.Completed
+    }
+
+    private fun extractFailureMessage(paramsObject: JsonObject, eventObject: JsonObject?): String? {
+        val turnObject = paramsObject["turn"]?.objectValue
+        val status = firstNonBlank(
+            turnObject?.get("status")?.stringValue,
+            paramsObject["status"]?.stringValue,
+            eventObject?.get("status")?.stringValue,
+        )
+
+        val failedStatus = status
+            ?.trim()
+            ?.lowercase()
+            ?.replace("_", "")
+            ?.replace("-", "")
+            ?.replace(" ", "")
+            ?.contains("fail") == true
+
+        if (!failedStatus) {
+            return firstNonBlank(
+                turnObject?.get("error")?.objectValue?.get("message")?.stringValue,
+                paramsObject["error"]?.objectValue?.get("message")?.stringValue,
+                paramsObject["errorMessage"]?.stringValue,
+                eventObject?.get("error")?.objectValue?.get("message")?.stringValue,
+            )
+        }
+
+        return firstNonBlank(
+            turnObject?.get("error")?.objectValue?.get("message")?.stringValue,
+            paramsObject["error"]?.objectValue?.get("message")?.stringValue,
+            paramsObject["errorMessage"]?.stringValue,
+            eventObject?.get("error")?.objectValue?.get("message")?.stringValue,
+            "Turn failed with no details",
+        )
     }
 
     private fun extractMessageText(itemObject: JsonObject): String {

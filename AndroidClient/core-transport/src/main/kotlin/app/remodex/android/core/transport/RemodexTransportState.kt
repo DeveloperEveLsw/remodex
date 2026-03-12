@@ -49,6 +49,13 @@ data class RemodexHandshakeResult(
 data class RemodexThreadReadResult(
     val thread: CodexThread,
     val messages: List<CodexMessage> = emptyList(),
+    val turnStateSnapshot: RemodexThreadTurnStateSnapshot = RemodexThreadTurnStateSnapshot(),
+)
+
+data class RemodexThreadTurnStateSnapshot(
+    val interruptibleTurnId: String? = null,
+    val hasInterruptibleTurnWithoutId: Boolean = false,
+    val latestTurnId: String? = null,
 )
 
 data class RemodexThreadStartResult(

@@ -81,12 +81,16 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import app.remodex.android.core.model.CodexAccessMode
+import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.protocol.arrayValue
 import app.remodex.android.core.protocol.intValue
 import app.remodex.android.core.protocol.objectValue
 import app.remodex.android.core.protocol.stringValue
@@ -116,6 +120,9 @@ private val RemodexColorScheme = lightColorScheme(
 private const val SETTINGS_PANEL = "settings"
 private const val ACTION_MENU_PANEL = "action-menu"
 private const val BRANCH_PICKER_PANEL = "branch-picker"
+private const val MODEL_PICKER_PANEL = "model-picker"
+private const val REASONING_PICKER_PANEL = "reasoning-picker"
+private const val ACCESS_PICKER_PANEL = "access-picker"
 
 @Composable
 fun RemodexAndroidRoot() {
@@ -129,6 +136,7 @@ fun RemodexAndroidRoot() {
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
+    val branchChoices = remember(selectedThread) { selectedThread?.availableBranchChoices().orEmpty() }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
@@ -180,8 +188,12 @@ fun RemodexAndroidRoot() {
                         onOpenSettings = { activePanel = SETTINGS_PANEL },
                         onOpenActionMenu = { activePanel = ACTION_MENU_PANEL },
                         onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
+                        onOpenModelPicker = { activePanel = MODEL_PICKER_PANEL },
+                        onOpenReasoningPicker = { activePanel = REASONING_PICKER_PANEL },
+                        onOpenAccessPicker = { activePanel = ACCESS_PICKER_PANEL },
                         onPromptChange = viewModel::updateDraftTurnInput,
                         onSendPrompt = viewModel::startTurn,
+                        onStopTurn = viewModel::interruptTurn,
                     )
                 } else {
                     OnboardingState(
@@ -197,13 +209,19 @@ fun RemodexAndroidRoot() {
                     uiState = uiState,
                     onDismiss = { activePanel = null },
                     onDisconnect = viewModel::disconnect,
+                    onOpenModelPicker = { activePanel = MODEL_PICKER_PANEL },
+                    onOpenReasoningPicker = { activePanel = REASONING_PICKER_PANEL },
+                    onOpenAccessPicker = { activePanel = ACCESS_PICKER_PANEL },
                 )
 
                 ACTION_MENU_PANEL -> ActionMenuSheet(
+                    uiState = uiState,
                     showDeveloperPanels = showDeveloperPanels,
                     branchLabel = gitChrome?.branch,
+                    branchChoices = branchChoices,
                     onDismiss = { activePanel = null },
                     onOpenSettings = { activePanel = SETTINGS_PANEL },
+                    onOpenBranchPicker = { activePanel = BRANCH_PICKER_PANEL },
                     onRefreshThreads = {
                         activePanel = null
                         viewModel.refreshThreads()
@@ -216,12 +234,55 @@ fun RemodexAndroidRoot() {
                         showDeveloperPanels = !showDeveloperPanels
                         activePanel = null
                     },
+                    onInterruptTurn = {
+                        activePanel = null
+                        viewModel.interruptTurn()
+                    },
                 )
 
                 BRANCH_PICKER_PANEL -> BranchPickerSheet(
                     branchLabel = gitChrome?.branch,
+                    branchChoices = branchChoices,
                     selectedThread = selectedThread,
                     onDismiss = { activePanel = null },
+                )
+
+                MODEL_PICKER_PANEL -> RuntimeOptionPickerSheet(
+                    title = "Model",
+                    options = uiState.availableModels.map {
+                        RuntimeOptionRow(
+                            id = it.id.ifBlank { it.model },
+                            label = it.displayName.ifBlank { it.model.ifBlank { it.id } },
+                        )
+                    },
+                    selectedId = uiState.selectedModelOption?.id ?: uiState.selectedModelOption?.model,
+                    emptyStateMessage = "No models reported by the current local runtime.",
+                    onDismiss = { activePanel = null },
+                    onSelect = { optionId ->
+                        viewModel.selectRuntimeModel(optionId)
+                        activePanel = null
+                    },
+                )
+
+                REASONING_PICKER_PANEL -> RuntimeOptionPickerSheet(
+                    title = "Reasoning",
+                    options = uiState.availableReasoningEffortsForSelectedModel.map { RuntimeOptionRow(it, reasoningTitle(it)) },
+                    selectedId = uiState.selectedReasoningEffort,
+                    emptyStateMessage = "No reasoning options are available for the selected model.",
+                    onDismiss = { activePanel = null },
+                    onSelect = { optionId ->
+                        viewModel.selectRuntimeReasoningEffort(optionId)
+                        activePanel = null
+                    },
+                )
+
+                ACCESS_PICKER_PANEL -> AccessModePickerSheet(
+                    selectedMode = uiState.selectedAccessMode,
+                    onDismiss = { activePanel = null },
+                    onSelect = { mode ->
+                        viewModel.selectAccessMode(mode)
+                        activePanel = null
+                    },
                 )
             }
         }
@@ -308,6 +369,11 @@ private fun SidebarDrawer(
                         ThreadDrawerRow(
                             thread = thread,
                             isSelected = thread.id == uiState.activeThreadId,
+                            badgeState = if (thread.id == uiState.activeThreadId) {
+                                null
+                            } else {
+                                uiState.conversation.threadRunBadgeState(thread.id)
+                            },
                             onClick = { onSelectThread(thread.id) },
                         )
                     }
@@ -412,17 +478,28 @@ private fun SidebarSectionHeader(title: String) {
 private fun ThreadDrawerRow(
     thread: CodexThread,
     isSelected: Boolean,
+    badgeState: CodexThreadRunBadgeState?,
     onClick: () -> Unit,
 ) {
     NavigationDrawerItem(
         label = {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    text = thread.displayTitle,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = thread.displayTitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    badgeState?.let { state ->
+                        ThreadRunBadge(state = state)
+                    }
+                }
                 Text(
                     text = thread.preview ?: thread.id,
                     style = MaterialTheme.typography.bodySmall,
@@ -453,6 +530,28 @@ private fun ThreadDrawerRow(
         shape = RoundedCornerShape(18.dp),
         modifier = Modifier.fillMaxWidth(),
     )
+}
+
+@Composable
+private fun ThreadRunBadge(state: CodexThreadRunBadgeState) {
+    val (label, background, foreground) = when (state) {
+        CodexThreadRunBadgeState.Running -> Triple("Running", Color(0xFFE9F2FF), Color(0xFF2D6FD2))
+        CodexThreadRunBadgeState.Ready -> Triple("Ready", Color(0xFFEAF6EC), Color(0xFF2F8C4C))
+        CodexThreadRunBadgeState.Failed -> Triple("Failed", Color(0xFFFFECE8), Color(0xFFC65446))
+    }
+
+    Surface(
+        shape = CircleShape,
+        color = background,
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = foreground,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
 }
 
 @Composable
@@ -616,8 +715,12 @@ private fun MainConversationPane(
     onOpenSettings: () -> Unit,
     onOpenActionMenu: () -> Unit,
     onOpenBranchPicker: () -> Unit,
+    onOpenModelPicker: () -> Unit,
+    onOpenReasoningPicker: () -> Unit,
+    onOpenAccessPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
+    onStopTurn: () -> Unit,
 ) {
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val selectedThreadRevision = uiState.conversation.messageRevisionFor(selectedThread?.id)
@@ -626,6 +729,7 @@ private fun MainConversationPane(
             .sortedBy(CodexMessage::orderIndex)
     }
     val isLoadingSelectedThread = uiState.conversation.isLoadingThread(selectedThread?.id)
+    val isRunningSelectedThread = uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id)
     val gitChrome = remember(selectedThread) { selectedThread?.gitChrome() }
 
     Column(
@@ -680,12 +784,25 @@ private fun MainConversationPane(
                             prompt = uiState.draftTurnInput,
                             isSending = uiState.isStartingTurn || uiState.isStartingThread,
                             selectedThreadId = uiState.activeThreadId,
+                            isRunningSelectedThread = isRunningSelectedThread,
+                            runtimeLabel = if (uiState.selectedCollaborationMode == CodexCollaborationModeKind.Plan) {
+                                "Local Plan"
+                            } else {
+                                "Local"
+                            },
+                            modelLabel = uiState.selectedModelLabel,
+                            reasoningLabel = uiState.selectedReasoningLabel,
+                            accessLabel = uiState.selectedAccessMode.displayName,
                             branchLabel = gitChrome?.branch,
                             onOpenSettings = onOpenSettings,
                             onOpenBranchPicker = onOpenBranchPicker,
                             onOpenActionMenu = onOpenActionMenu,
+                            onOpenModelPicker = onOpenModelPicker,
+                            onOpenReasoningPicker = onOpenReasoningPicker,
+                            onOpenAccessPicker = onOpenAccessPicker,
                             onPromptChange = onPromptChange,
                             onSendPrompt = onSendPrompt,
+                            onStopTurn = onStopTurn,
                         )
                     }
                 }
@@ -1145,6 +1262,9 @@ private fun SettingsSheet(
     uiState: RemodexDebugUiState,
     onDismiss: () -> Unit,
     onDisconnect: () -> Unit,
+    onOpenModelPicker: () -> Unit,
+    onOpenReasoningPicker: () -> Unit,
+    onOpenAccessPicker: () -> Unit,
 ) {
     SheetDialog(
         onDismiss = onDismiss,
@@ -1193,13 +1313,34 @@ private fun SettingsSheet(
             }
             SettingsSection(title = "Runtime Defaults") {
                 GroupedRowsCard {
-                    GroupedRow(label = "Model", value = "GPT-5.4")
+                    GroupedRow(
+                        label = "Model",
+                        value = uiState.selectedModelLabel,
+                        supporting = if (uiState.availableModels.isEmpty()) {
+                            "No models reported by the local runtime yet."
+                        } else {
+                            "${uiState.availableModels.size} model option(s) available."
+                        },
+                        onClick = onOpenModelPicker,
+                    )
                     GroupedDivider()
-                    GroupedRow(label = "Reasoning", value = "Extra High")
+                    GroupedRow(
+                        label = "Reasoning",
+                        value = uiState.selectedReasoningLabel,
+                        supporting = if (uiState.availableReasoningEffortsForSelectedModel.isEmpty()) {
+                            "The selected model does not expose reasoning controls."
+                        } else {
+                            "${uiState.availableReasoningEffortsForSelectedModel.size} reasoning level(s) available."
+                        },
+                        onClick = onOpenReasoningPicker,
+                    )
                     GroupedDivider()
-                    GroupedRow(label = "Speed", value = "Normal")
-                    GroupedDivider()
-                    GroupedRow(label = "Access", value = "On-Request")
+                    GroupedRow(
+                        label = "Access",
+                        value = uiState.selectedAccessMode.displayName,
+                        supporting = "Approval policy is applied to new turn and resume requests.",
+                        onClick = onOpenAccessPicker,
+                    )
                 }
             }
             SettingsSection(title = "Connection") {
@@ -1259,13 +1400,17 @@ private fun SettingsSheet(
 
 @Composable
 private fun ActionMenuSheet(
+    uiState: RemodexDebugUiState,
     showDeveloperPanels: Boolean,
     branchLabel: String?,
+    branchChoices: List<String>,
     onDismiss: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenBranchPicker: () -> Unit,
     onRefreshThreads: () -> Unit,
     onStartThread: () -> Unit,
     onToggleDeveloperPanels: () -> Unit,
+    onInterruptTurn: () -> Unit,
 ) {
     FloatingSheetDialog(onDismiss = onDismiss) {
         Column(
@@ -1277,6 +1422,19 @@ private fun ActionMenuSheet(
                 rows = listOf(
                     MenuRowModel("New Chat", "Create a fresh local thread", onStartThread),
                     MenuRowModel("Refresh Threads", "Reload thread metadata", onRefreshThreads),
+                    MenuRowModel(
+                        title = if (uiState.conversation.threadHasActiveOrRunningTurn(uiState.activeThreadId)) {
+                            "Stop Current Turn"
+                        } else {
+                            "No Running Turn"
+                        },
+                        subtitle = if (uiState.conversation.threadHasActiveOrRunningTurn(uiState.activeThreadId)) {
+                            "Interrupt the active turn using the current thread context"
+                        } else {
+                            "Stop becomes available when the selected thread is running."
+                        },
+                        onClick = if (uiState.conversation.threadHasActiveOrRunningTurn(uiState.activeThreadId)) onInterruptTurn else null,
+                    ),
                     MenuRowModel("Settings", "Open runtime defaults and connection info", onOpenSettings),
                 ),
             )
@@ -1285,7 +1443,30 @@ private fun ActionMenuSheet(
                 rows = listOf(
                     MenuRowModel(
                         title = branchLabel ?: "No branch",
-                        subtitle = "Current branch preview",
+                        subtitle = when {
+                            branchChoices.isEmpty() -> "Current branch preview"
+                            else -> "Browse ${branchChoices.size} known branch target(s)"
+                        },
+                        onClick = if (branchChoices.isNotEmpty()) onOpenBranchPicker else null,
+                    ),
+                ),
+            )
+            GroupedMenuSection(
+                title = "Runtime",
+                rows = listOf(
+                    MenuRowModel(
+                        title = uiState.selectedModelLabel,
+                        subtitle = "Model",
+                        onClick = null,
+                    ),
+                    MenuRowModel(
+                        title = uiState.selectedReasoningLabel,
+                        subtitle = "Reasoning",
+                        onClick = null,
+                    ),
+                    MenuRowModel(
+                        title = uiState.selectedAccessMode.displayName,
+                        subtitle = "Access",
                         onClick = null,
                     ),
                 ),
@@ -1307,6 +1488,7 @@ private fun ActionMenuSheet(
 @Composable
 private fun BranchPickerSheet(
     branchLabel: String?,
+    branchChoices: List<String>,
     selectedThread: CodexThread?,
     onDismiss: () -> Unit,
 ) {
@@ -1334,16 +1516,137 @@ private fun BranchPickerSheet(
                     )
                 }
             }
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = Color(0xFFF2F0EC),
-            ) {
-                Text(
-                    text = "Branch switching UI now follows the iOS grouped-sheet pattern. Actual branch mutations stay deferred until runtime actions are wired.",
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            if (branchChoices.isNotEmpty()) {
+                SettingsSection(title = "Known Branches") {
+                    GroupedRowsCard {
+                        branchChoices.forEachIndexed { index, branch ->
+                            if (index > 0) {
+                                GroupedDivider()
+                            }
+                            GroupedRow(
+                                label = branch,
+                                value = if (branch == branchLabel) "Current" else "Read-only",
+                                supporting = if (branch == branchLabel) {
+                                    "This is the branch currently reported for the selected local thread."
+                                } else {
+                                    "Branch switching stays disabled until git actions are fully wired."
+                                },
+                            )
+                        }
+                    }
+                }
+            } else {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color(0xFFF2F0EC),
+                ) {
+                    Text(
+                        text = "Branch metadata is available, but the current runtime has not reported any branch choices for this thread yet.",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private data class RuntimeOptionRow(
+    val id: String,
+    val label: String,
+)
+
+@Composable
+private fun RuntimeOptionPickerSheet(
+    title: String,
+    options: List<RuntimeOptionRow>,
+    selectedId: String?,
+    emptyStateMessage: String,
+    onDismiss: () -> Unit,
+    onSelect: (String) -> Unit,
+) {
+    SheetDialog(
+        onDismiss = onDismiss,
+        topPadding = 120.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            SheetHeader(
+                title = title,
+                actionLabel = "Done",
+                onAction = onDismiss,
+            )
+            if (options.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color(0xFFF2F0EC),
+                ) {
+                    Text(
+                        text = emptyStateMessage,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                GroupedRowsCard {
+                    options.forEachIndexed { index, option ->
+                        if (index > 0) {
+                            GroupedDivider()
+                        }
+                        GroupedRow(
+                            label = option.label,
+                            value = if (option.id == selectedId) "Selected" else null,
+                            onClick = { onSelect(option.id) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccessModePickerSheet(
+    selectedMode: CodexAccessMode,
+    onDismiss: () -> Unit,
+    onSelect: (CodexAccessMode) -> Unit,
+) {
+    SheetDialog(
+        onDismiss = onDismiss,
+        topPadding = 120.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            SheetHeader(
+                title = "Access",
+                actionLabel = "Done",
+                onAction = onDismiss,
+            )
+            GroupedRowsCard {
+                CodexAccessMode.entries.forEachIndexed { index, mode ->
+                    if (index > 0) {
+                        GroupedDivider()
+                    }
+                    GroupedRow(
+                        label = mode.displayName,
+                        value = if (mode == selectedMode) "Selected" else null,
+                        supporting = when (mode) {
+                            CodexAccessMode.OnRequest -> "Prompts can request approval before privileged actions run."
+                            CodexAccessMode.FullAccess -> "Turns run without approval prompts and use danger-full-access sandboxing."
+                        },
+                        onClick = { onSelect(mode) },
+                    )
+                }
             }
         }
     }
@@ -1482,10 +1785,12 @@ private fun GroupedRow(
     label: String,
     value: String? = null,
     supporting: String? = null,
+    onClick: (() -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
@@ -1639,12 +1944,21 @@ private fun ComposerArea(
     prompt: String,
     isSending: Boolean,
     selectedThreadId: String?,
+    isRunningSelectedThread: Boolean,
+    runtimeLabel: String,
+    modelLabel: String,
+    reasoningLabel: String,
+    accessLabel: String,
     branchLabel: String?,
     onOpenSettings: () -> Unit,
     onOpenBranchPicker: () -> Unit,
     onOpenActionMenu: () -> Unit,
+    onOpenModelPicker: () -> Unit,
+    onOpenReasoningPicker: () -> Unit,
+    onOpenAccessPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
     onSendPrompt: () -> Unit,
+    onStopTurn: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -1694,12 +2008,12 @@ private fun ComposerArea(
                         contentDescription = "Add attachment or context",
                     )
                     MinimalControlChip(
-                        label = "GPT-5.4",
-                        onClick = onOpenSettings,
+                        label = modelLabel,
+                        onClick = onOpenModelPicker,
                     )
                     MinimalControlChip(
-                        label = "Extra High",
-                        onClick = onOpenSettings,
+                        label = reasoningLabel,
+                        onClick = onOpenReasoningPicker,
                     )
                     MinimalIconChip(
                         icon = Icons.Outlined.Code,
@@ -1707,10 +2021,14 @@ private fun ComposerArea(
                         onClick = onOpenActionMenu,
                     )
                     Spacer(modifier = Modifier.weight(1f))
-                    SendActionButton(
-                        enabled = selectedThreadId != null && !isSending,
-                        onClick = onSendPrompt,
-                    )
+                    if (isRunningSelectedThread) {
+                        StopActionButton(onClick = onStopTurn)
+                    } else {
+                        SendActionButton(
+                            enabled = selectedThreadId != null && !isSending,
+                            onClick = onSendPrompt,
+                        )
+                    }
                 }
             }
         }
@@ -1721,14 +2039,14 @@ private fun ComposerArea(
             RuntimePill(
                 modifier = Modifier.weight(1f),
                 icon = Icons.AutoMirrored.Outlined.MenuBook,
-                label = "Local",
+                label = runtimeLabel,
                 onClick = onOpenSettings,
             )
             RuntimePill(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Outlined.SettingsEthernet,
-                label = "On-Request",
-                onClick = onOpenSettings,
+                label = accessLabel,
+                onClick = onOpenAccessPicker,
             )
             RuntimePill(
                 modifier = Modifier.weight(1f),
@@ -1831,6 +2149,31 @@ private fun SendActionButton(
                 contentDescription = "Send prompt",
                 tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.width(16.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun StopActionButton(
+    onClick: () -> Unit,
+) {
+    Surface(
+        shape = CircleShape,
+        color = Color(0xFFFFF1EF),
+        border = BorderStroke(1.dp, Color(0xFFF0C9C1)),
+    ) {
+        Box(
+            modifier = Modifier
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "Stop",
+                style = MaterialTheme.typography.labelMedium,
+                color = Color(0xFFC65446),
+                fontWeight = FontWeight.SemiBold,
             )
         }
     }
@@ -2129,6 +2472,21 @@ private fun CodexThread.gitChrome(): ThreadGitChrome? {
     )
 }
 
+private fun CodexThread.availableBranchChoices(): List<String> {
+    val metadataObject = metadata?.let(::JsonObject) ?: return emptyList()
+    val statusObject = metadataObject.findObject("status", "gitStatus", "repoStatus")
+    val candidateArrays = listOfNotNull(
+        metadataObject.findStringArray("branches", "availableBranches", "gitBranches", "branchTargets"),
+        statusObject?.findStringArray("branches", "availableBranches", "gitBranches", "branchTargets"),
+    )
+
+    return candidateArrays
+        .flatten()
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .distinct()
+}
+
 private fun assistantKindTone(kind: CodexMessageKind): Color {
     return when (kind) {
         CodexMessageKind.Thinking -> Color(0xFFF1F3FA)
@@ -2157,6 +2515,12 @@ private fun JsonObject.findInt(vararg keys: String): Int? {
 
 private fun JsonObject.findObject(vararg keys: String): JsonObject? {
     return keys.firstNotNullOfOrNull { key -> this[key]?.objectValue }
+}
+
+private fun JsonObject.findStringArray(vararg keys: String): List<String>? {
+    return keys.firstNotNullOfOrNull { key ->
+        this[key]?.arrayValue?.mapNotNull { element -> element.stringValue?.takeIf(String::isNotBlank) }
+    }
 }
 
 private val MESSAGE_TIME_FORMATTER: DateTimeFormatter =

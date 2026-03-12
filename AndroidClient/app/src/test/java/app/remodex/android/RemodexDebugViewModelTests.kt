@@ -3,8 +3,12 @@ package app.remodex.android
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexModelOption
+import app.remodex.android.core.model.CodexReasoningEffortOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.transport.RemodexThreadResumeResult
+import app.remodex.android.core.transport.RemodexThreadTurnStateSnapshot
 import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportClient
@@ -18,6 +22,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.JsonObject
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -137,6 +142,7 @@ class RemodexDebugViewModelTests {
                 role = CodexMessageRole.User,
                 kind = CodexMessageKind.Chat,
                 text = "Prompt",
+                orderIndex = 0,
             ),
             CodexMessage(
                 id = "msg-2",
@@ -144,6 +150,7 @@ class RemodexDebugViewModelTests {
                 role = CodexMessageRole.Assistant,
                 kind = CodexMessageKind.Chat,
                 text = "Reply",
+                orderIndex = 1,
             ),
         )
         val transport = FakeTransportClient(
@@ -164,14 +171,196 @@ class RemodexDebugViewModelTests {
         assertEquals(historyMessages, state.conversation.messagesFor(thread.id))
         assertTrue(!state.conversation.isLoadingThread(thread.id))
         assertTrue(state.conversation.messageRevisionFor(thread.id) > 0)
+        assertEquals(listOf("thread/resume", "thread/read"), transport.recordedMethods.takeLast(2))
+    }
+
+    @Test
+    fun selectThreadHydratesOncePerThreadUntilRecoveryForcesRefresh() = runTest {
+        val thread = CodexThread(
+            id = "thread-history",
+            title = "History",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("thread/resume", "thread/read", "thread/resume"),
+            transport.recordedMethods.takeLast(3),
+        )
+    }
+
+    @Test
+    fun selectThreadRefreshesRunningTurnStateFromThreadReadSnapshot() = runTest {
+        val thread = CodexThread(
+            id = "thread-running",
+            title = "Running",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                        interruptibleTurnId = "turn-live",
+                        latestTurnId = "turn-live",
+                    ),
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        val conversation = viewModel.uiState.value.conversation
+        assertEquals("turn-live", conversation.activeTurnIdByThread[thread.id])
+        assertTrue(conversation.runningThreadIds.contains(thread.id))
+    }
+
+    @Test
+    fun interruptTurnRecoversTurnIdFromThreadReadWhenLocalStateIsMissing() = runTest {
+        val thread = CodexThread(
+            id = "thread-running",
+            title = "Running",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            startThreadResult = RemodexThreadStartResult(
+                thread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                        interruptibleTurnId = "turn-live",
+                        latestTurnId = "turn-live",
+                    ),
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.startThread()
+        advanceUntilIdle()
+        viewModel.interruptTurn()
+        advanceUntilIdle()
+
+        assertEquals(listOf("thread/read", "turn/interrupt"), transport.recordedMethods.takeLast(2))
+        assertEquals("turn-live", transport.lastInterruptedTurnId)
+    }
+
+    @Test
+    fun refreshRuntimeOptionsNormalizesModelAndReasoningSelectionFromServer() = runTest {
+        val transport = FakeTransportClient(
+            modelOptions = listOf(
+                CodexModelOption(
+                    id = "model-gpt54",
+                    model = "gpt-5.4",
+                    displayName = "GPT-5.4",
+                    isDefault = true,
+                    supportedReasoningEfforts = listOf(
+                        CodexReasoningEffortOption(reasoningEffort = "medium"),
+                        CodexReasoningEffortOption(reasoningEffort = "high"),
+                    ),
+                    defaultReasoningEffort = "high",
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.refreshRuntimeOptions()
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals("model-gpt54", state.selectedModelId)
+        assertEquals("high", state.selectedReasoningEffort)
+        assertEquals("GPT-5.4", state.selectedModelLabel)
+        assertEquals("High", state.selectedReasoningLabel)
+    }
+
+    @Test
+    fun startTurnUsesSelectedRuntimeStateForTransportRequest() = runTest {
+        val thread = CodexThread(
+            id = "thread-live",
+            title = "Live",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            modelOptions = listOf(
+                CodexModelOption(
+                    id = "model-gpt54",
+                    model = "gpt-5.4",
+                    displayName = "GPT-5.4",
+                    isDefault = true,
+                    supportedReasoningEfforts = listOf(
+                        CodexReasoningEffortOption(reasoningEffort = "medium"),
+                        CodexReasoningEffortOption(reasoningEffort = "high"),
+                    ),
+                    defaultReasoningEffort = "medium",
+                ),
+            ),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-1",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.refreshRuntimeOptions()
+        advanceUntilIdle()
+        viewModel.selectRuntimeReasoningEffort("high")
+        viewModel.selectAccessMode(app.remodex.android.core.model.CodexAccessMode.FullAccess)
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.updateDraftTurnInput("Ship it")
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        assertEquals(app.remodex.android.core.model.CodexAccessMode.FullAccess, transport.lastStartTurnAccessMode)
+        assertEquals("gpt-5.4", transport.lastStartTurnModelIdentifier)
+        assertEquals("high", transport.lastStartTurnReasoningEffort)
     }
 
     private class FakeTransportClient(
         private val readThreadResults: Map<String, RemodexThreadReadResult> = emptyMap(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
+        private val modelOptions: List<CodexModelOption> = emptyList(),
     ) : RemodexTransportClient(appVersion = "test") {
         var lastPreferredProjectPath: String? = null
+        var lastInterruptedTurnId: String? = null
+        var lastStartTurnAccessMode: app.remodex.android.core.model.CodexAccessMode? = null
+        var lastStartTurnModelIdentifier: String? = null
+        var lastStartTurnReasoningEffort: String? = null
+        val recordedMethods = mutableListOf<String>()
+
+        init {
+            val stateField = RemodexTransportClient::class.java.getDeclaredField("_state")
+            stateField.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            val stateFlow = stateField.get(this) as MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
+            stateFlow.value = app.remodex.android.core.transport.RemodexTransportState.Connected(
+                sessionUrl = "ws://test",
+                isInitialized = true,
+            )
+        }
 
         override suspend fun startThread(
             preferredProjectPath: String?,
@@ -185,7 +374,41 @@ class RemodexDebugViewModelTests {
             threadId: String,
             includeTurns: Boolean,
         ): RemodexThreadReadResult {
+            recordedMethods += "thread/read"
             return readThreadResults[threadId] ?: error("No thread/read stub for $threadId")
+        }
+
+        override suspend fun resumeThread(
+            threadId: String,
+            accessMode: app.remodex.android.core.model.CodexAccessMode,
+            modelIdentifier: String?,
+        ): RemodexThreadResumeResult {
+            recordedMethods += "thread/resume"
+            return RemodexThreadResumeResult(
+                threadId = threadId,
+                thread = readThreadResults[threadId]?.thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            )
+        }
+
+        override suspend fun interruptTurn(
+            turnId: String,
+            threadId: String?,
+        ) {
+            recordedMethods += "turn/interrupt"
+            lastInterruptedTurnId = turnId
+        }
+
+        override suspend fun listModels(
+            limit: Int,
+        ): List<CodexModelOption> {
+            recordedMethods += "model/list"
+            return modelOptions
+        }
+
+        override suspend fun listCollaborationModes(): List<app.remodex.android.core.model.CodexCollaborationModeKind> {
+            recordedMethods += "collaborationMode/list"
+            return listOf(app.remodex.android.core.model.CodexCollaborationModeKind.Default)
         }
 
         override suspend fun startTurn(
@@ -194,8 +417,13 @@ class RemodexDebugViewModelTests {
             accessMode: app.remodex.android.core.model.CodexAccessMode,
             collaborationMode: app.remodex.android.core.model.CodexCollaborationModeKind?,
             preferredProjectPath: String?,
+            modelIdentifier: String?,
+            reasoningEffort: String?,
         ): RemodexTurnStartResult {
             lastPreferredProjectPath = preferredProjectPath
+            lastStartTurnAccessMode = accessMode
+            lastStartTurnModelIdentifier = modelIdentifier
+            lastStartTurnReasoningEffort = reasoningEffort
             return startTurnResult ?: error("startTurn was not stubbed")
         }
     }

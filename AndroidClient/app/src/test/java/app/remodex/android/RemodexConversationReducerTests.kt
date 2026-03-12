@@ -1,5 +1,6 @@
 package app.remodex.android
 
+import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.protocol.RpcMessage
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -102,6 +103,63 @@ class RemodexConversationReducerTests {
 
         assertTrue(conversation.runningThreadIds.contains("thread-1"))
         assertEquals(null, conversation.activeTurnIdByThread["thread-1"])
+    }
+
+    @Test
+    fun reducerMarksCompletedInactiveThreadAsReady() {
+        val conversation = RemodexConversationReducer.reduce(
+            conversation = RemodexConversationState(),
+            message = RpcMessage.notification(
+                method = "turn/completed",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "status" to JsonPrimitive("completed"),
+                ),
+            ),
+            knownThreadIds = setOf("thread-1"),
+        )
+
+        assertEquals(CodexThreadRunBadgeState.Ready, conversation.threadRunBadgeState("thread-1"))
+    }
+
+    @Test
+    fun reducerDoesNotMarkActiveThreadAsUnreadWhenCompleted() {
+        val conversation = RemodexConversationReducer.reduce(
+            conversation = RemodexConversationState().withActiveThread("thread-1"),
+            message = RpcMessage.notification(
+                method = "turn/completed",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "status" to JsonPrimitive("completed"),
+                ),
+            ),
+            knownThreadIds = setOf("thread-1"),
+        )
+
+        assertEquals(null, conversation.threadRunBadgeState("thread-1"))
+    }
+
+    @Test
+    fun reducerMarksFailedThreadAsFailedBadge() {
+        val conversation = RemodexConversationReducer.reduce(
+            conversation = RemodexConversationState(),
+            message = RpcMessage.notification(
+                method = "turn/completed",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "status" to JsonPrimitive("failed"),
+                    "error" to jsonObject(
+                        "message" to JsonPrimitive("Boom"),
+                    ),
+                ),
+            ),
+            knownThreadIds = setOf("thread-1"),
+        )
+
+        assertEquals(CodexThreadRunBadgeState.Failed, conversation.threadRunBadgeState("thread-1"))
     }
 
     private fun jsonObject(vararg entries: Pair<String, kotlinx.serialization.json.JsonElement>): JsonObject {
