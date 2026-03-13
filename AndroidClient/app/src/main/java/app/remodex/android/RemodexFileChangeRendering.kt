@@ -169,7 +169,9 @@ object RemodexFileChangeSummaryParser {
                     sawKindLine = true
                     kindsByPath[path] = parsedKind
                     if (actionsByPath[path] == null) {
-                        actionsByPath[path] = RemodexFileChangeAction.fromKind(parsedKind)
+                        RemodexFileChangeAction.fromKind(parsedKind)?.let { action ->
+                            actionsByPath[path] = action
+                        }
                     }
                 }
                 lineIndex += 1
