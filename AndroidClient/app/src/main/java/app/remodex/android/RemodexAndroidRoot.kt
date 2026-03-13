@@ -1582,9 +1582,10 @@ private fun BranchPickerSheet(
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = MaterialTheme.colorScheme.onSurface,
                             )
-                            if (selectedThread?.cwd != null) {
+                            val selectedThreadCwd = selectedThread?.cwd
+                            if (selectedThreadCwd != null) {
                                 Text(
-                                    text = selectedThread.cwd,
+                                    text = selectedThreadCwd,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
