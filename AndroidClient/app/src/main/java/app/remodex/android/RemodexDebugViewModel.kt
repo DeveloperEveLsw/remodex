@@ -99,6 +99,7 @@ class RemodexDebugViewModel(
     private val _uiState = MutableStateFlow(RemodexDebugUiState())
     val uiState: StateFlow<RemodexDebugUiState> = _uiState.asStateFlow()
     private var gitStatusRefreshJob: Job? = null
+    private var gitBranchRefreshThreadId: String? = null
 
     init {
         viewModelScope.launch {
@@ -323,6 +324,7 @@ class RemodexDebugViewModel(
         viewModelScope.launch {
             gitStatusRefreshJob?.cancel()
             gitStatusRefreshJob = null
+            gitBranchRefreshThreadId = null
             transport.disconnect()
             _uiState.update { current ->
                 current.copy(
@@ -416,6 +418,12 @@ class RemodexDebugViewModel(
                 }
                 return@launch
             }
+            if (gitBranchRefreshThreadId == targetThreadId ||
+                (_uiState.value.activeThreadId == targetThreadId && _uiState.value.isLoadingGitBranchTargets)
+            ) {
+                return@launch
+            }
+            gitBranchRefreshThreadId = targetThreadId
 
             _uiState.update { current ->
                 if (current.activeThreadId == targetThreadId) {
@@ -430,6 +438,9 @@ class RemodexDebugViewModel(
             runCatching {
                 transport.gitBranchesWithStatus(workingDirectory = workingDirectory)
             }.onSuccess { result ->
+                if (gitBranchRefreshThreadId == targetThreadId) {
+                    gitBranchRefreshThreadId = null
+                }
                 _uiState.update { current ->
                     if (current.activeThreadId != targetThreadId) {
                         return@update current
@@ -448,11 +459,17 @@ class RemodexDebugViewModel(
                             .map(String::trim)
                             .filter(String::isNotEmpty)
                             .distinct(),
-                        gitRepoSync = result.status,
                         isLoadingGitBranchTargets = false,
+                    ).applyObservedGitRepoSync(
+                        status = result.status,
+                        threadId = targetThreadId,
+                        workingDirectory = workingDirectory,
                     )
                 }
-            }.onFailure { throwable ->
+            }.onFailure {
+                if (gitBranchRefreshThreadId == targetThreadId) {
+                    gitBranchRefreshThreadId = null
+                }
                 _uiState.update { current ->
                     if (current.activeThreadId != targetThreadId) {
                         return@update current
@@ -489,9 +506,12 @@ class RemodexDebugViewModel(
                     }
 
                     current.copy(
-                        gitRepoSync = status,
                         currentGitBranch = status.currentBranch?.trim().orEmpty()
                             .ifEmpty { current.currentGitBranch },
+                    ).applyObservedGitRepoSync(
+                        status = status,
+                        threadId = targetThreadId,
+                        workingDirectory = workingDirectory,
                     )
                 }
             }
@@ -1108,6 +1128,90 @@ class RemodexDebugViewModel(
             } ?: return null
 
         return "${latestRepoMessage.id}|${latestRepoMessage.text.length}|${latestRepoMessage.isStreaming}"
+    }
+
+    private fun RemodexDebugUiState.applyObservedGitRepoSync(
+        status: GitRepoSyncResult?,
+        threadId: String,
+        workingDirectory: String?,
+    ): RemodexDebugUiState {
+        if (status == null) {
+            return copy(gitRepoSync = null)
+        }
+
+        var updatedConversation = conversation
+        val previousSync = gitRepoSync
+        val branchStayedStable = previousSync?.currentBranch == status.currentBranch
+        val didClearAheadQueue = (previousSync?.aheadCount ?: 0) > 0 && status.aheadCount == 0
+        if (branchStayedStable && didClearAheadQueue) {
+            updatedConversation = appendHiddenPushResetMarkers(
+                conversation = updatedConversation,
+                threadId = threadId,
+                workingDirectory = workingDirectory,
+                branch = status.currentBranch.orEmpty(),
+                remote = trackingRemoteName(status.trackingBranch),
+            )
+        }
+
+        return copy(
+            conversation = updatedConversation,
+            gitRepoSync = status,
+        )
+    }
+
+    private fun appendHiddenPushResetMarkers(
+        conversation: RemodexConversationState,
+        threadId: String,
+        workingDirectory: String?,
+        branch: String,
+        remote: String?,
+    ): RemodexConversationState {
+        val normalizedThreadId = threadId.trim().takeIf(String::isNotEmpty) ?: return conversation
+        val normalizedWorkingDirectory = normalizeWorkingDirectoryForPushReset(workingDirectory)
+        val relatedThreadIds = if (normalizedWorkingDirectory != null) {
+            _uiState.value.threads
+                .mapNotNull { thread ->
+                    val candidateWorkingDirectory = normalizeWorkingDirectoryForPushReset(thread.cwd)
+                    thread.id.takeIf { candidateWorkingDirectory == normalizedWorkingDirectory }
+                }
+        } else {
+            emptyList()
+        }
+
+        return (relatedThreadIds + normalizedThreadId)
+            .toSet()
+            .fold(conversation) { currentConversation, targetThreadId ->
+                currentConversation.appendSystemMessage(
+                    threadId = targetThreadId,
+                    kind = CodexMessageKind.FileChange,
+                    text = RemodexGitTimelineSupport.pushResetText(branch = branch, remote = remote),
+                    itemId = RemodexGitTimelineSupport.PushResetItemId,
+                )
+            }
+    }
+
+    private fun normalizeWorkingDirectoryForPushReset(rawValue: String?): String? {
+        val trimmed = rawValue?.trim().orEmpty()
+        if (trimmed.isEmpty()) {
+            return null
+        }
+        if (trimmed == "/") {
+            return trimmed
+        }
+
+        var normalized = trimmed
+        while (normalized.endsWith("/")) {
+            normalized = normalized.dropLast(1)
+        }
+        return normalized.ifEmpty { "/" }
+    }
+
+    private fun trackingRemoteName(trackingBranch: String?): String? {
+        val trimmed = trackingBranch?.trim().orEmpty()
+        if (trimmed.isEmpty()) {
+            return null
+        }
+        return trimmed.split("/", limit = 2).firstOrNull()?.takeIf(String::isNotEmpty)
     }
 }
 

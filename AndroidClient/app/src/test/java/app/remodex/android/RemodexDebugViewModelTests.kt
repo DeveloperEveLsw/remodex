@@ -21,6 +21,7 @@ import app.remodex.android.core.transport.RemodexTurnStartResult
 import app.remodex.android.core.protocol.RpcMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -536,6 +537,110 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun turnDiffNotificationsCreateRepoAffectingSystemRows() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/diff/updated",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-1"),
+                        "diff" to JsonPrimitive("diff --git a/app.txt b/app.txt\n+hello"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        val repoMessages = viewModel.uiState.value.conversation.messagesFor(thread.id)
+            .filter { it.role == CodexMessageRole.System && it.kind == CodexMessageKind.FileChange }
+        assertEquals(1, repoMessages.size)
+        assertTrue(repoMessages.single().text.contains("diff --git a/app.txt b/app.txt"))
+    }
+
+    @Test
+    fun observedPushResetAddsHiddenMarkerWithoutVisibleTimelineRow() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusResult = GitBranchesWithStatusResult(
+                branches = listOf("main"),
+                currentBranch = "main",
+                defaultBranch = "main",
+                status = GitRepoSyncResult(
+                    currentBranch = "main",
+                    trackingBranch = "origin/main",
+                    aheadCount = 1,
+                ),
+            ),
+            gitStatusResult = GitRepoSyncResult(
+                currentBranch = "main",
+                trackingBranch = "origin/main",
+                aheadCount = 0,
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.refreshGitStatus(thread.id)
+        advanceUntilIdle()
+
+        val allMessages = viewModel.uiState.value.conversation.messagesFor(thread.id)
+        val visibleMessages = viewModel.uiState.value.conversation.visibleMessagesFor(thread.id)
+        assertTrue(allMessages.any { it.itemId == RemodexGitTimelineSupport.PushResetItemId })
+        assertTrue(visibleMessages.none { it.itemId == RemodexGitTimelineSupport.PushResetItemId })
+    }
+
+    @Test
+    fun branchRefreshDoesNotOverlapForSameThread() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val branchGate = CompletableDeferred<Unit>()
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusGate = branchGate,
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.refreshGitBranchTargets(thread.id)
+        advanceUntilIdle()
+
+        assertEquals(1, transport.recordedMethods.count { it == "git/branchesWithStatus" })
+
+        branchGate.complete(Unit)
+        advanceUntilIdle()
+    }
+
+    @Test
     fun selectGitBaseBranchUpdatesPrTargetSelection() = runTest {
         val viewModel = RemodexDebugViewModel(transport = FakeTransportClient())
 
@@ -551,6 +656,7 @@ class RemodexDebugViewModelTests {
         private val modelOptions: List<CodexModelOption> = emptyList(),
         private val gitBranchesWithStatusResult: GitBranchesWithStatusResult = GitBranchesWithStatusResult(),
         private val gitBranchesWithStatusThrowable: Throwable? = null,
+        private val gitBranchesWithStatusGate: CompletableDeferred<Unit>? = null,
         private val gitStatusResult: GitRepoSyncResult = GitRepoSyncResult(),
         private val gitCheckoutResult: GitCheckoutResult? = null,
     ) : RemodexTransportClient(appVersion = "test") {
@@ -629,6 +735,7 @@ class RemodexDebugViewModelTests {
             recordedMethods += "git/branchesWithStatus"
             lastGitWorkingDirectory = workingDirectory
             gitBranchesWithStatusThrowable?.let { throw it }
+            gitBranchesWithStatusGate?.await()
             return gitBranchesWithStatusResult
         }
 

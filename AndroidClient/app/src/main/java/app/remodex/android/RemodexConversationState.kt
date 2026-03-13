@@ -2,6 +2,7 @@ package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageDeliveryState
+import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexTurnTerminalState
@@ -24,6 +25,10 @@ data class RemodexConversationState(
     fun messagesFor(threadId: String?): List<CodexMessage> {
         val normalizedThreadId = normalizeThreadId(threadId) ?: return emptyList()
         return messagesByThread[normalizedThreadId] ?: emptyList()
+    }
+
+    fun visibleMessagesFor(threadId: String?): List<CodexMessage> {
+        return messagesFor(threadId).filterNot(RemodexGitTimelineSupport::isHiddenTimelineMessage)
     }
 
     fun messageRevisionFor(threadId: String?): Int {
@@ -449,6 +454,182 @@ data class RemodexConversationState(
         return replaceThreadMessages(normalizedThreadId, nextMessages)
     }
 
+    fun upsertSystemMessage(
+        threadId: String,
+        kind: CodexMessageKind,
+        text: String,
+        turnId: String? = null,
+        itemId: String? = null,
+        isStreaming: Boolean = false,
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val trimmedText = text.trim()
+        if (trimmedText.isEmpty()) {
+            return this
+        }
+
+        val normalizedTurnId = normalizeThreadId(turnId)
+        val normalizedItemId = normalizeThreadId(itemId)
+        val existingMessages = messagesFor(normalizedThreadId)
+        val existingIndex = findSystemMessageIndex(
+            threadMessages = existingMessages,
+            kind = kind,
+            turnId = normalizedTurnId,
+            itemId = normalizedItemId,
+        )
+        if (existingIndex >= 0) {
+            val updatedMessages = existingMessages.toMutableList()
+            val existingMessage = updatedMessages[existingIndex]
+            updatedMessages[existingIndex] = existingMessage.copy(
+                kind = kind,
+                text = trimmedText,
+                turnId = existingMessage.turnId ?: normalizedTurnId,
+                itemId = existingMessage.itemId ?: normalizedItemId,
+                isStreaming = isStreaming,
+            )
+            return replaceThreadMessages(normalizedThreadId, updatedMessages)
+        }
+
+        val nextMessages = existingMessages + CodexMessage(
+            id = UUID.randomUUID().toString(),
+            threadId = normalizedThreadId,
+            role = CodexMessageRole.System,
+            kind = kind,
+            text = trimmedText,
+            createdAt = Instant.now(),
+            turnId = normalizedTurnId,
+            itemId = normalizedItemId,
+            isStreaming = isStreaming,
+            orderIndex = nextOrderIndex(existingMessages),
+        )
+        return replaceThreadMessages(normalizedThreadId, nextMessages)
+    }
+
+    fun appendSystemMessage(
+        threadId: String,
+        kind: CodexMessageKind,
+        text: String,
+        turnId: String? = null,
+        itemId: String? = null,
+        isStreaming: Boolean = false,
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val trimmedText = text.trim()
+        if (trimmedText.isEmpty()) {
+            return this
+        }
+
+        val existingMessages = messagesFor(normalizedThreadId)
+        val nextMessages = existingMessages + CodexMessage(
+            id = UUID.randomUUID().toString(),
+            threadId = normalizedThreadId,
+            role = CodexMessageRole.System,
+            kind = kind,
+            text = trimmedText,
+            createdAt = Instant.now(),
+            turnId = normalizeThreadId(turnId),
+            itemId = normalizeThreadId(itemId),
+            isStreaming = isStreaming,
+            orderIndex = nextOrderIndex(existingMessages),
+        )
+        return replaceThreadMessages(normalizedThreadId, nextMessages)
+    }
+
+    fun appendSystemDelta(
+        threadId: String,
+        kind: CodexMessageKind,
+        delta: String,
+        turnId: String? = null,
+        itemId: String? = null,
+        placeholderText: String = streamingPlaceholderText(kind),
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val normalizedTurnId = normalizeThreadId(turnId)
+        val normalizedItemId = normalizeThreadId(itemId)
+        val trimmedDelta = delta.trim()
+        if (trimmedDelta.isEmpty()) {
+            return upsertSystemMessage(
+                threadId = normalizedThreadId,
+                kind = kind,
+                text = placeholderText,
+                turnId = normalizedTurnId,
+                itemId = normalizedItemId,
+                isStreaming = true,
+            )
+        }
+
+        val stateWithPlaceholder = upsertSystemMessage(
+            threadId = normalizedThreadId,
+            kind = kind,
+            text = placeholderText,
+            turnId = normalizedTurnId,
+            itemId = normalizedItemId,
+            isStreaming = true,
+        )
+        val existingMessages = stateWithPlaceholder.messagesFor(normalizedThreadId)
+        val targetIndex = findSystemMessageIndex(
+            threadMessages = existingMessages,
+            kind = kind,
+            turnId = normalizedTurnId,
+            itemId = normalizedItemId,
+        )
+        if (targetIndex < 0) {
+            return stateWithPlaceholder
+        }
+
+        val updatedMessages = existingMessages.toMutableList()
+        val targetMessage = updatedMessages[targetIndex]
+        val nextText = if (isPlaceholderText(targetMessage.text, kind)) {
+            trimmedDelta
+        } else {
+            targetMessage.text + delta
+        }
+        updatedMessages[targetIndex] = targetMessage.copy(
+            text = nextText.trim(),
+            isStreaming = true,
+            turnId = targetMessage.turnId ?: normalizedTurnId,
+            itemId = targetMessage.itemId ?: normalizedItemId,
+        )
+        return stateWithPlaceholder.replaceThreadMessages(normalizedThreadId, updatedMessages)
+    }
+
+    fun completeSystemMessage(
+        threadId: String,
+        kind: CodexMessageKind,
+        text: String,
+        turnId: String? = null,
+        itemId: String? = null,
+    ): RemodexConversationState {
+        return upsertSystemMessage(
+            threadId = threadId,
+            kind = kind,
+            text = text,
+            turnId = turnId,
+            itemId = itemId,
+            isStreaming = false,
+        )
+    }
+
+    fun completeStreamingSystemMessages(threadId: String, turnId: String? = null): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val normalizedTurnId = normalizeThreadId(turnId)
+        val existingMessages = messagesFor(normalizedThreadId)
+        var didMutate = false
+        val updatedMessages = existingMessages.map { message ->
+            val matchesTurn = normalizedTurnId == null || message.turnId == normalizedTurnId
+            if (message.role == CodexMessageRole.System && message.isStreaming && matchesTurn) {
+                didMutate = true
+                message.copy(isStreaming = false)
+            } else {
+                message
+            }
+        }
+        if (!didMutate) {
+            return this
+        }
+        return replaceThreadMessages(normalizedThreadId, updatedMessages)
+    }
+
     fun pruneToThreads(threadIds: Set<String>): RemodexConversationState {
         val validThreadIds = threadIds.mapNotNull(::normalizeThreadId).toSet()
         val nextActiveThreadId = activeThreadId?.takeIf(validThreadIds::contains)
@@ -504,6 +685,53 @@ data class RemodexConversationState(
             }
 
             return -1
+        }
+
+        private fun findSystemMessageIndex(
+            threadMessages: List<CodexMessage>,
+            kind: CodexMessageKind,
+            turnId: String?,
+            itemId: String?,
+        ): Int {
+            val normalizedTurnId = normalizeThreadId(turnId)
+            val normalizedItemId = normalizeThreadId(itemId)
+
+            if (normalizedItemId != null) {
+                val itemIndex = threadMessages.indexOfLast { message ->
+                    message.role == CodexMessageRole.System &&
+                        message.kind == kind &&
+                        message.itemId == normalizedItemId
+                }
+                if (itemIndex >= 0) {
+                    return itemIndex
+                }
+            }
+
+            if (normalizedTurnId != null) {
+                return threadMessages.indexOfLast { message ->
+                    message.role == CodexMessageRole.System &&
+                        message.kind == kind &&
+                        message.turnId == normalizedTurnId &&
+                        (message.isStreaming || normalizedItemId == null)
+                }
+            }
+
+            return -1
+        }
+
+        private fun streamingPlaceholderText(kind: CodexMessageKind): String {
+            return when (kind) {
+                CodexMessageKind.Thinking -> "Thinking..."
+                CodexMessageKind.FileChange -> "Applying file changes..."
+                CodexMessageKind.CommandExecution -> "Running command"
+                CodexMessageKind.Plan -> "Planning..."
+                CodexMessageKind.UserInputPrompt -> "Waiting for input..."
+                CodexMessageKind.Chat -> "Updating..."
+            }
+        }
+
+        private fun isPlaceholderText(text: String, kind: CodexMessageKind): Boolean {
+            return text.trim().equals(streamingPlaceholderText(kind), ignoreCase = true)
         }
 
         private fun findHydrationMatchIndex(

@@ -737,7 +737,7 @@ private fun MainConversationPane(
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val selectedThreadRevision = uiState.conversation.messageRevisionFor(selectedThread?.id)
     val selectedMessages = remember(selectedThread?.id, selectedThreadRevision) {
-        uiState.conversation.messagesFor(selectedThread?.id)
+        uiState.conversation.visibleMessagesFor(selectedThread?.id)
             .sortedBy(CodexMessage::orderIndex)
     }
     val isLoadingSelectedThread = uiState.conversation.isLoadingThread(selectedThread?.id)

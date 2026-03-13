@@ -1,5 +1,6 @@
 package app.remodex.android
 
+import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexTurnTerminalState
 import app.remodex.android.core.protocol.RpcMessage
 import app.remodex.android.core.protocol.arrayValue
@@ -55,6 +56,22 @@ object RemodexConversationReducer {
                 knownThreadIds = knownThreadIds,
             )
 
+            "item/filechange/outputdelta",
+            "item/filechange/output_delta",
+            "item/commandexecution/outputdelta",
+            "item/commandexecution/output_delta",
+            "item/toolcall/outputdelta",
+            "item/toolcall/output_delta",
+            "turn/diff/updated",
+            "codex/event/turn_diff_updated",
+            "codex/event/turn_diff" -> reduceRepoAffectingDelta(
+                conversation = conversation,
+                normalizedMethod = normalizedMethod,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
             else -> conversation
         }
     }
@@ -96,6 +113,9 @@ object RemodexConversationReducer {
             threadId = threadId,
             turnId = turnId,
             terminalState = parseTurnTerminalState(paramsObject, eventObject),
+        ).completeStreamingSystemMessages(
+            threadId = threadId,
+            turnId = turnId,
         )
     }
 
@@ -107,7 +127,13 @@ object RemodexConversationReducer {
     ): RemodexConversationState {
         val itemObject = extractItemObject(paramsObject, eventObject) ?: return conversation
         if (!isAssistantMessageItem(itemObject)) {
-            return conversation
+            return reduceSystemItemStarted(
+                conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+                itemObject = itemObject,
+            )
         }
 
         val turnId = extractTurnId(paramsObject, eventObject) ?: return conversation
@@ -165,10 +191,27 @@ object RemodexConversationReducer {
         val itemObject = extractItemObject(paramsObject, eventObject)
         val text = when {
             itemObject != null && isAssistantMessageItem(itemObject) -> extractMessageText(itemObject)
+            itemObject != null -> extractSystemItemText(
+                itemObject = itemObject,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                isCompleted = true,
+            )
             else -> extractCompletionFallbackText(paramsObject, eventObject)
         }
         if (text.isBlank()) {
             return conversation
+        }
+
+        if (itemObject != null && !isAssistantMessageItem(itemObject)) {
+            return reduceSystemItemCompleted(
+                conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+                itemObject = itemObject,
+                text = text,
+            )
         }
 
         val turnId = extractTurnId(paramsObject, eventObject)
@@ -186,6 +229,107 @@ object RemodexConversationReducer {
             turnId = turnId,
             itemId = itemId,
             text = text,
+        )
+    }
+
+    private fun reduceSystemItemStarted(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+        itemObject: JsonObject,
+    ): RemodexConversationState {
+        val kind = resolveSystemItemKind(itemObject) ?: return conversation
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val itemId = extractItemId(paramsObject, eventObject, itemObject)
+        val text = extractSystemItemText(
+            itemObject = itemObject,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            isCompleted = false,
+        ).ifBlank { streamingPlaceholderText(kind) }
+
+        return conversation.upsertSystemMessage(
+            threadId = threadId,
+            kind = kind,
+            text = text,
+            turnId = turnId,
+            itemId = itemId,
+            isStreaming = true,
+        )
+    }
+
+    private fun reduceSystemItemCompleted(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+        itemObject: JsonObject,
+        text: String,
+    ): RemodexConversationState {
+        val kind = resolveSystemItemKind(itemObject) ?: return conversation
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val itemId = extractItemId(paramsObject, eventObject, itemObject)
+
+        return conversation.completeSystemMessage(
+            threadId = threadId,
+            kind = kind,
+            text = text,
+            turnId = turnId,
+            itemId = itemId,
+        )
+    }
+
+    private fun reduceRepoAffectingDelta(
+        conversation: RemodexConversationState,
+        normalizedMethod: String,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val itemObject = extractItemObject(paramsObject, eventObject)
+        val kind = when {
+            normalizedMethod.contains("commandexecution") -> CodexMessageKind.CommandExecution
+            normalizedMethod.contains("filechange") || normalizedMethod.contains("diff") -> CodexMessageKind.FileChange
+            itemObject != null -> resolveSystemItemKind(itemObject)
+            else -> null
+        } ?: return conversation
+
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val itemId = extractItemId(paramsObject, eventObject, itemObject)
+        val delta = when (kind) {
+            CodexMessageKind.FileChange -> extractFileChangeDelta(paramsObject, eventObject)
+            CodexMessageKind.CommandExecution -> extractCommandExecutionDelta(paramsObject, eventObject)
+            else -> extractCompletionFallbackText(paramsObject, eventObject)
+        }
+
+        return conversation.appendSystemDelta(
+            threadId = threadId,
+            kind = kind,
+            delta = delta,
+            turnId = turnId,
+            itemId = itemId,
         )
     }
 
@@ -237,6 +381,37 @@ object RemodexConversationReducer {
             eventObject?.get("delta")?.stringValue,
             paramsObject["event"]?.objectValue?.get("delta")?.stringValue,
         )
+    }
+
+    private fun extractFileChangeDelta(paramsObject: JsonObject, eventObject: JsonObject?): String {
+        val directDiff = firstNonBlank(
+            paramsObject["diff"]?.stringValue,
+            paramsObject["unified_diff"]?.stringValue,
+            paramsObject["patch"]?.stringValue,
+            eventObject?.get("diff")?.stringValue,
+            eventObject?.get("unified_diff")?.stringValue,
+            eventObject?.get("patch")?.stringValue,
+        )
+        if (!directDiff.isNullOrBlank()) {
+            return directDiff
+        }
+
+        return firstNonBlank(
+            paramsObject["delta"]?.stringValue,
+            eventObject?.get("delta")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("delta")?.stringValue,
+        ).orEmpty()
+    }
+
+    private fun extractCommandExecutionDelta(paramsObject: JsonObject, eventObject: JsonObject?): String {
+        return firstNonBlank(
+            paramsObject["delta"]?.stringValue,
+            eventObject?.get("delta")?.stringValue,
+            paramsObject["output"]?.stringValue,
+            eventObject?.get("output")?.stringValue,
+            paramsObject["stderr"]?.stringValue,
+            paramsObject["stdout"]?.stringValue,
+        ).orEmpty()
     }
 
     private fun extractCompletionFallbackText(paramsObject: JsonObject, eventObject: JsonObject?): String {
@@ -357,6 +532,183 @@ object RemodexConversationReducer {
             itemObject["text"]?.stringValue,
             itemObject["message"]?.stringValue,
         ).orEmpty()
+    }
+
+    private fun resolveSystemItemKind(itemObject: JsonObject): CodexMessageKind? {
+        return when (normalizeItemType(itemObject["type"]?.stringValue)) {
+            "reasoning" -> CodexMessageKind.Thinking
+            "filechange", "diff" -> CodexMessageKind.FileChange
+            "commandexecution" -> CodexMessageKind.CommandExecution
+            "toolcall" -> {
+                if (isRepoAffectingToolCall(itemObject)) {
+                    CodexMessageKind.FileChange
+                } else {
+                    null
+                }
+            }
+            "plan" -> CodexMessageKind.Plan
+            else -> null
+        }
+    }
+
+    private fun extractSystemItemText(
+        itemObject: JsonObject,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        isCompleted: Boolean,
+    ): String {
+        val kind = resolveSystemItemKind(itemObject) ?: return ""
+        val extractedText = when (kind) {
+            CodexMessageKind.CommandExecution -> extractCommandExecutionText(itemObject, paramsObject, eventObject, isCompleted)
+            CodexMessageKind.FileChange -> extractFileChangeText(itemObject, paramsObject, eventObject, isCompleted)
+            CodexMessageKind.Thinking, CodexMessageKind.Plan, CodexMessageKind.UserInputPrompt, CodexMessageKind.Chat ->
+                extractMessageText(itemObject)
+        }
+        return extractedText.ifBlank {
+            when (kind) {
+                CodexMessageKind.FileChange, CodexMessageKind.CommandExecution -> streamingPlaceholderText(kind)
+                else -> ""
+            }
+        }
+    }
+
+    private fun extractCommandExecutionText(
+        itemObject: JsonObject,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        isCompleted: Boolean,
+    ): String {
+        val command = firstNonBlank(
+            itemObject["command"]?.stringValue,
+            itemObject["cmd"]?.stringValue,
+            itemObject["title"]?.stringValue,
+            itemObject["label"]?.stringValue,
+            paramsObject["command"]?.stringValue,
+            eventObject?.get("command")?.stringValue,
+        ).orEmpty().trim()
+        val status = firstNonBlank(
+            itemObject["status"]?.stringValue,
+            paramsObject["status"]?.stringValue,
+            eventObject?.get("status")?.stringValue,
+        )?.trim()
+        val resolvedStatus = if (status.isNullOrEmpty()) {
+            if (isCompleted) "completed" else "running"
+        } else {
+            status
+        }
+
+        return if (command.isNotEmpty()) {
+            "$resolvedStatus $command"
+        } else {
+            "Command $resolvedStatus"
+        }
+    }
+
+    private fun extractFileChangeText(
+        itemObject: JsonObject,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        isCompleted: Boolean,
+    ): String {
+        val patch = firstNonBlank(
+            itemObject["diff"]?.stringValue,
+            itemObject["unified_diff"]?.stringValue,
+            itemObject["patch"]?.stringValue,
+            paramsObject["diff"]?.stringValue,
+            paramsObject["unified_diff"]?.stringValue,
+            paramsObject["patch"]?.stringValue,
+            eventObject?.get("diff")?.stringValue,
+            eventObject?.get("unified_diff")?.stringValue,
+            eventObject?.get("patch")?.stringValue,
+        )
+        if (!patch.isNullOrBlank()) {
+            return patch
+        }
+
+        val changeSummary = decodeFileChangeSummary(itemObject["changes"]?.arrayValue)
+        if (changeSummary.isNotBlank()) {
+            return changeSummary
+        }
+
+        val outputText = firstNonBlank(
+            itemObject["output"]?.stringValue,
+            itemObject["text"]?.stringValue,
+            itemObject["message"]?.stringValue,
+            paramsObject["output"]?.stringValue,
+            eventObject?.get("output")?.stringValue,
+        )
+        if (!outputText.isNullOrBlank()) {
+            return outputText
+        }
+
+        return if (isCompleted) {
+            "File changes applied."
+        } else {
+            "Applying file changes..."
+        }
+    }
+
+    private fun decodeFileChangeSummary(changes: List<app.remodex.android.core.protocol.JsonValue>?): String {
+        val entries = changes.orEmpty().mapNotNull { value ->
+            val changeObject = value.objectValue ?: return@mapNotNull null
+            val path = firstNonBlank(
+                changeObject["path"]?.stringValue,
+                changeObject["file"]?.stringValue,
+                changeObject["filename"]?.stringValue,
+            ) ?: return@mapNotNull null
+            val kind = firstNonBlank(
+                changeObject["kind"]?.stringValue,
+                changeObject["type"]?.stringValue,
+                changeObject["status"]?.stringValue,
+            ) ?: "update"
+            "$kind $path"
+        }
+        return entries.joinToString(separator = "\n")
+    }
+
+    private fun isRepoAffectingToolCall(itemObject: JsonObject): Boolean {
+        val descriptor = firstNonBlank(
+            itemObject["tool"]?.stringValue,
+            itemObject["name"]?.stringValue,
+            itemObject["title"]?.stringValue,
+            itemObject["label"]?.stringValue,
+        ).orEmpty().lowercase()
+        if (descriptor.contains("filechange")
+            || descriptor.contains("diff")
+            || descriptor.contains("patch")
+            || descriptor.contains("edit")
+            || descriptor.contains("write")
+        ) {
+            return true
+        }
+
+        return itemObject["changes"] != null ||
+            itemObject["files"] != null ||
+            itemObject["diff"] != null ||
+            itemObject["unified_diff"] != null ||
+            itemObject["patch"] != null
+    }
+
+    private fun normalizeItemType(rawType: String?): String? {
+        val trimmed = rawType?.trim()?.lowercase().orEmpty()
+        if (trimmed.isEmpty()) {
+            return null
+        }
+        return trimmed
+            .replace("_", "")
+            .replace("-", "")
+            .replace(" ", "")
+    }
+
+    private fun streamingPlaceholderText(kind: CodexMessageKind): String {
+        return when (kind) {
+            CodexMessageKind.Thinking -> "Thinking..."
+            CodexMessageKind.FileChange -> "Applying file changes..."
+            CodexMessageKind.CommandExecution -> "Running command"
+            CodexMessageKind.Plan -> "Planning..."
+            CodexMessageKind.UserInputPrompt -> "Waiting for input..."
+            CodexMessageKind.Chat -> "Updating..."
+        }
     }
 
     private fun resolveThreadId(
