@@ -1557,7 +1557,7 @@ private fun BranchRuntimeControl(
     onSelectBranch: (String) -> Unit,
 ) {
     val normalizedDefaultBranch = defaultBranch.trim().takeIf(String::isNotEmpty)
-    val normalizedCurrentBranch = branchLabel?.trim().takeIf(String::isNotEmpty).orEmpty()
+    val normalizedCurrentBranch = branchLabel?.trim()?.takeIf(String::isNotEmpty).orEmpty()
     val effectiveGitBaseBranch = gitBaseBranch.trim().takeIf(String::isNotEmpty)
         ?: normalizedDefaultBranch
         ?: normalizedCurrentBranch
