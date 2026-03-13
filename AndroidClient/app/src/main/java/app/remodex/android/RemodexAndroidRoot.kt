@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -22,11 +23,13 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
@@ -65,6 +68,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -77,7 +81,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -794,9 +801,12 @@ private fun MainConversationPane(
 ) {
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val selectedThreadRevision = uiState.conversation.messageRevisionFor(selectedThread?.id)
-    val selectedMessages = remember(selectedThread?.id, selectedThreadRevision) {
-        uiState.conversation.visibleMessagesFor(selectedThread?.id)
-            .sortedBy(CodexMessage::orderIndex)
+    val selectedActiveTurnId = selectedThread?.id?.let(uiState.conversation.activeTurnIdByThread::get)
+    val projectedTimeline = remember(selectedThread?.id, selectedThreadRevision) {
+        RemodexTimelineProjector.project(
+            uiState.conversation.visibleMessagesFor(selectedThread?.id)
+                .sortedBy(CodexMessage::orderIndex),
+        )
     }
     val isLoadingSelectedThread = uiState.conversation.isLoadingThread(selectedThread?.id)
     val isRunningSelectedThread = uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id)
@@ -833,8 +843,10 @@ private fun MainConversationPane(
                     )
                     ConversationTimeline(
                         selectedThread = selectedThread,
-                        messages = selectedMessages,
+                        messages = projectedTimeline.messages,
                         isLoadingThread = isLoadingSelectedThread,
+                        isThreadRunning = isRunningSelectedThread,
+                        activeTurnId = selectedActiveTurnId,
                         modifier = Modifier.weight(1f),
                     )
                     AnimatedVisibility(visible = showDeveloperPanels) {
@@ -1020,6 +1032,8 @@ private fun ConversationTimeline(
     selectedThread: CodexThread?,
     messages: List<CodexMessage>,
     isLoadingThread: Boolean,
+    isThreadRunning: Boolean,
+    activeTurnId: String?,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxWidth()) {
@@ -1047,13 +1061,98 @@ private fun ConversationTimeline(
             return
         }
 
+        val pageSize = 40
+        var visibleTailCount by remember(selectedThread.id) { mutableStateOf(pageSize) }
+        val listState = rememberLazyListState()
+        val timelineScope = rememberCoroutineScope()
+        val visibleMessages = remember(messages, visibleTailCount) {
+            messages.takeLast(visibleTailCount)
+        }
+        val hasEarlierMessages = visibleTailCount < messages.size
+        val isScrolledToBottom by remember(listState, visibleMessages) {
+            derivedStateOf {
+                val lastVisibleIndex = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+                lastVisibleIndex >= visibleMessages.lastIndex - 1
+            }
+        }
+        val assistantAnchorId = remember(visibleMessages, activeTurnId) {
+            RemodexTimelineProjector.assistantResponseAnchorMessageId(
+                messages = visibleMessages,
+                activeTurnId = activeTurnId,
+            )
+        }
+
+        LaunchedEffect(selectedThread.id) {
+            visibleTailCount = pageSize
+            if (visibleMessages.isNotEmpty()) {
+                listState.scrollToItem(visibleMessages.lastIndex)
+            }
+        }
+
+        LaunchedEffect(visibleMessages.size, isThreadRunning, assistantAnchorId) {
+            if (visibleMessages.isEmpty()) {
+                return@LaunchedEffect
+            }
+            if (isThreadRunning && assistantAnchorId != null) {
+                val anchorIndex = visibleMessages.indexOfFirst { it.id == assistantAnchorId }
+                if (anchorIndex >= 0) {
+                    listState.animateScrollToItem(anchorIndex)
+                    return@LaunchedEffect
+                }
+            }
+            if (isScrolledToBottom) {
+                listState.animateScrollToItem(visibleMessages.lastIndex)
+            }
+        }
+
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 18.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(22.dp),
         ) {
-            items(messages, key = { it.id }) { message ->
+            if (hasEarlierMessages) {
+                item(key = "load-earlier") {
+                    TextButton(
+                        onClick = {
+                            visibleTailCount = minOf(visibleTailCount + pageSize, messages.size)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Load earlier messages")
+                    }
+                }
+            }
+            items(visibleMessages, key = { it.id }) { message ->
                 TranscriptMessage(message = message)
+            }
+        }
+        AnimatedVisibility(
+            visible = visibleMessages.size > 1 && !isScrolledToBottom,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 18.dp),
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = Color(0xFFFCFAF6),
+                border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
+            ) {
+                IconButton(
+                    onClick = {
+                        if (visibleMessages.isNotEmpty()) {
+                            timelineScope.launch {
+                                listState.animateScrollToItem(visibleMessages.lastIndex)
+                            }
+                        }
+                    },
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.KeyboardArrowDown,
+                        contentDescription = "Scroll to latest message",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
             }
         }
     }
@@ -2377,18 +2476,10 @@ private fun GroupedMenuSection(
 
 @Composable
 private fun TranscriptMessage(message: CodexMessage) {
-    val isUser = message.role == CodexMessageRole.User
-
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start,
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (isUser) {
-            UserTranscriptBubble(message = message)
-        } else {
-            AssistantTranscriptBlock(message = message)
-        }
+    when (message.role) {
+        CodexMessageRole.User -> UserTranscriptBubble(message = message)
+        CodexMessageRole.Assistant -> AssistantTranscriptBlock(message = message)
+        CodexMessageRole.System -> SystemTranscriptBlock(message = message)
     }
 }
 
@@ -2767,53 +2858,988 @@ private fun InlineInfoBadge(
 
 @Composable
 private fun UserTranscriptBubble(message: CodexMessage) {
-    Surface(
-        modifier = Modifier.widthIn(max = 240.dp),
-        shape = RoundedCornerShape(18.dp),
-        color = Color(0xFFF1F1F1),
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.End,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(
-            text = message.text,
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
+        if (message.attachments.isNotEmpty()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                message.attachments.forEachIndexed { index, _ ->
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color(0xFFF5F3EF),
+                        border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
+                    ) {
+                        Text(
+                            text = "Image ${index + 1}",
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+
+        Surface(
+            modifier = Modifier.widthIn(max = 280.dp),
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFFF1F1F1),
+        ) {
+            Text(
+                text = message.text,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        UserDeliveryMetaRow(message = message)
     }
-    MessageMetaRow(
-        message = message,
-        leadingIcon = null,
-    )
 }
 
 @Composable
 private fun AssistantTranscriptBlock(message: CodexMessage) {
+    val clipboard = LocalClipboardManager.current
+    val segments = remember(message.text) {
+        RemodexMarkdownRenderer.parseMarkdownSegments(message.text.trim())
+    }
+
     Column(
-        modifier = Modifier.widthIn(max = 340.dp),
+        modifier = Modifier.widthIn(max = 520.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        if (message.kind != CodexMessageKind.Chat) {
+        if (message.text.isNotBlank()) {
+            segments.forEach { segment ->
+                when (segment) {
+                    is MarkdownSegment.Prose -> MarkdownProseBlock(text = segment.text)
+                    is MarkdownSegment.CodeBlock -> AssistantCodeBlock(
+                        language = segment.language,
+                        code = segment.code,
+                    )
+                }
+            }
+        }
+        if (message.isStreaming) {
+            Text(
+                text = "Working on it...",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        )
+        {
             Surface(
                 shape = CircleShape,
-                color = assistantKindTone(message.kind),
+                color = Color(0xFFF5F3EF),
+                border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+                modifier = Modifier.clickable(enabled = message.text.isNotBlank()) {
+                    clipboard.setText(AnnotatedString(message.text))
+                },
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.ContentCopy,
+                        contentDescription = "Copy assistant message",
+                        modifier = Modifier.width(13.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "Copy",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            MessageMetaRow(message = message, leadingIcon = null)
+        }
+    }
+}
+
+@Composable
+private fun SystemTranscriptBlock(message: CodexMessage) {
+    Column(
+        modifier = Modifier.widthIn(max = 520.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        when (message.kind) {
+            CodexMessageKind.Thinking -> ThinkingSystemBlock(message = message)
+            CodexMessageKind.FileChange -> FileChangeSystemBlock(message = message)
+            CodexMessageKind.CommandExecution -> CommandExecutionSystemBlock(message = message)
+            CodexMessageKind.Plan -> PlanSystemBlock(message = message)
+            CodexMessageKind.UserInputPrompt -> StructuredUserInputPromptBlock(message = message)
+            CodexMessageKind.Chat -> DefaultSystemBlock(message = message)
+        }
+    }
+}
+
+@Composable
+private fun ThinkingSystemBlock(message: CodexMessage) {
+    val content = remember(message.text) {
+        ThinkingDisclosureParser.parse(message.text)
+    }
+    val normalized = content.fallbackText
+    if (!message.isStreaming && normalized.isBlank()) {
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "Thinking...",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (normalized.isNotBlank()) {
+            ThinkingDisclosureBlock(
+                messageId = message.id,
+                content = content,
+            )
+        }
+        MessageMetaRow(message = message, leadingIcon = null)
+    }
+}
+
+@Composable
+private fun FileChangeSystemBlock(message: CodexMessage) {
+    val renderState = remember(message.id, message.text) {
+        RemodexFileChangeRenderState.fromSourceText(message.text)
+    }
+    val actionEntries = renderState.actionEntries
+    val allEntries = if (actionEntries.isNotEmpty()) {
+        actionEntries
+    } else {
+        renderState.summary?.entries.orEmpty()
+    }
+    val groupedEntries = remember(allEntries) {
+        RemodexFileChangeGrouping.grouped(allEntries)
+    }
+    val diffChunks = remember(message.id, renderState.bodyText, allEntries) {
+        RemodexPerFileDiffParser.parse(renderState.bodyText, allEntries)
+    }
+    var showDiffDialog by rememberSaveable(message.id) { mutableStateOf(false) }
+
+    SystemCardContainer(
+        message = message,
+        title = "Workspace",
+        tone = assistantKindTone(CodexMessageKind.FileChange),
+        isStreaming = message.isStreaming,
+    ) {
+        if (groupedEntries.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                groupedEntries.forEach { group ->
+                    FileChangeEntryGroup(group = group)
+                }
+            }
+        } else if (message.text.isNotBlank()) {
+            MarkdownProseBlock(text = message.text)
+        }
+
+        if (!message.isStreaming && allEntries.isNotEmpty()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = { showDiffDialog = true },
+                    shape = RoundedCornerShape(999.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                ) {
+                    Text(
+                        text = buildString {
+                            append("Diff")
+                            val additions = allEntries.sumOf { it.additions }
+                            val deletions = allEntries.sumOf { it.deletions }
+                            if (additions > 0) append(" +$additions")
+                            if (deletions > 0) append(" -$deletions")
+                        },
+                    )
+                }
+            }
+        }
+
+        if (message.isStreaming) {
+            Text(
+                text = "Applying changes...",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
+    if (showDiffDialog) {
+        FileChangeDiffDialog(
+            chunks = diffChunks,
+            onDismiss = { showDiffDialog = false },
+        )
+    }
+}
+
+@Composable
+private fun CommandExecutionSystemBlock(message: CodexMessage) {
+    val status = parseCommandExecutionStatus(message.text)
+    SystemCardContainer(
+        message = message,
+        title = "Command",
+        tone = assistantKindTone(CodexMessageKind.CommandExecution),
+        isStreaming = message.isStreaming,
+    ) {
+        if (status != null) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(3.dp)
+                        .height(34.dp)
+                        .background(status.accent, RoundedCornerShape(99.dp)),
+                )
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = status.command,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = status.statusLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = status.accent,
+                    )
+                }
+            }
+        } else if (message.text.isNotBlank()) {
+            Text(
+                text = message.text,
+                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PlanSystemBlock(message: CodexMessage) {
+    val bodyText = message.text.trim().takeUnless { it.isBlank() || it == "Planning..." }
+    val explanationText = message.planState?.explanation?.trim()
+        ?.takeUnless { it.isNullOrBlank() || it == bodyText }
+
+    SystemCardContainer(
+        message = message,
+        title = "Plan",
+        tone = assistantKindTone(CodexMessageKind.Plan),
+        isStreaming = message.isStreaming,
+    ) {
+        bodyText?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        if (bodyText == null && explanationText != null) {
+            Text(
+                text = explanationText,
+                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        if (explanationText != null && bodyText != null) {
+            Text(
+                text = explanationText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        val steps = message.planState?.steps.orEmpty()
+        if (steps.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                steps.forEach { step ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Text(
+                            text = when (step.status.name) {
+                                "Completed" -> "●"
+                                "InProgress" -> "◐"
+                                else -> "○"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = when (step.status.name) {
+                                "Completed" -> Color(0xFF4DA468)
+                                "InProgress" -> Color(0xFFC98935)
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = step.step,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = when (step.status.name) {
+                                    "Completed" -> "Completed"
+                                    "InProgress" -> "In progress"
+                                    else -> "Pending"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StructuredUserInputPromptBlock(message: CodexMessage) {
+    val request = message.structuredUserInputRequest
+    SystemCardContainer(
+        message = message,
+        title = "Question",
+        tone = assistantKindTone(CodexMessageKind.UserInputPrompt),
+        isStreaming = message.isStreaming,
+    ) {
+        if (request == null) {
+            Text(
+                text = message.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                request.questions.forEachIndexed { index, question ->
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (question.header.isNotBlank()) {
+                            Text(
+                                text = question.header.uppercase(Locale.US),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Text(
+                            text = question.question,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        question.options.forEach { option ->
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = Color(0xFFFFFEFC),
+                                border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                                ) {
+                                    Text(
+                                        text = option.label,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    )
+                                    if (option.description.isNotBlank()) {
+                                        Text(
+                                            text = option.description,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        if (index < request.questions.lastIndex) {
+                            Divider(color = Color(0xFFE9E3DB))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DefaultSystemBlock(message: CodexMessage) {
+    Text(
+        text = message.text,
+        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 20.sp),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun SystemCardContainer(
+    message: CodexMessage,
+    title: String,
+    tone: Color,
+    isStreaming: Boolean,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = tone.copy(alpha = 0.78f),
+        border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = messageKindLabel(message.kind),
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    text = title,
                     style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (isStreaming) {
+                    Text(
+                        text = "Streaming",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            content()
+        }
+    }
+    MessageMetaRow(message = message, leadingIcon = null)
+}
+
+private data class CommandExecutionStatus(
+    val command: String,
+    val statusLabel: String,
+    val accent: Color,
+)
+
+private fun parseCommandExecutionStatus(text: String): CommandExecutionStatus? {
+    val words = text.trim().split(Regex("\\s+")).filter(String::isNotBlank)
+    val first = words.firstOrNull()?.lowercase() ?: return null
+    val command = words.drop(1).joinToString(" ").trim().ifEmpty { "command" }
+    return when (first) {
+        "running" -> CommandExecutionStatus(command, "running", Color(0xFFC98935))
+        "completed" -> CommandExecutionStatus(command, "completed", Color(0xFF4DA468))
+        "failed", "stopped" -> CommandExecutionStatus(command, first, Color(0xFFD35D5D))
+        else -> null
+    }
+}
+
+@Composable
+private fun MarkdownProseBlock(text: String) {
+    SelectionContainer {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp),
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+@Composable
+private fun AssistantCodeBlock(
+    language: String?,
+    code: String,
+) {
+    val clipboard = LocalClipboardManager.current
+    val isDiffBlock = remember(code) {
+        RemodexDiffLineKind.detectVerifiedPatch(code)
+    }
+
+    if (isDiffBlock) {
+        DiffCodeBlock(code = code)
+        return
+    }
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFFF7F5F1),
+        border = BorderStroke(1.dp, Color(0xFFE6E2DB)),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF1EDE7))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = language?.takeIf(String::isNotBlank) ?: "code",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                TextButton(
+                    onClick = { clipboard.setText(AnnotatedString(code)) },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        text = "Copy",
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                SelectionContainer {
+                    Text(
+                        text = code,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 20.sp,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiffCodeBlock(code: String) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFFF7F5F1),
+        border = BorderStroke(1.dp, Color(0xFFE6E2DB)),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(vertical = 8.dp),
+        ) {
+            code.split('\n').forEach { line ->
+                val kind = RemodexDiffLineKind.classify(line)
+                if (kind != RemodexDiffLineKind.Meta) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(diffBackgroundColor(kind)),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(if (kind == RemodexDiffLineKind.Addition || kind == RemodexDiffLineKind.Deletion) 2.dp else 0.dp)
+                                .heightIn(min = 22.dp)
+                                .background(diffIndicatorColor(kind)),
+                        )
+                        SelectionContainer {
+                            Text(
+                                text = line,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 1.dp),
+                                color = diffTextColor(kind),
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    lineHeight = 20.sp,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CleanDiffCodeBlock(code: String) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        code.split('\n').forEach { line ->
+            when (val kind = RemodexDiffLineKind.classify(line)) {
+                RemodexDiffLineKind.Meta -> Unit
+                RemodexDiffLineKind.Hunk -> Divider(
+                    modifier = Modifier.padding(vertical = 6.dp),
+                    color = Color(0xFFE4DFD6),
+                )
+                else -> {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(diffBackgroundColor(kind)),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(if (kind == RemodexDiffLineKind.Addition || kind == RemodexDiffLineKind.Deletion) 2.dp else 0.dp)
+                                .heightIn(min = 22.dp)
+                                .background(diffIndicatorColor(kind)),
+                        )
+                        SelectionContainer {
+                            Text(
+                                text = strippedDiffLine(line, kind),
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 1.dp),
+                                color = diffTextColor(kind),
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    lineHeight = 20.sp,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileChangeEntryGroup(group: RemodexFileChangeGroup) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = group.key,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        group.entries.forEach { entry ->
+            FileChangeEntryRow(entry = entry)
+        }
+    }
+}
+
+@Composable
+private fun FileChangeEntryRow(entry: RemodexFileChangeSummaryEntry) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = entry.compactPath,
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                color = Color(0xFF2D6AB5),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            if (entry.additions > 0) {
+                Text(
+                    text = "+${entry.additions}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    color = Color(0xFF208C49),
+                )
+            }
+            if (entry.deletions > 0) {
+                Text(
+                    text = "-${entry.deletions}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    color = Color(0xFFC74848),
+                )
+            }
+        }
+        entry.fullDirectoryPath?.let { directory ->
+            Text(
+                text = directory,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FileChangeDiffDialog(
+    chunks: List<RemodexPerFileDiffChunk>,
+    onDismiss: () -> Unit,
+) {
+    FloatingSheetDialog(onDismiss = onDismiss) {
+        SheetHeader(
+            title = "Changes",
+            actionLabel = "Done",
+            onAction = onDismiss,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "${chunks.size} file${if (chunks.size == 1) "" else "s"} changed",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 8.dp),
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 520.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            chunks.forEach { chunk ->
+                FileChangeDiffCard(chunk = chunk)
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileChangeDiffCard(chunk: RemodexPerFileDiffChunk) {
+    var isExpanded by rememberSaveable(chunk.id) { mutableStateOf(true) }
+
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color(0xFFF3F0EA),
+        border = BorderStroke(1.dp, Color(0xFFE4DFD6)),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { isExpanded = !isExpanded }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.graphicsLayer {
+                        rotationZ = if (isExpanded) 0f else -90f
+                    },
+                )
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = chunk.compactPath,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.Medium,
+                                fontFamily = FontFamily.Monospace,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        FileChangeActionPill(action = chunk.action)
+                    }
+                    chunk.fullDirectoryPath?.let { directory ->
+                        Text(
+                            text = directory,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (chunk.additions > 0) {
+                        Text(
+                            text = "+${chunk.additions}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = Color(0xFF208C49),
+                        )
+                    }
+                    if (chunk.deletions > 0) {
+                        Text(
+                            text = "-${chunk.deletions}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = Color(0xFFC74848),
+                        )
+                    }
+                }
+            }
+
+            if (isExpanded && chunk.diffCode.isNotBlank()) {
+                Divider(color = Color(0xFFE4DFD6))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(vertical = 6.dp),
+                ) {
+                    CleanDiffCodeBlock(code = chunk.diffCode)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileChangeActionPill(action: RemodexFileChangeAction) {
+    val color = when (action) {
+        RemodexFileChangeAction.Edited -> Color(0xFFC98935)
+        RemodexFileChangeAction.Added -> Color(0xFF208C49)
+        RemodexFileChangeAction.Deleted -> Color(0xFFC74848)
+        RemodexFileChangeAction.Renamed -> Color(0xFF2D6AB5)
+    }
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = color.copy(alpha = 0.12f),
+    ) {
+        Text(
+            text = action.label,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+            color = color,
+        )
+    }
+}
+
+@Composable
+private fun ThinkingDisclosureBlock(
+    messageId: String,
+    content: ThinkingDisclosureContent,
+) {
+    var expandedSectionIds by remember(messageId) { mutableStateOf(emptySet<String>()) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (content.showsDisclosure) {
+            content.sections.forEach { section ->
+                val isExpanded = expandedSectionIds.contains(section.id)
+                val hasDetail = section.detail.isNotBlank()
+
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = hasDetail) {
+                                expandedSectionIds = if (isExpanded) {
+                                    expandedSectionIds - section.id
+                                } else {
+                                    expandedSectionIds + section.id
+                                }
+                            },
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = if (hasDetail) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+                            },
+                            modifier = Modifier
+                                .width(14.dp)
+                                .graphicsLayer {
+                                    rotationZ = if (isExpanded) 0f else -90f
+                                },
+                        )
+                        Text(
+                            text = section.title,
+                            style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    if (isExpanded && hasDetail) {
+                        SelectionContainer {
+                            Text(
+                                text = section.detail,
+                                modifier = Modifier.padding(start = 22.dp),
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    lineHeight = 20.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                ),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        } else if (content.fallbackText.isNotBlank()) {
+            SelectionContainer {
+                Text(
+                    text = content.fallbackText,
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        lineHeight = 20.sp,
+                        fontFamily = FontFamily.Monospace,
+                    ),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
-        Text(
-            text = message.text,
-            style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp),
-            color = MaterialTheme.colorScheme.onSurface,
-        )
-        MessageMetaRow(
-            message = message,
-            leadingIcon = Icons.Outlined.ContentCopy,
-        )
     }
+}
+
+private fun diffTextColor(kind: RemodexDiffLineKind): Color {
+    return when (kind) {
+        RemodexDiffLineKind.Addition -> Color(0xFF208C49)
+        RemodexDiffLineKind.Deletion -> Color(0xFFC74848)
+        RemodexDiffLineKind.Hunk -> Color(0xFF6679A6)
+        RemodexDiffLineKind.Meta -> Color(0xFF8C887F)
+        RemodexDiffLineKind.Neutral -> Color(0xFF161616)
+    }
+}
+
+private fun diffBackgroundColor(kind: RemodexDiffLineKind): Color {
+    return when (kind) {
+        RemodexDiffLineKind.Addition -> Color(0x1F208C49)
+        RemodexDiffLineKind.Deletion -> Color(0x1FC74848)
+        else -> Color.Transparent
+    }
+}
+
+private fun diffIndicatorColor(kind: RemodexDiffLineKind): Color {
+    return when (kind) {
+        RemodexDiffLineKind.Addition -> Color(0xFF208C49)
+        RemodexDiffLineKind.Deletion -> Color(0xFFC74848)
+        else -> Color.Transparent
+    }
+}
+
+private fun strippedDiffLine(
+    line: String,
+    kind: RemodexDiffLineKind,
+): String {
+    return when (kind) {
+        RemodexDiffLineKind.Addition, RemodexDiffLineKind.Deletion -> line.drop(1)
+        RemodexDiffLineKind.Neutral -> if (line.startsWith(" ")) line.drop(1) else line
+        RemodexDiffLineKind.Hunk,
+        RemodexDiffLineKind.Meta,
+        -> line
+    }
+}
+
+@Composable
+private fun UserDeliveryMetaRow(message: CodexMessage) {
+    val deliveryText = when (message.deliveryState.name) {
+        "Pending" -> "sending..."
+        "Failed" -> "send failed"
+        else -> formatMessageTimestamp(message.createdAt)
+    }
+    if (deliveryText == null) {
+        return
+    }
+    Text(
+        text = deliveryText,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (message.deliveryState.name == "Failed") {
+            MaterialTheme.colorScheme.error
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+    )
 }
 
 @Composable
