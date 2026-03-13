@@ -252,7 +252,7 @@ async function gitCheckout(cwd, params) {
   }
 
   try {
-    await git(cwd, "checkout", "--", branch);
+    await git(cwd, "checkout", branch);
   } catch (err) {
     if (err.message?.includes("would be overwritten")) {
       throw gitError(
