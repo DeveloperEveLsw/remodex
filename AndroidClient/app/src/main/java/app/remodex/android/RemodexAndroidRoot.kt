@@ -48,6 +48,8 @@ import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -133,6 +135,10 @@ fun RemodexAndroidRoot() {
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
+    val canOpenBranchMenu = selectedThread?.cwd?.isNotBlank() == true &&
+        !uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id) &&
+        !uiState.isLoadingGitBranchTargets &&
+        !uiState.isSwitchingGitBranch
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
         Box(
@@ -183,9 +189,11 @@ fun RemodexAndroidRoot() {
                         onOpenSettings = { activePanel = SETTINGS_PANEL },
                         onOpenActionMenu = { activePanel = ACTION_MENU_PANEL },
                         onOpenBranchPicker = {
-                            viewModel.refreshGitBranchTargets()
-                            activePanel = BRANCH_PICKER_PANEL
+                            if (canOpenBranchMenu) {
+                                activePanel = BRANCH_PICKER_PANEL
+                            }
                         },
+                        onDismissBranchPicker = { activePanel = null },
                         onOpenModelPicker = { activePanel = MODEL_PICKER_PANEL },
                         onOpenReasoningPicker = { activePanel = REASONING_PICKER_PANEL },
                         onOpenAccessPicker = { activePanel = ACCESS_PICKER_PANEL },
@@ -193,6 +201,15 @@ fun RemodexAndroidRoot() {
                         onSendPrompt = viewModel::startTurn,
                         onStopTurn = viewModel::interruptTurn,
                         onRefreshGitBranches = { viewModel.refreshGitBranchTargets() },
+                        onSelectGitBaseBranch = { branch ->
+                            viewModel.selectGitBaseBranch(branch)
+                            activePanel = null
+                        },
+                        onSelectBranch = { branch ->
+                            viewModel.switchGitBranch(branch)
+                            activePanel = null
+                        },
+                        isBranchMenuExpanded = activePanel == BRANCH_PICKER_PANEL,
                     )
                 } else {
                     OnboardingState(
@@ -221,8 +238,9 @@ fun RemodexAndroidRoot() {
                     onDismiss = { activePanel = null },
                     onOpenSettings = { activePanel = SETTINGS_PANEL },
                     onOpenBranchPicker = {
-                        viewModel.refreshGitBranchTargets()
-                        activePanel = BRANCH_PICKER_PANEL
+                        if (canOpenBranchMenu) {
+                            activePanel = BRANCH_PICKER_PANEL
+                        }
                     },
                     onRefreshThreads = {
                         activePanel = null
@@ -240,28 +258,6 @@ fun RemodexAndroidRoot() {
                         activePanel = null
                         viewModel.interruptTurn()
                     },
-                )
-
-                BRANCH_PICKER_PANEL -> BranchPickerSheet(
-                    branchLabel = uiState.currentBranchLabel,
-                    gitBaseBranch = uiState.effectiveGitBaseBranch,
-                    defaultBranch = uiState.gitDefaultBranch,
-                    branchChoices = uiState.availableGitBranchTargets,
-                    isLoadingBranches = uiState.isLoadingGitBranchTargets,
-                    canSwitchBranches = selectedThread?.cwd?.isNotBlank() == true &&
-                        !uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id) &&
-                        !uiState.isSwitchingGitBranch,
-                    selectedThread = selectedThread,
-                    onRefreshBranches = { viewModel.refreshGitBranchTargets() },
-                    onSelectGitBaseBranch = { branch ->
-                        viewModel.selectGitBaseBranch(branch)
-                        activePanel = null
-                    },
-                    onSelectBranch = { branch ->
-                        viewModel.switchGitBranch(branch)
-                        activePanel = null
-                    },
-                    onDismiss = { activePanel = null },
                 )
 
                 MODEL_PICKER_PANEL -> RuntimeOptionPickerSheet(
@@ -732,6 +728,7 @@ private fun MainConversationPane(
     onOpenSettings: () -> Unit,
     onOpenActionMenu: () -> Unit,
     onOpenBranchPicker: () -> Unit,
+    onDismissBranchPicker: () -> Unit,
     onOpenModelPicker: () -> Unit,
     onOpenReasoningPicker: () -> Unit,
     onOpenAccessPicker: () -> Unit,
@@ -739,6 +736,9 @@ private fun MainConversationPane(
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
     onRefreshGitBranches: () -> Unit,
+    onSelectGitBaseBranch: (String) -> Unit,
+    onSelectBranch: (String) -> Unit,
+    isBranchMenuExpanded: Boolean,
 ) {
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val selectedThreadRevision = uiState.conversation.messageRevisionFor(selectedThread?.id)
@@ -811,8 +811,11 @@ private fun MainConversationPane(
                             reasoningLabel = uiState.selectedReasoningLabel,
                             accessLabel = uiState.selectedAccessMode.displayName,
                             branchLabel = uiState.currentBranchLabel,
+                            gitBaseBranch = uiState.effectiveGitBaseBranch,
+                            defaultBranch = uiState.gitDefaultBranch,
                             onOpenSettings = onOpenSettings,
                             onOpenBranchPicker = onOpenBranchPicker,
+                            onDismissBranchPicker = onDismissBranchPicker,
                             onOpenActionMenu = onOpenActionMenu,
                             onOpenModelPicker = onOpenModelPicker,
                             onOpenReasoningPicker = onOpenReasoningPicker,
@@ -824,7 +827,10 @@ private fun MainConversationPane(
                             branchChoices = uiState.availableGitBranchTargets,
                             isLoadingBranches = uiState.isLoadingGitBranchTargets,
                             isSwitchingBranches = uiState.isSwitchingGitBranch,
+                            isBranchMenuExpanded = isBranchMenuExpanded,
                             isBranchSelectionEnabled = selectedThread?.cwd?.isNotBlank() == true && !isRunningSelectedThread,
+                            onSelectGitBaseBranch = onSelectGitBaseBranch,
+                            onSelectBranch = onSelectBranch,
                         )
                     }
                 }
@@ -1510,123 +1516,415 @@ private fun ActionMenuSheet(
     }
 }
 
+private const val BRANCH_INLINE_LIMIT = 12
+
+private enum class BranchBrowseMode(
+    val id: String,
+    val sectionTitle: String,
+    val sheetTitle: String,
+) {
+    CurrentBranch(
+        id = "current-branch",
+        sectionTitle = "Current branch",
+        sheetTitle = "Current Branch",
+    ),
+    PullRequestTarget(
+        id = "pull-request-target",
+        sectionTitle = "PR target",
+        sheetTitle = "PR Target",
+    );
+
+    companion object {
+        fun fromId(id: String?): BranchBrowseMode? = entries.firstOrNull { it.id == id }
+    }
+}
+
 @Composable
-private fun BranchPickerSheet(
+private fun BranchRuntimeControl(
+    modifier: Modifier = Modifier,
     branchLabel: String?,
     gitBaseBranch: String,
     defaultBranch: String,
     branchChoices: List<String>,
     isLoadingBranches: Boolean,
-    canSwitchBranches: Boolean,
-    selectedThread: CodexThread?,
+    isSwitchingBranches: Boolean,
+    isBranchSelectionEnabled: Boolean,
+    isMenuExpanded: Boolean,
+    onOpenMenu: () -> Unit,
+    onDismissMenu: () -> Unit,
     onRefreshBranches: () -> Unit,
     onSelectGitBaseBranch: (String) -> Unit,
     onSelectBranch: (String) -> Unit,
-    onDismiss: () -> Unit,
 ) {
     val normalizedDefaultBranch = defaultBranch.trim().takeIf(String::isNotEmpty)
-    val normalizedCurrentBranch = branchLabel?.trim()?.takeIf(String::isNotEmpty)
-    val normalizedGitBaseBranch = gitBaseBranch.trim().takeIf(String::isNotEmpty)
+    val normalizedCurrentBranch = branchLabel?.trim().takeIf(String::isNotEmpty).orEmpty()
+    val effectiveGitBaseBranch = gitBaseBranch.trim().takeIf(String::isNotEmpty)
         ?: normalizedDefaultBranch
         ?: normalizedCurrentBranch
-    val prTargetChoices = remember(normalizedGitBaseBranch, normalizedDefaultBranch, branchChoices) {
-        orderedBranchMenuOptions(
-            selectedBranch = normalizedGitBaseBranch,
+    val visibleBranchLabel = normalizedCurrentBranch.ifEmpty {
+        normalizedDefaultBranch ?: "Branch"
+    }
+    val branchControlsDisabled = !isBranchSelectionEnabled || isLoadingBranches || isSwitchingBranches
+    val nonDefaultBranches = remember(normalizedDefaultBranch, branchChoices) {
+        branchChoices
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+            .filter { branch -> branch != normalizedDefaultBranch }
+    }
+    var browseModeId by rememberSaveable { mutableStateOf<String?>(null) }
+    val browseMode = BranchBrowseMode.fromId(browseModeId)
+
+    Box(modifier = modifier) {
+        BranchRuntimePill(
+            modifier = Modifier.fillMaxWidth(),
+            label = visibleBranchLabel,
+            enabled = !branchControlsDisabled,
+            onClick = onOpenMenu,
+        )
+        DropdownMenu(
+            expanded = isMenuExpanded && !branchControlsDisabled,
+            onDismissRequest = onDismissMenu,
+            modifier = Modifier.widthIn(min = 280.dp, max = 320.dp),
+        ) {
+            BranchDropdownSectionLabel(BranchBrowseMode.CurrentBranch.sectionTitle)
+            BranchDropdownSection(
+                mode = BranchBrowseMode.CurrentBranch,
+                selectedBranch = normalizedCurrentBranch,
+                defaultBranch = normalizedDefaultBranch,
+                currentBranch = normalizedCurrentBranch,
+                nonDefaultBranches = nonDefaultBranches,
+                branchControlsDisabled = branchControlsDisabled,
+                onSelectBranch = { branch ->
+                    onDismissMenu()
+                    onSelectBranch(branch)
+                },
+                onBrowseAll = { mode ->
+                    browseModeId = mode.id
+                    onDismissMenu()
+                },
+            )
+            Divider(
+                modifier = Modifier.padding(vertical = 4.dp),
+                color = Color(0xFFE6E1DA),
+            )
+            BranchDropdownSectionLabel(BranchBrowseMode.PullRequestTarget.sectionTitle)
+            BranchDropdownSection(
+                mode = BranchBrowseMode.PullRequestTarget,
+                selectedBranch = effectiveGitBaseBranch,
+                defaultBranch = normalizedDefaultBranch,
+                currentBranch = normalizedCurrentBranch,
+                nonDefaultBranches = nonDefaultBranches,
+                branchControlsDisabled = branchControlsDisabled,
+                onSelectBranch = { branch ->
+                    onDismissMenu()
+                    onSelectGitBaseBranch(branch)
+                },
+                onBrowseAll = { mode ->
+                    browseModeId = mode.id
+                    onDismissMenu()
+                },
+            )
+            Divider(
+                modifier = Modifier.padding(vertical = 4.dp),
+                color = Color(0xFFE6E1DA),
+            )
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        text = when {
+                            isSwitchingBranches -> "Switching..."
+                            isLoadingBranches -> "Reloading..."
+                            else -> "Reload branch list"
+                        },
+                    )
+                },
+                trailingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.Refresh,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                onClick = {
+                    onDismissMenu()
+                    onRefreshBranches()
+                },
+                enabled = !branchControlsDisabled,
+            )
+        }
+    }
+
+    browseMode?.let { mode ->
+        BranchBrowseSheet(
+            mode = mode,
+            branches = nonDefaultBranches,
+            selectedBranch = when (mode) {
+                BranchBrowseMode.CurrentBranch -> normalizedCurrentBranch
+                BranchBrowseMode.PullRequestTarget -> effectiveGitBaseBranch
+            },
             defaultBranch = normalizedDefaultBranch,
-            branches = branchChoices,
+            currentBranch = normalizedCurrentBranch,
+            isLoadingBranches = isLoadingBranches,
+            isSwitchingBranches = isSwitchingBranches,
+            onDismiss = { browseModeId = null },
+            onRefreshBranches = onRefreshBranches,
+            onSelectBranch = { branch ->
+                browseModeId = null
+                when (mode) {
+                    BranchBrowseMode.CurrentBranch -> onSelectBranch(branch)
+                    BranchBrowseMode.PullRequestTarget -> onSelectGitBaseBranch(branch)
+                }
+            },
         )
     }
-    val currentBranchChoices = remember(normalizedCurrentBranch, normalizedDefaultBranch, branchChoices) {
-        orderedBranchMenuOptions(
-            selectedBranch = normalizedCurrentBranch,
-            defaultBranch = normalizedDefaultBranch,
-            branches = branchChoices,
+}
+
+@Composable
+private fun BranchRuntimePill(
+    modifier: Modifier = Modifier,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = modifier.alpha(if (enabled) 1f else 0.55f),
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xFFF4F2EE),
+        border = BorderStroke(1.dp, Color(0xFFE6E2DB)),
+    ) {
+        Row(
+            modifier = Modifier
+                .clickable(enabled = enabled, onClick = onClick)
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.DataObject,
+                contentDescription = null,
+                modifier = Modifier.width(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = label,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Icon(
+                imageVector = Icons.Outlined.KeyboardArrowDown,
+                contentDescription = null,
+                modifier = Modifier.width(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BranchDropdownSectionLabel(label: String) {
+    Text(
+        text = label,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+    )
+}
+
+@Composable
+private fun BranchDropdownSection(
+    mode: BranchBrowseMode,
+    selectedBranch: String,
+    defaultBranch: String?,
+    currentBranch: String,
+    nonDefaultBranches: List<String>,
+    branchControlsDisabled: Boolean,
+    onSelectBranch: (String) -> Unit,
+    onBrowseAll: (BranchBrowseMode) -> Unit,
+) {
+    if (defaultBranch != null) {
+        val defaultBranchEnabled = !branchControlsDisabled &&
+            (mode == BranchBrowseMode.CurrentBranch || defaultBranch != currentBranch)
+        DropdownMenuItem(
+            text = {
+                Text(text = "$defaultBranch (default)")
+            },
+            trailingIcon = {
+                if (selectedBranch == defaultBranch) {
+                    Icon(
+                        imageVector = Icons.Outlined.Check,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            onClick = { onSelectBranch(defaultBranch) },
+            enabled = defaultBranchEnabled,
         )
     }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
+    prioritizedNonDefaultBranches(
+        selectedBranch = selectedBranch,
+        defaultBranch = defaultBranch,
+        branches = nonDefaultBranches,
+    )
+        .take(BRANCH_INLINE_LIMIT)
+        .forEach { branch ->
+            val branchEnabled = !branchControlsDisabled &&
+                (mode == BranchBrowseMode.CurrentBranch || branch != currentBranch)
+            DropdownMenuItem(
+                text = {
+                    Text(text = branch)
+                },
+                trailingIcon = {
+                    if (selectedBranch == branch) {
+                        Icon(
+                            imageVector = Icons.Outlined.Check,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
+                onClick = { onSelectBranch(branch) },
+                enabled = branchEnabled,
+            )
+        }
+
+    if (nonDefaultBranches.size > BRANCH_INLINE_LIMIT) {
+        DropdownMenuItem(
+            text = {
+                Text(text = "Browse all branches (${nonDefaultBranches.size})...")
+            },
+            onClick = { onBrowseAll(mode) },
+            enabled = !branchControlsDisabled,
+        )
+    }
+}
+
+@Composable
+private fun BranchBrowseSheet(
+    mode: BranchBrowseMode,
+    branches: List<String>,
+    selectedBranch: String,
+    defaultBranch: String?,
+    currentBranch: String,
+    isLoadingBranches: Boolean,
+    isSwitchingBranches: Boolean,
+    onDismiss: () -> Unit,
+    onRefreshBranches: () -> Unit,
+    onSelectBranch: (String) -> Unit,
+) {
+    var query by rememberSaveable(mode.id) { mutableStateOf("") }
+    val filteredBranches = remember(query, branches) {
+        val normalizedQuery = query.trim().lowercase(Locale.US)
+        if (normalizedQuery.isEmpty()) {
+            branches
+        } else {
+            branches.filter { branch -> branch.lowercase(Locale.US).contains(normalizedQuery) }
+        }
+    }
+    val branchControlsDisabled = isLoadingBranches || isSwitchingBranches
+
+    SheetDialog(
+        onDismiss = onDismiss,
+        topPadding = 104.dp,
     ) {
-        Box(
+        Column(
             modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0x12000000))
-                .padding(horizontal = 48.dp, vertical = 126.dp),
-            contentAlignment = Alignment.BottomCenter,
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Surface(
-                modifier = Modifier.widthIn(max = 340.dp),
-                shape = RoundedCornerShape(24.dp),
-                color = Color(0xFFFBFAF7),
-                shadowElevation = 16.dp,
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                TextButton(onClick = onDismiss) {
+                    Text("Close")
+                }
+                Text(
+                    text = mode.sheetTitle,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                TextButton(
+                    onClick = onRefreshBranches,
+                    enabled = !branchControlsDisabled,
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = Color(0xFFF2F0EC),
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable(enabled = !isLoadingBranches, onClick = onRefreshBranches)
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = if (isLoadingBranches) "Reloading branch list" else "Reload branch list",
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                            val selectedThreadCwd = selectedThread?.cwd
-                            if (selectedThreadCwd != null) {
-                                Text(
-                                    text = selectedThreadCwd,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
+                    Text(
+                        when {
+                            isSwitchingBranches -> "Switching..."
+                            isLoadingBranches -> "Refreshing..."
+                            else -> "Refresh"
+                        },
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.Search,
+                        contentDescription = null,
+                    )
+                },
+                placeholder = {
+                    Text("Search branches")
+                },
+            )
+
+            if (defaultBranch == null && filteredBranches.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color(0xFFF2F0EC),
+                ) {
+                    Text(
+                        text = "No branches found",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                GroupedRowsCard {
+                    defaultBranch?.let { branch ->
+                        BranchBrowseRow(
+                            branch = branch,
+                            selectedBranch = selectedBranch,
+                            currentBranch = currentBranch,
+                            allowsSelectingCurrentBranch = mode == BranchBrowseMode.CurrentBranch,
+                            isDefaultBranch = true,
+                            branchControlsDisabled = branchControlsDisabled,
+                            onSelect = onSelectBranch,
+                        )
+                        if (filteredBranches.isNotEmpty()) {
+                            GroupedDivider()
                         }
                     }
 
-                    BranchMenuSection(
-                        title = "PR target",
-                        branches = prTargetChoices,
-                        selectedBranch = normalizedGitBaseBranch,
-                        defaultBranch = normalizedDefaultBranch,
-                        canSelectBranch = true,
-                        onSelectBranch = onSelectGitBaseBranch,
-                    )
-                    BranchMenuSection(
-                        title = "Current branch",
-                        branches = currentBranchChoices,
-                        selectedBranch = normalizedCurrentBranch,
-                        defaultBranch = normalizedDefaultBranch,
-                        canSelectBranch = canSwitchBranches,
-                        onSelectBranch = onSelectBranch,
-                    )
-
-                    if (prTargetChoices.isEmpty() && currentBranchChoices.isEmpty()) {
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = Color(0xFFF2F0EC),
-                        ) {
-                            Text(
-                                text = if (isLoadingBranches) {
-                                    "Loading branch state from the paired host..."
-                                } else {
-                                    "No branches were reported for this local repository yet."
-                                },
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                    filteredBranches.forEachIndexed { index, branch ->
+                        BranchBrowseRow(
+                            branch = branch,
+                            selectedBranch = selectedBranch,
+                            currentBranch = currentBranch,
+                            allowsSelectingCurrentBranch = mode == BranchBrowseMode.CurrentBranch,
+                            isDefaultBranch = false,
+                            branchControlsDisabled = branchControlsDisabled,
+                            onSelect = onSelectBranch,
+                        )
+                        if (index < filteredBranches.lastIndex) {
+                            GroupedDivider()
                         }
                     }
                 }
@@ -1636,91 +1934,67 @@ private fun BranchPickerSheet(
 }
 
 @Composable
-private fun BranchMenuSection(
-    title: String,
-    branches: List<String>,
-    selectedBranch: String?,
-    defaultBranch: String?,
-    canSelectBranch: Boolean,
-    onSelectBranch: (String) -> Unit,
+private fun BranchBrowseRow(
+    branch: String,
+    selectedBranch: String,
+    currentBranch: String,
+    allowsSelectingCurrentBranch: Boolean,
+    isDefaultBranch: Boolean,
+    branchControlsDisabled: Boolean,
+    onSelect: (String) -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    val rowEnabled = !branchControlsDisabled &&
+        (allowsSelectingCurrentBranch || branch != currentBranch)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (rowEnabled) Modifier.clickable { onSelect(branch) } else Modifier)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
         Text(
-            text = title,
-            modifier = Modifier.padding(horizontal = 6.dp),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontWeight = FontWeight.SemiBold,
+            text = if (isDefaultBranch) "$branch (default)" else branch,
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (rowEnabled || selectedBranch == branch) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
         )
-        Surface(
-            shape = RoundedCornerShape(22.dp),
-            color = Color(0xFFF2F0EC),
-        ) {
-            Column {
-                branches.forEachIndexed { index, branch ->
-                    if (index > 0) {
-                        Divider(
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            color = Color(0xFFE6E1DA),
-                        )
-                    }
-
-                    val isSelected = branch == selectedBranch
-                    val branchLabel = if (branch == defaultBranch) "$branch (default)" else branch
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .then(
-                                if (canSelectBranch && !isSelected) {
-                                    Modifier.clickable { onSelectBranch(branch) }
-                                } else {
-                                    Modifier
-                                },
-                            )
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            text = branchLabel,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = if (canSelectBranch || isSelected) {
-                                MaterialTheme.colorScheme.onSurface
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                        )
-                        if (isSelected) {
-                            Icon(
-                                imageVector = Icons.Outlined.Check,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(18.dp),
-                            )
-                        }
-                    }
-                }
-            }
+        if (selectedBranch == branch) {
+            Icon(
+                imageVector = Icons.Outlined.Check,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
 
-private fun orderedBranchMenuOptions(
+private fun prioritizedNonDefaultBranches(
     selectedBranch: String?,
     defaultBranch: String?,
     branches: List<String>,
 ): List<String> {
     val normalizedSelected = selectedBranch?.trim()?.takeIf(String::isNotEmpty)
     val normalizedDefault = defaultBranch?.trim()?.takeIf(String::isNotEmpty)
-    val ordered = linkedSetOf<String>()
-
-    normalizedDefault?.let(ordered::add)
-    normalizedSelected?.let(ordered::add)
-    branches.map(String::trim)
+    val prioritized = branches
+        .map(String::trim)
         .filter(String::isNotEmpty)
-        .forEach(ordered::add)
+        .filter { it != normalizedDefault }
+        .distinct()
+        .toMutableList()
 
-    return ordered.toList()
+    if (normalizedSelected != null && normalizedSelected != normalizedDefault) {
+        val selectedIndex = prioritized.indexOf(normalizedSelected)
+        if (selectedIndex > 0) {
+            val selected = prioritized.removeAt(selectedIndex)
+            prioritized.add(0, selected)
+        }
+    }
+
+    return prioritized
 }
 
 private data class RuntimeOptionRow(
@@ -2121,8 +2395,11 @@ private fun ComposerArea(
     reasoningLabel: String,
     accessLabel: String,
     branchLabel: String?,
+    gitBaseBranch: String,
+    defaultBranch: String,
     onOpenSettings: () -> Unit,
     onOpenBranchPicker: () -> Unit,
+    onDismissBranchPicker: () -> Unit,
     onOpenActionMenu: () -> Unit,
     onOpenModelPicker: () -> Unit,
     onOpenReasoningPicker: () -> Unit,
@@ -2134,15 +2411,11 @@ private fun ComposerArea(
     branchChoices: List<String>,
     isLoadingBranches: Boolean,
     isSwitchingBranches: Boolean,
+    isBranchMenuExpanded: Boolean,
     isBranchSelectionEnabled: Boolean,
+    onSelectGitBaseBranch: (String) -> Unit,
+    onSelectBranch: (String) -> Unit,
 ) {
-    val displayedBranchLabel = when {
-        isSwitchingBranches -> "Switching..."
-        isLoadingBranches -> "Reloading..."
-        !branchLabel.isNullOrBlank() -> branchLabel
-        branchChoices.isNotEmpty() -> "Branch"
-        else -> "No branch"
-    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -2231,17 +2504,21 @@ private fun ComposerArea(
                 label = accessLabel,
                 onClick = onOpenAccessPicker,
             )
-            RuntimePill(
+            BranchRuntimeControl(
                 modifier = Modifier.weight(1f),
-                icon = Icons.Outlined.FolderOpen,
-                label = displayedBranchLabel,
-                onClick = {
-                    if (!isBranchSelectionEnabled && branchChoices.isEmpty()) {
-                        onRefreshGitBranches()
-                    } else {
-                        onOpenBranchPicker()
-                    }
-                },
+                branchLabel = branchLabel,
+                gitBaseBranch = gitBaseBranch,
+                defaultBranch = defaultBranch,
+                branchChoices = branchChoices,
+                isLoadingBranches = isLoadingBranches,
+                isSwitchingBranches = isSwitchingBranches,
+                isBranchSelectionEnabled = isBranchSelectionEnabled,
+                isMenuExpanded = isBranchMenuExpanded,
+                onOpenMenu = onOpenBranchPicker,
+                onDismissMenu = onDismissBranchPicker,
+                onRefreshBranches = onRefreshGitBranches,
+                onSelectGitBaseBranch = onSelectGitBaseBranch,
+                onSelectBranch = onSelectBranch,
             )
         }
     }
