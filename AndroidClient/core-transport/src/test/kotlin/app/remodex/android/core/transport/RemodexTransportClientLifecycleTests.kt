@@ -13,6 +13,33 @@ import org.junit.Test
 
 class RemodexTransportClientLifecycleTests {
     @Test
+    fun permanentRelayCloseCodesMatchIosMessages() {
+        val transport = RemodexTransportClient(appVersion = "test")
+        val method = RemodexTransportClient::class.java.getDeclaredMethod(
+            "permanentRelayDisconnectMessage",
+            Int::class.javaPrimitiveType,
+        )
+        method.isAccessible = true
+
+        assertEquals(
+            "This relay pairing is no longer valid. Scan a new QR code to reconnect.",
+            method.invoke(transport, 4000),
+        )
+        assertEquals(
+            "This relay session was replaced by another host connection. Scan a new QR code to reconnect.",
+            method.invoke(transport, 4001),
+        )
+        assertEquals(
+            "The host session closed. Scan a new QR code to reconnect.",
+            method.invoke(transport, 4002),
+        )
+        assertEquals(
+            "This device was replaced by a newer connection. Scan a new QR code to reconnect.",
+            method.invoke(transport, 4003),
+        )
+    }
+
+    @Test
     fun startTurnResumesThreadBeforeSendingTurnStart() = runTest {
         val transport = ScriptedTransportClient(
             steps = listOf(

@@ -18,22 +18,26 @@ import app.remodex.android.core.transport.RemodexHandshakeResult
 import app.remodex.android.core.transport.RemodexTransportClient
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportException
+import app.remodex.android.core.transport.RemodexTransportFailureKind
 import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
 
 data class RemodexDebugUiState(
     val qrPayload: String = "",
     val parsedPairing: RemodexPairingPayload? = null,
+    val hasSavedRelaySession: Boolean = false,
+    val shouldAutoReconnectOnForeground: Boolean = false,
+    val isAttemptingAutoReconnect: Boolean = false,
     val connectionState: RemodexTransportState = RemodexTransportState.Disconnected,
     val lastNotificationMethod: String? = null,
     val lastServerRequestMethod: String? = null,
@@ -95,13 +99,20 @@ data class RemodexDebugUiState(
 
 class RemodexDebugViewModel(
     private val transport: RemodexTransportClient = RemodexTransportClient(appVersion = APP_VERSION),
+    private val relaySessionStore: RemodexRelaySessionStore = InMemoryRemodexRelaySessionStore(),
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(RemodexDebugUiState())
     val uiState: StateFlow<RemodexDebugUiState> = _uiState.asStateFlow()
     private var gitStatusRefreshJob: Job? = null
     private var gitBranchRefreshThreadId: String? = null
+    private var hasAttemptedInitialAutoConnect = false
+    private var isAppInForeground = true
+    private var isRunningAutoReconnect = false
+    private var savedRelayPairing: RemodexPairingPayload? = null
 
     init {
+        restoreSavedRelayPairing()
+
         viewModelScope.launch {
             transport.state.collect { state ->
                 val previousState = _uiState.value.connectionState
@@ -114,12 +125,18 @@ class RemodexDebugViewModel(
                     )
                 }
 
+                handleTransportStateTransition(
+                    previousState = previousState,
+                    state = state,
+                )
+
                 val isNewInitializedConnection = state is RemodexTransportState.Connected &&
                     state.isInitialized &&
                     (previousState !is RemodexTransportState.Connected || !previousState.isInitialized)
                 if (isNewInitializedConnection) {
                     val activeThreadId = _uiState.value.activeThreadId
                     refreshRuntimeOptions()
+                    refreshThreads()
                     if (!activeThreadId.isNullOrBlank()) {
                         prepareThreadForDisplay(activeThreadId, forceHydration = true)
                     }
@@ -182,6 +199,37 @@ class RemodexDebugViewModel(
                     current.copy(lastServerRequestMethod = message.method)
                 }
             }
+        }
+    }
+
+    fun attemptAutoConnectOnLaunchIfNeeded() {
+        if (hasAttemptedInitialAutoConnect) {
+            return
+        }
+        hasAttemptedInitialAutoConnect = true
+
+        if (savedRelayPairing == null || isTransportConnectedOrConnecting()) {
+            return
+        }
+
+        viewModelScope.launch {
+            runCatching {
+                connectWithAutoRecovery(
+                    pairing = savedRelayPairing ?: return@launch,
+                    performAutoRetry = true,
+                )
+            }
+        }
+    }
+
+    fun setForegroundState(isForeground: Boolean) {
+        if (isAppInForeground == isForeground) {
+            return
+        }
+
+        isAppInForeground = isForeground
+        if (isForeground) {
+            attemptAutoReconnectOnForegroundIfNeeded()
         }
     }
 
@@ -263,7 +311,7 @@ class RemodexDebugViewModel(
 
     fun parsePairingPayload() {
         runCatching {
-            RemodexPairingParser.parse(_uiState.value.qrPayload)
+            resolvePairingForManualConnect()
         }.onSuccess { payload ->
             _uiState.update { current ->
                 current.copy(
@@ -286,7 +334,7 @@ class RemodexDebugViewModel(
     fun connect() {
         viewModelScope.launch {
             val pairing = runCatching {
-                RemodexPairingParser.parse(_uiState.value.qrPayload)
+                resolvePairingForManualConnect()
             }.getOrElse { throwable ->
                 _uiState.update { current ->
                     current.copy(errorMessage = throwable.message)
@@ -294,6 +342,7 @@ class RemodexDebugViewModel(
                 return@launch
             }
 
+            persistRelayPairing(pairing)
             _uiState.update { current ->
                 current.copy(
                     parsedPairing = pairing,
@@ -304,16 +353,17 @@ class RemodexDebugViewModel(
             }
 
             runCatching {
-                transport.connectWithRecovery(pairing = pairing)
+                connectWithAutoRecovery(
+                    pairing = pairing,
+                    performAutoRetry = true,
+                )
             }.onSuccess { handshake ->
                 applyHandshake(handshake)
-                refreshRuntimeOptions()
-                refreshThreads()
             }.onFailure { throwable ->
                 _uiState.update { current ->
                     current.copy(
                         isBusy = false,
-                        errorMessage = throwable.message,
+                        errorMessage = userFacingConnectFailureMessage(throwable),
                     )
                 }
             }
@@ -326,9 +376,12 @@ class RemodexDebugViewModel(
             gitStatusRefreshJob = null
             gitBranchRefreshThreadId = null
             transport.disconnect()
+            clearSavedRelayPairing()
             _uiState.update { current ->
                 current.copy(
                     isBusy = false,
+                    shouldAutoReconnectOnForeground = false,
+                    isAttemptingAutoReconnect = false,
                     isStartingThread = false,
                     isStartingTurn = false,
                     currentGitBranch = "",
@@ -346,6 +399,321 @@ class RemodexDebugViewModel(
                     errorMessage = null,
                 )
             }
+        }
+    }
+
+    private fun restoreSavedRelayPairing() {
+        savedRelayPairing = relaySessionStore.read()
+        _uiState.update { current ->
+            current.copy(
+                hasSavedRelaySession = savedRelayPairing != null,
+                sessionUrl = savedRelayPairing?.relaySessionUrl() ?: current.sessionUrl,
+            )
+        }
+    }
+
+    private fun persistRelayPairing(pairing: RemodexPairingPayload) {
+        relaySessionStore.write(pairing)
+        savedRelayPairing = pairing
+        _uiState.update { current ->
+            current.copy(
+                hasSavedRelaySession = true,
+                sessionUrl = pairing.relaySessionUrl(),
+            )
+        }
+    }
+
+    private fun clearSavedRelayPairing() {
+        relaySessionStore.clear()
+        savedRelayPairing = null
+        _uiState.update { current ->
+            current.copy(
+                hasSavedRelaySession = false,
+                shouldAutoReconnectOnForeground = false,
+                isAttemptingAutoReconnect = false,
+            )
+        }
+    }
+
+    private fun resolvePairingForManualConnect(): RemodexPairingPayload {
+        val rawPayload = _uiState.value.qrPayload.trim()
+        if (rawPayload.isNotEmpty()) {
+            return RemodexPairingParser.parse(rawPayload)
+        }
+
+        return savedRelayPairing ?: throw IllegalStateException(
+            "Paste or scan a pairing payload before connecting.",
+        )
+    }
+
+    private fun handleTransportStateTransition(
+        previousState: RemodexTransportState,
+        state: RemodexTransportState,
+    ) {
+        when (state) {
+            RemodexTransportState.Disconnected -> {
+                _uiState.update { current ->
+                    current.copy(
+                        isBusy = false,
+                        isAttemptingAutoReconnect = false,
+                        shouldAutoReconnectOnForeground = false,
+                    )
+                }
+            }
+
+            is RemodexTransportState.Connected -> {
+                if (state.isInitialized) {
+                    _uiState.update { current ->
+                        current.copy(
+                            isBusy = false,
+                            shouldAutoReconnectOnForeground = false,
+                            isAttemptingAutoReconnect = false,
+                            errorMessage = null,
+                        )
+                    }
+                }
+            }
+
+            is RemodexTransportState.Failed -> {
+                handleTransportFailure(state)
+            }
+
+            is RemodexTransportState.Connecting,
+            is RemodexTransportState.Retrying -> Unit
+        }
+
+        if (previousState is RemodexTransportState.Connected &&
+            previousState.isInitialized &&
+            state is RemodexTransportState.Failed &&
+            !state.isPermanent &&
+            isAppInForeground
+        ) {
+            attemptAutoReconnectOnForegroundIfNeeded()
+        }
+    }
+
+    private fun handleTransportFailure(state: RemodexTransportState.Failed) {
+        if (state.isPermanent) {
+            clearSavedRelayPairing()
+            _uiState.update { current ->
+                current.copy(
+                    isBusy = false,
+                    errorMessage = state.message,
+                )
+            }
+            return
+        }
+
+        val hasSavedPairing = savedRelayPairing != null
+        _uiState.update { current ->
+            current.copy(
+                isBusy = false,
+                shouldAutoReconnectOnForeground = hasSavedPairing,
+                isAttemptingAutoReconnect = false,
+                errorMessage = if (hasSavedPairing) {
+                    null
+                } else {
+                    state.message
+                },
+            )
+        }
+    }
+
+    private fun attemptAutoReconnectOnForegroundIfNeeded() {
+        if (!_uiState.value.shouldAutoReconnectOnForeground || isRunningAutoReconnect) {
+            return
+        }
+
+        viewModelScope.launch {
+            val pairing = savedRelayPairing
+            if (pairing == null) {
+                _uiState.update { current ->
+                    current.copy(
+                        shouldAutoReconnectOnForeground = false,
+                        isAttemptingAutoReconnect = false,
+                    )
+                }
+                return@launch
+            }
+
+            isRunningAutoReconnect = true
+            _uiState.update { current ->
+                current.copy(
+                    isAttemptingAutoReconnect = true,
+                    errorMessage = null,
+                )
+            }
+
+            try {
+                var attempt = 0
+                while (_uiState.value.shouldAutoReconnectOnForeground && attempt < MAX_FOREGROUND_RECONNECT_ATTEMPTS) {
+                    if (isTransportConnectedAndInitialized()) {
+                        _uiState.update { current ->
+                            current.copy(
+                                shouldAutoReconnectOnForeground = false,
+                                isAttemptingAutoReconnect = false,
+                                errorMessage = null,
+                            )
+                        }
+                        return@launch
+                    }
+
+                    if (isTransportConnecting()) {
+                        delay(CONNECTING_POLL_DELAY_MILLIS)
+                        continue
+                    }
+
+                    runCatching {
+                        transport.connect(pairing = pairing)
+                    }.onSuccess {
+                        _uiState.update { current ->
+                            current.copy(
+                                shouldAutoReconnectOnForeground = false,
+                                isAttemptingAutoReconnect = false,
+                                errorMessage = null,
+                            )
+                        }
+                        return@launch
+                    }.onFailure { throwable ->
+                        if (isPermanentFailure(throwable)) {
+                            clearSavedRelayPairing()
+                            _uiState.update { current ->
+                                current.copy(
+                                    errorMessage = userFacingConnectFailureMessage(throwable),
+                                )
+                            }
+                            return@launch
+                        }
+
+                        if (!transport.isRecoverableTransientFailure(throwable)) {
+                            _uiState.update { current ->
+                                current.copy(
+                                    shouldAutoReconnectOnForeground = false,
+                                    isAttemptingAutoReconnect = false,
+                                    errorMessage = userFacingConnectFailureMessage(throwable),
+                                )
+                            }
+                            return@launch
+                        }
+
+                        attempt += 1
+                        delay(
+                            AUTO_RECONNECT_BACKOFF_MILLIS[
+                                minOf(attempt - 1, AUTO_RECONNECT_BACKOFF_MILLIS.lastIndex)
+                            ],
+                        )
+                    }
+                }
+
+                _uiState.update { current ->
+                    current.copy(
+                        shouldAutoReconnectOnForeground = false,
+                        isAttemptingAutoReconnect = false,
+                        errorMessage = "Could not reconnect. Tap Reconnect to try again.",
+                    )
+                }
+            } finally {
+                isRunningAutoReconnect = false
+            }
+        }
+    }
+
+    private suspend fun connectWithAutoRecovery(
+        pairing: RemodexPairingPayload,
+        performAutoRetry: Boolean,
+    ): RemodexHandshakeResult {
+        val attemptLimit = if (performAutoRetry) {
+            AUTO_RECONNECT_BACKOFF_MILLIS.size
+        } else {
+            0
+        }
+
+        var attemptIndex = 0
+        var lastError: Throwable? = null
+        while (attemptIndex <= attemptLimit) {
+            if (attemptIndex > 0) {
+                _uiState.update { current ->
+                    current.copy(
+                        isAttemptingAutoReconnect = true,
+                        errorMessage = null,
+                    )
+                }
+            }
+
+            runCatching {
+                transport.connect(pairing = pairing)
+            }.onSuccess { handshake ->
+                _uiState.update { current ->
+                    current.copy(
+                        isBusy = false,
+                        isAttemptingAutoReconnect = false,
+                        shouldAutoReconnectOnForeground = false,
+                        errorMessage = null,
+                    )
+                }
+                return handshake
+            }.onFailure { throwable ->
+                lastError = throwable
+                if (isPermanentFailure(throwable)) {
+                    clearSavedRelayPairing()
+                    throw throwable
+                }
+
+                if (!performAutoRetry ||
+                    !transport.isRecoverableTransientFailure(throwable) ||
+                    attemptIndex >= AUTO_RECONNECT_BACKOFF_MILLIS.size
+                ) {
+                    _uiState.update { current ->
+                        current.copy(
+                            isBusy = false,
+                            isAttemptingAutoReconnect = false,
+                            shouldAutoReconnectOnForeground = false,
+                        )
+                    }
+                    throw throwable
+                }
+
+                delay(AUTO_RECONNECT_BACKOFF_MILLIS[attemptIndex])
+            }
+
+            attemptIndex += 1
+        }
+
+        throw lastError ?: IllegalStateException("Connection failed.")
+    }
+
+    private fun isTransportConnectedOrConnecting(): Boolean {
+        return when (transport.state.value) {
+            is RemodexTransportState.Connected,
+            is RemodexTransportState.Connecting,
+            is RemodexTransportState.Retrying -> true
+            RemodexTransportState.Disconnected,
+            is RemodexTransportState.Failed -> false
+        }
+    }
+
+    private fun isTransportConnecting(): Boolean {
+        return transport.state.value is RemodexTransportState.Connecting
+    }
+
+    private fun isTransportConnectedAndInitialized(): Boolean {
+        return (transport.state.value as? RemodexTransportState.Connected)?.isInitialized == true
+    }
+
+    private fun isPermanentFailure(throwable: Throwable): Boolean {
+        val transportError = throwable as? RemodexTransportException
+        return transportError?.isPermanent == true ||
+            transportError?.kind == RemodexTransportFailureKind.PermanentRelayClosure
+    }
+
+    private fun userFacingConnectFailureMessage(throwable: Throwable): String {
+        val transportError = throwable as? RemodexTransportException
+        return when {
+            transportError == null -> throwable.message ?: "Unexpected transport failure."
+            transportError.isPermanent -> transportError.message
+            transportError.kind == RemodexTransportFailureKind.Timeout -> "Connection timed out. Check server/network."
+            transportError.kind == RemodexTransportFailureKind.Disconnected -> "Connection was interrupted. Tap Reconnect to try again."
+            else -> transportError.message
         }
     }
 
@@ -754,6 +1122,8 @@ class RemodexDebugViewModel(
         _uiState.update { current ->
             current.copy(
                 isBusy = false,
+                isAttemptingAutoReconnect = false,
+                shouldAutoReconnectOnForeground = false,
                 sessionUrl = handshake.sessionUrl,
                 hostInfo = handshake.hostInfo,
                 supportsPlanCollaborationMode = handshake.supportsPlanCollaborationMode,
@@ -765,6 +1135,9 @@ class RemodexDebugViewModel(
     companion object {
         private const val APP_VERSION = "0.1.0"
         private const val GIT_STATUS_REFRESH_DEBOUNCE_MILLIS = 350L
+        private const val CONNECTING_POLL_DELAY_MILLIS = 300L
+        private const val MAX_FOREGROUND_RECONNECT_ATTEMPTS = 20
+        private val AUTO_RECONNECT_BACKOFF_MILLIS = listOf(1_000L, 3_000L)
     }
 
     private fun applyThreadStarted(result: RemodexThreadStartResult) {

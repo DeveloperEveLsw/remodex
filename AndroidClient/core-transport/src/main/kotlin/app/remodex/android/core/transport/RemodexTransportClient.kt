@@ -88,7 +88,7 @@ open class RemodexTransportClient(
     @Volatile
     private var isIntentionalDisconnect = false
 
-    suspend fun connect(
+    open suspend fun connect(
         pairing: RemodexPairingPayload,
         role: String = "mobile",
     ): RemodexHandshakeResult = connectWithRoleCompatibility(
@@ -97,7 +97,7 @@ open class RemodexTransportClient(
         attempt = 1,
     )
 
-    suspend fun connectWithRecovery(
+    open suspend fun connectWithRecovery(
         pairing: RemodexPairingPayload,
         role: String = "mobile",
         reconnectPolicy: RemodexReconnectPolicy = RemodexReconnectPolicy(),
@@ -153,7 +153,7 @@ open class RemodexTransportClient(
         }
     }
 
-    suspend fun disconnect() {
+    open suspend fun disconnect() {
         connectMutex.withLock {
             isIntentionalDisconnect = true
             currentWebSocket?.close(1000, "Client disconnect")
@@ -1657,10 +1657,10 @@ open class RemodexTransportClient(
 
     private fun permanentRelayDisconnectMessage(closeCode: Int): String? {
         return when (closeCode) {
-            4000 -> "The host session closed. Scan a new QR code to reconnect."
+            4002 -> "The host session closed. Scan a new QR code to reconnect."
             4001 -> "This relay session was replaced by another host connection. Scan a new QR code to reconnect."
-            4002 -> "This device was replaced by a newer connection. Scan a new QR code to reconnect."
-            4003 -> "This relay pairing is no longer valid. Scan a new QR code to reconnect."
+            4003 -> "This device was replaced by a newer connection. Scan a new QR code to reconnect."
+            4000 -> "This relay pairing is no longer valid. Scan a new QR code to reconnect."
             else -> null
         }
     }

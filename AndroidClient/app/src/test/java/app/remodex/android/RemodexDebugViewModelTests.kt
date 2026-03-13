@@ -12,11 +12,14 @@ import app.remodex.android.core.model.GitBranchesWithStatusResult
 import app.remodex.android.core.model.GitCheckoutResult
 import app.remodex.android.core.model.GitDiffTotals
 import app.remodex.android.core.model.GitRepoSyncResult
+import app.remodex.android.core.pairing.RemodexPairingPayload
+import app.remodex.android.core.transport.RemodexHandshakeResult
 import app.remodex.android.core.transport.RemodexThreadResumeResult
 import app.remodex.android.core.transport.RemodexThreadTurnStateSnapshot
 import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportClient
+import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
 import app.remodex.android.core.protocol.RpcMessage
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +35,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -49,6 +53,92 @@ class RemodexDebugViewModelTests {
     @After
     fun tearDown() {
         Dispatchers.resetMain()
+    }
+
+    @Test
+    fun attemptAutoConnectOnLaunchUsesSavedRelayPairing() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-1",
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val viewModel = RemodexDebugViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        viewModel.attemptAutoConnectOnLaunchIfNeeded()
+        advanceUntilIdle()
+
+        assertEquals(listOf(pairing.relaySessionUrl()), transport.connectedSessionUrls)
+        assertTrue(viewModel.uiState.value.hasSavedRelaySession)
+        assertEquals(pairing.relaySessionUrl(), viewModel.uiState.value.sessionUrl)
+    }
+
+    @Test
+    fun transientFailureKeepsSavedPairingAndReconnectsOnForeground() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-2",
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val viewModel = RemodexDebugViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        viewModel.setForegroundState(false)
+        transport.emitState(
+            RemodexTransportState.Failed(
+                sessionUrl = pairing.relaySessionUrl(),
+                message = "Connection dropped.",
+                isPermanent = false,
+            ),
+        )
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.shouldAutoReconnectOnForeground)
+        assertTrue(viewModel.uiState.value.hasSavedRelaySession)
+        assertNull(viewModel.uiState.value.errorMessage)
+
+        viewModel.setForegroundState(true)
+        advanceUntilIdle()
+
+        assertEquals(listOf(pairing.relaySessionUrl()), transport.connectedSessionUrls)
+        assertFalse(viewModel.uiState.value.shouldAutoReconnectOnForeground)
+        assertFalse(viewModel.uiState.value.isAttemptingAutoReconnect)
+    }
+
+    @Test
+    fun permanentFailureClearsSavedPairing() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-3",
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val viewModel = RemodexDebugViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        transport.emitState(
+            RemodexTransportState.Failed(
+                sessionUrl = pairing.relaySessionUrl(),
+                message = "The host session closed. Scan a new QR code to reconnect.",
+                isPermanent = true,
+            ),
+        )
+        advanceUntilIdle()
+
+        assertNull(store.read())
+        assertFalse(viewModel.uiState.value.hasSavedRelaySession)
+        assertEquals(
+            "The host session closed. Scan a new QR code to reconnect.",
+            viewModel.uiState.value.errorMessage,
+        )
     }
 
     @Test
@@ -651,6 +741,7 @@ class RemodexDebugViewModelTests {
 
     private class FakeTransportClient(
         private val readThreadResults: Map<String, RemodexThreadReadResult> = emptyMap(),
+        private val threadListResult: List<CodexThread> = emptyList(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
         private val modelOptions: List<CodexModelOption> = emptyList(),
@@ -659,6 +750,15 @@ class RemodexDebugViewModelTests {
         private val gitBranchesWithStatusGate: CompletableDeferred<Unit>? = null,
         private val gitStatusResult: GitRepoSyncResult = GitRepoSyncResult(),
         private val gitCheckoutResult: GitCheckoutResult? = null,
+        private val connectResult: RemodexHandshakeResult = RemodexHandshakeResult(
+            sessionUrl = "ws://test",
+            initializeResponse = RpcMessage.success(null, JsonObject(emptyMap())),
+        ),
+        private val connectThrowable: Throwable? = null,
+        initialConnectionState: RemodexTransportState = RemodexTransportState.Connected(
+            sessionUrl = "ws://test",
+            isInitialized = true,
+        ),
     ) : RemodexTransportClient(appVersion = "test") {
         var lastPreferredProjectPath: String? = null
         var lastInterruptedTurnId: String? = null
@@ -667,17 +767,35 @@ class RemodexDebugViewModelTests {
         var lastStartTurnReasoningEffort: String? = null
         var lastGitWorkingDirectory: String? = null
         var lastCheckedOutBranch: String? = null
+        val connectedSessionUrls = mutableListOf<String>()
         val recordedMethods = mutableListOf<String>()
+        private val stateFlow: MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
 
         init {
             val stateField = RemodexTransportClient::class.java.getDeclaredField("_state")
             stateField.isAccessible = true
             @Suppress("UNCHECKED_CAST")
-            val stateFlow = stateField.get(this) as MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
-            stateFlow.value = app.remodex.android.core.transport.RemodexTransportState.Connected(
-                sessionUrl = "ws://test",
+            stateFlow = stateField.get(this) as MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
+            stateFlow.value = initialConnectionState
+        }
+
+        override suspend fun connect(
+            pairing: RemodexPairingPayload,
+            role: String,
+        ): RemodexHandshakeResult {
+            connectedSessionUrls += pairing.relaySessionUrl()
+            connectThrowable?.let { throw it }
+            stateFlow.value = RemodexTransportState.Connected(
+                sessionUrl = connectResult.sessionUrl,
                 isInitialized = true,
+                hostInfo = connectResult.hostInfo,
+                supportsPlanCollaborationMode = connectResult.supportsPlanCollaborationMode,
             )
+            return connectResult
+        }
+
+        override suspend fun disconnect() {
+            stateFlow.value = RemodexTransportState.Disconnected
         }
 
         override suspend fun startThread(
@@ -686,6 +804,18 @@ class RemodexDebugViewModelTests {
         ): RemodexThreadStartResult {
             lastPreferredProjectPath = preferredProjectPath
             return startThreadResult ?: error("startThread was not stubbed")
+        }
+
+        override suspend fun listThreads(
+            limit: Int,
+            archived: Boolean,
+        ): List<CodexThread> {
+            recordedMethods += "thread/list"
+            return if (threadListResult.isNotEmpty()) {
+                threadListResult
+            } else {
+                readThreadResults.values.map { it.thread }
+            }
         }
 
         override suspend fun readThread(
@@ -782,6 +912,10 @@ class RemodexDebugViewModelTests {
             @Suppress("UNCHECKED_CAST")
             val notifications = notificationsField.get(this) as kotlinx.coroutines.flow.MutableSharedFlow<RpcMessage>
             notifications.tryEmit(message)
+        }
+
+        fun emitState(state: RemodexTransportState) {
+            stateFlow.value = state
         }
     }
 }

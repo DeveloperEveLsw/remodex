@@ -63,6 +63,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,13 +77,19 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.viewmodel.CreationExtras
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexCollaborationModeKind
@@ -124,8 +132,33 @@ private const val ACCESS_PICKER_PANEL = "access-picker"
 
 @Composable
 fun RemodexAndroidRoot() {
-    val viewModel: RemodexDebugViewModel = viewModel()
+    val context = LocalContext.current
+    val relaySessionStore = remember(context) {
+        SharedPreferencesRemodexRelaySessionStore(context)
+    }
+    val viewModelFactory = remember(relaySessionStore) {
+        object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                return RemodexDebugViewModel(
+                    relaySessionStore = relaySessionStore,
+                ) as T
+            }
+
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : androidx.lifecycle.ViewModel> create(
+                modelClass: Class<T>,
+                extras: CreationExtras,
+            ): T {
+                return RemodexDebugViewModel(
+                    relaySessionStore = relaySessionStore,
+                ) as T
+            }
+        }
+    }
+    val viewModel: RemodexDebugViewModel = viewModel(factory = viewModelFactory)
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
     val drawerState = androidx.compose.material3.rememberDrawerState(
         initialValue = androidx.compose.material3.DrawerValue.Closed,
     )
@@ -134,10 +167,29 @@ fun RemodexAndroidRoot() {
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
+    val shouldShowConnectionShell = isConnected || uiState.isAttemptingAutoReconnect || uiState.hasSavedRelaySession
     val canOpenBranchMenu = selectedThread?.cwd?.isNotBlank() == true &&
         !uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id) &&
         !uiState.isLoadingGitBranchTargets &&
         !uiState.isSwitchingGitBranch
+
+    LaunchedEffect(Unit) {
+        viewModel.attemptAutoConnectOnLaunchIfNeeded()
+    }
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.setForegroundState(true)
+                Lifecycle.Event.ON_STOP -> viewModel.setForegroundState(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
         Box(
@@ -172,7 +224,7 @@ fun RemodexAndroidRoot() {
                 },
                 modifier = Modifier.fillMaxSize(),
             ) {
-                if (isConnected) {
+                if (shouldShowConnectionShell) {
                     MainConversationPane(
                         uiState = uiState,
                         showDeveloperPanels = showDeveloperPanels,
@@ -572,6 +624,12 @@ private fun SidebarConnectionPanel(
     onDisconnect: () -> Unit,
     onUpdateQrPayload: (String) -> Unit,
 ) {
+    val connectLabel = when {
+        uiState.isBusy || uiState.isAttemptingAutoReconnect -> "Connecting..."
+        uiState.hasSavedRelaySession && uiState.qrPayload.isBlank() -> "Reconnect"
+        else -> "Connect"
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -612,13 +670,13 @@ private fun SidebarConnectionPanel(
             }
             Button(
                 onClick = onConnect,
-                enabled = !uiState.isBusy,
+                enabled = !uiState.isBusy && !uiState.isAttemptingAutoReconnect,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,
                 ),
             ) {
-                Text(if (uiState.isBusy) "Connecting..." else "Connect")
+                Text(connectLabel)
             }
             OutlinedButton(onClick = onDisconnect) {
                 Text("Stop")
