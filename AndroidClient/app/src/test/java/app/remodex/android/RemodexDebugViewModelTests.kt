@@ -27,9 +27,11 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -454,7 +456,83 @@ class RemodexDebugViewModelTests {
         val state = viewModel.uiState.value
         assertEquals("feature/android", transport.lastCheckedOutBranch)
         assertEquals("feature/android", state.currentGitBranch)
-        assertEquals(listOf("git/checkout", "git/branchesWithStatus"), transport.recordedMethods.takeLast(2))
+        assertEquals(1, transport.recordedMethods.count { it == "git/checkout" })
+        assertEquals(1, transport.recordedMethods.count { it == "git/branchesWithStatus" })
+    }
+
+    @Test
+    fun turnCompletedRefreshesGitBranchesInsteadOfStatus() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusResult = GitBranchesWithStatusResult(
+                branches = listOf("main", "feature/android"),
+                currentBranch = "main",
+                defaultBranch = "main",
+                status = GitRepoSyncResult(currentBranch = "main"),
+            ),
+            gitStatusResult = GitRepoSyncResult(currentBranch = "main"),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/started",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-1"),
+                    ),
+                ),
+            ),
+        )
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/completed",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-1"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(2, transport.recordedMethods.count { it == "git/branchesWithStatus" })
+        assertEquals(0, transport.recordedMethods.count { it == "git/status" })
+    }
+
+    @Test
+    fun branchRefreshFailuresStaySilent() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusThrowable = IllegalStateException("branch refresh failed"),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertNull(state.errorMessage)
+        assertTrue(!state.isLoadingGitBranchTargets)
     }
 
     @Test
@@ -472,6 +550,7 @@ class RemodexDebugViewModelTests {
         private val startTurnResult: RemodexTurnStartResult? = null,
         private val modelOptions: List<CodexModelOption> = emptyList(),
         private val gitBranchesWithStatusResult: GitBranchesWithStatusResult = GitBranchesWithStatusResult(),
+        private val gitBranchesWithStatusThrowable: Throwable? = null,
         private val gitStatusResult: GitRepoSyncResult = GitRepoSyncResult(),
         private val gitCheckoutResult: GitCheckoutResult? = null,
     ) : RemodexTransportClient(appVersion = "test") {
@@ -549,6 +628,7 @@ class RemodexDebugViewModelTests {
         ): GitBranchesWithStatusResult {
             recordedMethods += "git/branchesWithStatus"
             lastGitWorkingDirectory = workingDirectory
+            gitBranchesWithStatusThrowable?.let { throw it }
             return gitBranchesWithStatusResult
         }
 
@@ -587,6 +667,14 @@ class RemodexDebugViewModelTests {
             lastStartTurnModelIdentifier = modelIdentifier
             lastStartTurnReasoningEffort = reasoningEffort
             return startTurnResult ?: error("startTurn was not stubbed")
+        }
+
+        fun emitNotification(message: RpcMessage) {
+            val notificationsField = RemodexTransportClient::class.java.getDeclaredField("_notifications")
+            notificationsField.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            val notifications = notificationsField.get(this) as kotlinx.coroutines.flow.MutableSharedFlow<RpcMessage>
+            notifications.tryEmit(message)
         }
     }
 }

@@ -5,7 +5,9 @@ import androidx.lifecycle.viewModelScope
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageDeliveryState
+import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
@@ -24,6 +26,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -94,6 +98,7 @@ class RemodexDebugViewModel(
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(RemodexDebugUiState())
     val uiState: StateFlow<RemodexDebugUiState> = _uiState.asStateFlow()
+    private var gitStatusRefreshJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -131,25 +136,41 @@ class RemodexDebugViewModel(
 
         viewModelScope.launch {
             transport.notifications.collect { message ->
-                var refreshGitStatusForActiveThread = false
+                var refreshGitBranchesForActiveThread = false
+                var scheduleGitStatusRefreshForActiveThread = false
+                var activeThreadIdForRefresh: String? = null
                 _uiState.update { current ->
                     val activeThreadId = current.activeThreadId
+                    val previousRepoRefreshSignal = repoRefreshSignal(
+                        conversation = current.conversation,
+                        threadId = activeThreadId,
+                    )
                     val wasRunningActiveThread = current.conversation.threadHasActiveOrRunningTurn(activeThreadId)
                     val updatedConversation = RemodexConversationReducer.reduce(
                         conversation = current.conversation,
                         message = message,
                         knownThreadIds = current.threads.mapTo(linkedSetOf(), CodexThread::id),
                     )
+                    val updatedRepoRefreshSignal = repoRefreshSignal(
+                        conversation = updatedConversation,
+                        threadId = activeThreadId,
+                    )
                     val isRunningActiveThread = updatedConversation.threadHasActiveOrRunningTurn(activeThreadId)
-                    refreshGitStatusForActiveThread = wasRunningActiveThread && !isRunningActiveThread
+                    refreshGitBranchesForActiveThread = wasRunningActiveThread && !isRunningActiveThread
+                    scheduleGitStatusRefreshForActiveThread = previousRepoRefreshSignal != updatedRepoRefreshSignal &&
+                        updatedRepoRefreshSignal != null
+                    activeThreadIdForRefresh = activeThreadId
 
                     current.copy(
                         lastNotificationMethod = message.method,
                         conversation = updatedConversation,
                     )
                 }
-                if (refreshGitStatusForActiveThread) {
-                    refreshGitStatus()
+                if (refreshGitBranchesForActiveThread) {
+                    refreshGitBranchTargets(activeThreadIdForRefresh)
+                }
+                if (scheduleGitStatusRefreshForActiveThread) {
+                    scheduleGitStatusRefresh(activeThreadIdForRefresh)
                 }
             }
         }
@@ -300,6 +321,8 @@ class RemodexDebugViewModel(
 
     fun disconnect() {
         viewModelScope.launch {
+            gitStatusRefreshJob?.cancel()
+            gitStatusRefreshJob = null
             transport.disconnect()
             _uiState.update { current ->
                 current.copy(
@@ -398,7 +421,6 @@ class RemodexDebugViewModel(
                 if (current.activeThreadId == targetThreadId) {
                     current.copy(
                         isLoadingGitBranchTargets = true,
-                        errorMessage = null,
                     )
                 } else {
                     current
@@ -428,7 +450,6 @@ class RemodexDebugViewModel(
                             .distinct(),
                         gitRepoSync = result.status,
                         isLoadingGitBranchTargets = false,
-                        errorMessage = null,
                     )
                 }
             }.onFailure { throwable ->
@@ -439,10 +460,18 @@ class RemodexDebugViewModel(
 
                     current.copy(
                         isLoadingGitBranchTargets = false,
-                        errorMessage = throwable.message,
                     )
                 }
             }
+        }
+    }
+
+    private fun scheduleGitStatusRefresh(threadId: String? = _uiState.value.activeThreadId) {
+        val targetThreadId = threadId?.trim()?.takeIf(String::isNotEmpty) ?: return
+        gitStatusRefreshJob?.cancel()
+        gitStatusRefreshJob = viewModelScope.launch {
+            delay(GIT_STATUS_REFRESH_DEBOUNCE_MILLIS)
+            refreshGitStatus(targetThreadId)
         }
     }
 
@@ -525,7 +554,6 @@ class RemodexDebugViewModel(
                         errorMessage = null,
                     )
                 }
-                refreshGitBranchTargets(activeThreadId)
             }.onFailure { throwable ->
                 _uiState.update { current ->
                     current.copy(
@@ -716,6 +744,7 @@ class RemodexDebugViewModel(
 
     companion object {
         private const val APP_VERSION = "0.1.0"
+        private const val GIT_STATUS_REFRESH_DEBOUNCE_MILLIS = 350L
     }
 
     private fun applyThreadStarted(result: RemodexThreadStartResult) {
@@ -1066,6 +1095,19 @@ class RemodexDebugViewModel(
         }
 
         return merged
+    }
+
+    private fun repoRefreshSignal(
+        conversation: RemodexConversationState,
+        threadId: String?,
+    ): String? {
+        val latestRepoMessage = conversation.messagesFor(threadId)
+            .lastOrNull { message ->
+                message.role == CodexMessageRole.System &&
+                    (message.kind == CodexMessageKind.FileChange || message.kind == CodexMessageKind.CommandExecution)
+            } ?: return null
+
+        return "${latestRepoMessage.id}|${latestRepoMessage.text.length}|${latestRepoMessage.isStreaming}"
     }
 }
 
