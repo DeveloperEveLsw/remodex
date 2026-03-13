@@ -73,7 +73,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
@@ -144,11 +143,7 @@ fun RemodexAndroidRoot() {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color(0xFFF8F7F4), Color(0xFFEDEAE4)),
-                    ),
-                ),
+                .background(MaterialTheme.colorScheme.background),
         ) {
             ModalNavigationDrawer(
                 drawerState = drawerState,
@@ -325,17 +320,16 @@ private fun SidebarDrawer(
 
     Surface(
         modifier = Modifier
-            .width(336.dp)
-            .fillMaxSize()
-            .statusBarsPadding()
-            .padding(start = 12.dp, top = 12.dp, bottom = 12.dp),
-        shape = RoundedCornerShape(32.dp),
-        color = Color(0xF5FCFBF8),
-        shadowElevation = 18.dp,
+            .width(320.dp)
+            .fillMaxSize(),
+        shape = RoundedCornerShape(topEnd = 28.dp, bottomEnd = 28.dp),
+        color = Color(0xFFFDFBF7),
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -754,85 +748,78 @@ private fun MainConversationPane(
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .padding(horizontal = 8.dp, vertical = 6.dp),
+            .background(Color(0xFFFFFEFC)),
     ) {
-        Surface(
+        Column(
             modifier = Modifier.fillMaxSize(),
-            shape = RoundedCornerShape(30.dp),
-            color = Color(0xFCFFFEFC),
-            shadowElevation = 6.dp,
         ) {
-            Column(
-                modifier = Modifier.fillMaxSize(),
+            ConversationTopBar(
+                selectedThread = selectedThread,
+                connectionState = uiState.connectionState,
+                gitRepoSync = uiState.gitRepoSync,
+                onToggleDrawer = onToggleDrawer,
+                onOpenActionMenu = onOpenActionMenu,
+            )
+            Divider(color = Color(0xFFE7E3DD))
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
             ) {
-                ConversationTopBar(
-                    selectedThread = selectedThread,
-                    connectionState = uiState.connectionState,
-                    gitRepoSync = uiState.gitRepoSync,
-                    onToggleDrawer = onToggleDrawer,
-                    onOpenActionMenu = onOpenActionMenu,
-                )
-                Divider(color = Color(0xFFE7E3DD))
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
+                Column(
+                    modifier = Modifier.fillMaxSize(),
                 ) {
-                    Column(
-                        modifier = Modifier.fillMaxSize(),
-                    ) {
-                        ConversationStatusStrip(
+                    ConversationStatusStrip(
+                        hostInfo = uiState.hostInfo,
+                        errorMessage = uiState.errorMessage,
+                    )
+                    ConversationTimeline(
+                        selectedThread = selectedThread,
+                        messages = selectedMessages,
+                        isLoadingThread = isLoadingSelectedThread,
+                        modifier = Modifier.weight(1f),
+                    )
+                    AnimatedVisibility(visible = showDeveloperPanels) {
+                        DeveloperPanel(
+                            diagnostics = uiState.diagnostics,
                             hostInfo = uiState.hostInfo,
-                            errorMessage = uiState.errorMessage,
-                        )
-                        ConversationTimeline(
-                            selectedThread = selectedThread,
-                            messages = selectedMessages,
-                            isLoadingThread = isLoadingSelectedThread,
-                            modifier = Modifier.weight(1f),
-                        )
-                        AnimatedVisibility(visible = showDeveloperPanels) {
-                            DeveloperPanel(
-                                diagnostics = uiState.diagnostics,
-                                hostInfo = uiState.hostInfo,
-                            )
-                        }
-                        ComposerArea(
-                            prompt = uiState.draftTurnInput,
-                            isSending = uiState.isStartingTurn || uiState.isStartingThread,
-                            selectedThreadId = uiState.activeThreadId,
-                            isRunningSelectedThread = isRunningSelectedThread,
-                            runtimeLabel = if (uiState.selectedCollaborationMode == CodexCollaborationModeKind.Plan) {
-                                "Local Plan"
-                            } else {
-                                "Local"
-                            },
-                            modelLabel = uiState.selectedModelLabel,
-                            reasoningLabel = uiState.selectedReasoningLabel,
-                            accessLabel = uiState.selectedAccessMode.displayName,
-                            branchLabel = uiState.currentBranchLabel,
-                            gitBaseBranch = uiState.effectiveGitBaseBranch,
-                            defaultBranch = uiState.gitDefaultBranch,
-                            onOpenSettings = onOpenSettings,
-                            onOpenBranchPicker = onOpenBranchPicker,
-                            onDismissBranchPicker = onDismissBranchPicker,
-                            onOpenActionMenu = onOpenActionMenu,
-                            onOpenModelPicker = onOpenModelPicker,
-                            onOpenReasoningPicker = onOpenReasoningPicker,
-                            onOpenAccessPicker = onOpenAccessPicker,
-                            onPromptChange = onPromptChange,
-                            onSendPrompt = onSendPrompt,
-                            onStopTurn = onStopTurn,
-                            onRefreshGitBranches = onRefreshGitBranches,
-                            branchChoices = uiState.availableGitBranchTargets,
-                            isLoadingBranches = uiState.isLoadingGitBranchTargets,
-                            isSwitchingBranches = uiState.isSwitchingGitBranch,
-                            isBranchMenuExpanded = isBranchMenuExpanded,
-                            isBranchSelectionEnabled = selectedThread?.cwd?.isNotBlank() == true && !isRunningSelectedThread,
-                            onSelectGitBaseBranch = onSelectGitBaseBranch,
-                            onSelectBranch = onSelectBranch,
                         )
                     }
+                    ComposerArea(
+                        prompt = uiState.draftTurnInput,
+                        isSending = uiState.isStartingTurn || uiState.isStartingThread,
+                        selectedThreadId = uiState.activeThreadId,
+                        isRunningSelectedThread = isRunningSelectedThread,
+                        runtimeLabel = if (uiState.selectedCollaborationMode == CodexCollaborationModeKind.Plan) {
+                            "Local Plan"
+                        } else {
+                            "Local"
+                        },
+                        modelLabel = uiState.selectedModelLabel,
+                        reasoningLabel = uiState.selectedReasoningLabel,
+                        accessLabel = uiState.selectedAccessMode.displayName,
+                        branchLabel = uiState.currentBranchLabel,
+                        gitBaseBranch = uiState.effectiveGitBaseBranch,
+                        defaultBranch = uiState.gitDefaultBranch,
+                        onOpenSettings = onOpenSettings,
+                        onOpenBranchPicker = onOpenBranchPicker,
+                        onDismissBranchPicker = onDismissBranchPicker,
+                        onOpenActionMenu = onOpenActionMenu,
+                        onOpenModelPicker = onOpenModelPicker,
+                        onOpenReasoningPicker = onOpenReasoningPicker,
+                        onOpenAccessPicker = onOpenAccessPicker,
+                        onPromptChange = onPromptChange,
+                        onSendPrompt = onSendPrompt,
+                        onStopTurn = onStopTurn,
+                        onRefreshGitBranches = onRefreshGitBranches,
+                        branchChoices = uiState.availableGitBranchTargets,
+                        isLoadingBranches = uiState.isLoadingGitBranchTargets,
+                        isSwitchingBranches = uiState.isSwitchingGitBranch,
+                        isBranchMenuExpanded = isBranchMenuExpanded,
+                        isBranchSelectionEnabled = selectedThread?.cwd?.isNotBlank() == true && !isRunningSelectedThread,
+                        onSelectGitBaseBranch = onSelectGitBaseBranch,
+                        onSelectBranch = onSelectBranch,
+                    )
                 }
             }
         }
@@ -1145,7 +1132,7 @@ private fun OnboardingHero() {
         horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        HeroPhoneCard(
+        HeroPreviewCard(
             modifier = Modifier
                 .weight(1f)
                 .alpha(0.78f),
@@ -1158,7 +1145,7 @@ private fun OnboardingHero() {
                 "- flatten placeholder rows",
             ),
         )
-        HeroPhoneCard(
+        HeroPreviewCard(
             modifier = Modifier.weight(1.1f),
             rotation = 0f,
             title = "Remodex",
@@ -1169,7 +1156,7 @@ private fun OnboardingHero() {
                 "timeline updates live",
             ),
         )
-        HeroPhoneCard(
+        HeroPreviewCard(
             modifier = Modifier
                 .weight(1f)
                 .alpha(0.78f),
@@ -1186,7 +1173,7 @@ private fun OnboardingHero() {
 }
 
 @Composable
-private fun HeroPhoneCard(
+private fun HeroPreviewCard(
     modifier: Modifier = Modifier,
     rotation: Float,
     title: String,
@@ -1194,9 +1181,9 @@ private fun HeroPhoneCard(
 ) {
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(28.dp),
-        color = Color(0xFFFFFEFC),
-        shadowElevation = 10.dp,
+        shape = RoundedCornerShape(22.dp),
+        color = Color(0xFFFCFAF6),
+        border = BorderStroke(1.dp, Color(0xFFE7E2DA)),
     ) {
         Column(
             modifier = Modifier
@@ -2111,16 +2098,14 @@ private fun SheetDialog(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0x3D000000))
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+                .padding(top = topPadding),
             contentAlignment = Alignment.BottomCenter,
         ) {
             Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = topPadding),
-                shape = RoundedCornerShape(30.dp),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(topStart = 30.dp, topEnd = 30.dp),
                 color = Color(0xFFFBFAF7),
-                shadowElevation = 14.dp,
+                shadowElevation = 4.dp,
             ) {
                 Column(content = content)
             }
@@ -2141,16 +2126,16 @@ private fun FloatingSheetDialog(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0x24000000))
-                .padding(horizontal = 22.dp, vertical = 84.dp),
+                .padding(horizontal = 16.dp, vertical = 32.dp),
             contentAlignment = Alignment.TopCenter,
         ) {
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .widthIn(max = 420.dp),
-                shape = RoundedCornerShape(28.dp),
+                shape = RoundedCornerShape(24.dp),
                 color = Color(0xFFFBFAF7),
-                shadowElevation = 18.dp,
+                shadowElevation = 8.dp,
             ) {
                 Column(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
