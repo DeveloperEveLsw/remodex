@@ -610,6 +610,13 @@ object RemodexConversationReducer {
         eventObject: JsonObject?,
         isCompleted: Boolean,
     ): String {
+        val status = firstNonBlank(
+            itemObject["status"]?.stringValue,
+            paramsObject["status"]?.stringValue,
+            eventObject?.get("status")?.stringValue,
+        )?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: if (isCompleted) "completed" else "inProgress"
+
         val patch = firstNonBlank(
             itemObject["diff"]?.stringValue,
             itemObject["unified_diff"]?.stringValue,
@@ -621,13 +628,15 @@ object RemodexConversationReducer {
             eventObject?.get("unified_diff")?.stringValue,
             eventObject?.get("patch")?.stringValue,
         )
-        if (!patch.isNullOrBlank()) {
-            return patch
+        if (!patch.isNullOrBlank() && RemodexFileChangeBodyFormatter.looksLikePatchText(patch)) {
+            return RemodexFileChangeBodyFormatter.renderUnifiedDiffBody(patch, status)
         }
 
-        val changeSummary = decodeFileChangeSummary(itemObject["changes"]?.arrayValue)
-        if (changeSummary.isNotBlank()) {
-            return changeSummary
+        if (itemObject["changes"] != null) {
+            val body = RemodexFileChangeBodyFormatter.decodeFileChangeItemBody(itemObject)
+            if (body.isNotBlank()) {
+                return body
+            }
         }
 
         val outputText = firstNonBlank(
@@ -638,7 +647,11 @@ object RemodexConversationReducer {
             eventObject?.get("output")?.stringValue,
         )
         if (!outputText.isNullOrBlank()) {
-            return outputText
+            return if (RemodexFileChangeBodyFormatter.looksLikePatchText(outputText)) {
+                RemodexFileChangeBodyFormatter.renderUnifiedDiffBody(outputText, status)
+            } else {
+                outputText
+            }
         }
 
         return if (isCompleted) {
@@ -646,24 +659,6 @@ object RemodexConversationReducer {
         } else {
             "Applying file changes..."
         }
-    }
-
-    private fun decodeFileChangeSummary(changes: List<app.remodex.android.core.protocol.JsonValue>?): String {
-        val entries = changes.orEmpty().mapNotNull { value ->
-            val changeObject = value.objectValue ?: return@mapNotNull null
-            val path = firstNonBlank(
-                changeObject["path"]?.stringValue,
-                changeObject["file"]?.stringValue,
-                changeObject["filename"]?.stringValue,
-            ) ?: return@mapNotNull null
-            val kind = firstNonBlank(
-                changeObject["kind"]?.stringValue,
-                changeObject["type"]?.stringValue,
-                changeObject["status"]?.stringValue,
-            ) ?: "update"
-            "$kind $path"
-        }
-        return entries.joinToString(separator = "\n")
     }
 
     private fun isRepoAffectingToolCall(itemObject: JsonObject): Boolean {
