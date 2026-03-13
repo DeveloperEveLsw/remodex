@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -243,6 +244,7 @@ fun RemodexAndroidRoot() {
 
                 BRANCH_PICKER_PANEL -> BranchPickerSheet(
                     branchLabel = uiState.currentBranchLabel,
+                    gitBaseBranch = uiState.effectiveGitBaseBranch,
                     defaultBranch = uiState.gitDefaultBranch,
                     branchChoices = uiState.availableGitBranchTargets,
                     isLoadingBranches = uiState.isLoadingGitBranchTargets,
@@ -251,6 +253,10 @@ fun RemodexAndroidRoot() {
                         !uiState.isSwitchingGitBranch,
                     selectedThread = selectedThread,
                     onRefreshBranches = { viewModel.refreshGitBranchTargets() },
+                    onSelectGitBaseBranch = { branch ->
+                        viewModel.selectGitBaseBranch(branch)
+                        activePanel = null
+                    },
                     onSelectBranch = { branch ->
                         viewModel.switchGitBranch(branch)
                         activePanel = null
@@ -1507,99 +1513,213 @@ private fun ActionMenuSheet(
 @Composable
 private fun BranchPickerSheet(
     branchLabel: String?,
+    gitBaseBranch: String,
     defaultBranch: String,
     branchChoices: List<String>,
     isLoadingBranches: Boolean,
     canSwitchBranches: Boolean,
     selectedThread: CodexThread?,
     onRefreshBranches: () -> Unit,
+    onSelectGitBaseBranch: (String) -> Unit,
     onSelectBranch: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val normalizedDefaultBranch = defaultBranch.trim().takeIf(String::isNotEmpty)
     val normalizedCurrentBranch = branchLabel?.trim()?.takeIf(String::isNotEmpty)
-    SheetDialog(
-        onDismiss = onDismiss,
-        topPadding = 120.dp,
+    val normalizedGitBaseBranch = gitBaseBranch.trim().takeIf(String::isNotEmpty)
+        ?: normalizedDefaultBranch
+        ?: normalizedCurrentBranch
+    val prTargetChoices = remember(normalizedGitBaseBranch, normalizedDefaultBranch, branchChoices) {
+        orderedBranchMenuOptions(
+            selectedBranch = normalizedGitBaseBranch,
+            defaultBranch = normalizedDefaultBranch,
+            branches = branchChoices,
+        )
+    }
+    val currentBranchChoices = remember(normalizedCurrentBranch, normalizedDefaultBranch, branchChoices) {
+        orderedBranchMenuOptions(
+            selectedBranch = normalizedCurrentBranch,
+            defaultBranch = normalizedDefaultBranch,
+            branches = branchChoices,
+        )
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Column(
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .fillMaxSize()
+                .background(Color(0x12000000))
+                .padding(horizontal = 48.dp, vertical = 126.dp),
+            contentAlignment = Alignment.BottomCenter,
         ) {
-            SheetHeader(
-                title = "Branch",
-                actionLabel = "Done",
-                onAction = onDismiss,
-            )
-            SettingsSection(title = "Current Repository") {
-                GroupedRowsCard {
-                    GroupedRow(
-                        label = normalizedCurrentBranch ?: normalizedDefaultBranch ?: "Branch unavailable",
-                        value = selectedThread?.projectDisplayName ?: "No project",
-                        supporting = selectedThread?.cwd ?: "Select a local conversation to inspect git state.",
-                    )
-                }
-            }
-            SettingsSection(title = "Bridge") {
-                GroupedRowsCard {
-                    GroupedRow(
-                        label = if (isLoadingBranches) "Reloading branch list" else "Reload branch list",
-                        value = if (isLoadingBranches) "Working" else "Refresh",
-                        supporting = "Reads git/branchesWithStatus from the paired host using the selected thread cwd.",
-                        onClick = if (isLoadingBranches) null else onRefreshBranches,
-                    )
-                }
-            }
-            if (branchChoices.isNotEmpty()) {
-                SettingsSection(title = "Known Branches") {
-                    GroupedRowsCard {
-                        branchChoices.forEachIndexed { index, branch ->
-                            if (index > 0) {
-                                GroupedDivider()
+            Surface(
+                modifier = Modifier.widthIn(max = 340.dp),
+                shape = RoundedCornerShape(24.dp),
+                color = Color(0xFFFBFAF7),
+                shadowElevation = 16.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = Color(0xFFF2F0EC),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = !isLoadingBranches, onClick = onRefreshBranches)
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = if (isLoadingBranches) "Reloading branch list" else "Reload branch list",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            if (selectedThread?.cwd != null) {
+                                Text(
+                                    text = selectedThread.cwd,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
                             }
-                            GroupedRow(
-                                label = branch,
-                                value = when {
-                                    branch == normalizedCurrentBranch -> "Current"
-                                    branch == normalizedDefaultBranch -> "Default"
-                                    else -> if (canSwitchBranches) "Switch" else "Unavailable"
-                                },
-                                supporting = when {
-                                    branch == normalizedCurrentBranch -> "This is the branch currently checked out for the selected local thread."
-                                    branch == normalizedDefaultBranch -> "This is the default branch reported by the host."
-                                    canSwitchBranches -> "Switch the selected local repository to this branch."
-                                    else -> "Branch switching is disabled while a turn is running or the local repo is unavailable."
-                                },
-                                onClick = if (canSwitchBranches && branch != normalizedCurrentBranch) {
-                                    { onSelectBranch(branch) }
+                        }
+                    }
+
+                    BranchMenuSection(
+                        title = "PR target",
+                        branches = prTargetChoices,
+                        selectedBranch = normalizedGitBaseBranch,
+                        defaultBranch = normalizedDefaultBranch,
+                        canSelectBranch = true,
+                        onSelectBranch = onSelectGitBaseBranch,
+                    )
+                    BranchMenuSection(
+                        title = "Current branch",
+                        branches = currentBranchChoices,
+                        selectedBranch = normalizedCurrentBranch,
+                        defaultBranch = normalizedDefaultBranch,
+                        canSelectBranch = canSwitchBranches,
+                        onSelectBranch = onSelectBranch,
+                    )
+
+                    if (prTargetChoices.isEmpty() && currentBranchChoices.isEmpty()) {
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = Color(0xFFF2F0EC),
+                        ) {
+                            Text(
+                                text = if (isLoadingBranches) {
+                                    "Loading branch state from the paired host..."
                                 } else {
-                                    null
+                                    "No branches were reported for this local repository yet."
                                 },
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
                 }
-            } else {
-                Surface(
-                    shape = RoundedCornerShape(24.dp),
-                    color = Color(0xFFF2F0EC),
-                ) {
-                    Text(
-                        text = if (isLoadingBranches) {
-                            "Loading branch state from the paired host..."
-                        } else {
-                            "No branch targets have been reported for this local repository yet. Try reloading the branch list."
-                        },
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BranchMenuSection(
+    title: String,
+    branches: List<String>,
+    selectedBranch: String?,
+    defaultBranch: String?,
+    canSelectBranch: Boolean,
+    onSelectBranch: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = title,
+            modifier = Modifier.padding(horizontal = 6.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Surface(
+            shape = RoundedCornerShape(22.dp),
+            color = Color(0xFFF2F0EC),
+        ) {
+            Column {
+                branches.forEachIndexed { index, branch ->
+                    if (index > 0) {
+                        Divider(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            color = Color(0xFFE6E1DA),
+                        )
+                    }
+
+                    val isSelected = branch == selectedBranch
+                    val branchLabel = if (branch == defaultBranch) "$branch (default)" else branch
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (canSelectBranch && !isSelected) {
+                                    Modifier.clickable { onSelectBranch(branch) }
+                                } else {
+                                    Modifier
+                                },
+                            )
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = branchLabel,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = if (canSelectBranch || isSelected) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                        if (isSelected) {
+                            Icon(
+                                imageVector = Icons.Outlined.Check,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+private fun orderedBranchMenuOptions(
+    selectedBranch: String?,
+    defaultBranch: String?,
+    branches: List<String>,
+): List<String> {
+    val normalizedSelected = selectedBranch?.trim()?.takeIf(String::isNotEmpty)
+    val normalizedDefault = defaultBranch?.trim()?.takeIf(String::isNotEmpty)
+    val ordered = linkedSetOf<String>()
+
+    normalizedDefault?.let(ordered::add)
+    normalizedSelected?.let(ordered::add)
+    branches.map(String::trim)
+        .filter(String::isNotEmpty)
+        .forEach(ordered::add)
+
+    return ordered.toList()
 }
 
 private data class RuntimeOptionRow(

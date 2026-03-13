@@ -45,6 +45,7 @@ data class RemodexDebugUiState(
     val selectedCollaborationMode: CodexCollaborationModeKind = CodexCollaborationModeKind.Default,
     val currentGitBranch: String = "",
     val gitDefaultBranch: String = "",
+    val selectedGitBaseBranch: String = "",
     val availableGitBranchTargets: List<String> = emptyList(),
     val isLoadingGitBranchTargets: Boolean = false,
     val isSwitchingGitBranch: Boolean = false,
@@ -81,6 +82,11 @@ data class RemodexDebugUiState(
     val currentBranchLabel: String?
         get() = currentGitBranch.trim().takeIf(String::isNotEmpty)
             ?: gitDefaultBranch.trim().takeIf(String::isNotEmpty)
+
+    val effectiveGitBaseBranch: String
+        get() = selectedGitBaseBranch.trim().takeIf(String::isNotEmpty)
+            ?: gitDefaultBranch.trim().takeIf(String::isNotEmpty)
+            ?: currentGitBranch.trim()
 }
 
 class RemodexDebugViewModel(
@@ -219,6 +225,20 @@ class RemodexDebugViewModel(
         }
     }
 
+    fun selectGitBaseBranch(branch: String) {
+        val normalizedBranch = branch.trim()
+        if (normalizedBranch.isEmpty()) {
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                selectedGitBaseBranch = normalizedBranch,
+                errorMessage = null,
+            )
+        }
+    }
+
     fun parsePairingPayload() {
         runCatching {
             RemodexPairingParser.parse(_uiState.value.qrPayload)
@@ -288,6 +308,7 @@ class RemodexDebugViewModel(
                     isStartingTurn = false,
                     currentGitBranch = "",
                     gitDefaultBranch = "",
+                    selectedGitBaseBranch = "",
                     availableGitBranchTargets = emptyList(),
                     isLoadingGitBranchTargets = false,
                     isSwitchingGitBranch = false,
@@ -395,6 +416,12 @@ class RemodexDebugViewModel(
                     current.copy(
                         currentGitBranch = result.currentBranch?.trim().orEmpty(),
                         gitDefaultBranch = result.defaultBranch?.trim().orEmpty(),
+                        selectedGitBaseBranch = current.selectedGitBaseBranch
+                            .takeIf { selection ->
+                                selection.isNotBlank() &&
+                                    result.branches.any { it.trim() == selection }
+                            }
+                            ?: result.defaultBranch?.trim().orEmpty(),
                         availableGitBranchTargets = result.branches
                             .map(String::trim)
                             .filter(String::isNotEmpty)
@@ -809,6 +836,7 @@ class RemodexDebugViewModel(
                     .withThreadLoading(threadId, isLoading = shouldLoadThreadHistory(current, threadId, forceHydration)),
                 currentGitBranch = "",
                 gitDefaultBranch = "",
+                selectedGitBaseBranch = "",
                 availableGitBranchTargets = emptyList(),
                 gitRepoSync = null,
                 isLoadingGitBranchTargets = selectedThreadWorkingDirectory(threadId, current.threads) != null,
@@ -1058,6 +1086,7 @@ private fun RemodexDebugUiState.withClearedGitBranchState(): RemodexDebugUiState
     return copy(
         currentGitBranch = "",
         gitDefaultBranch = "",
+        selectedGitBaseBranch = "",
         availableGitBranchTargets = emptyList(),
         isLoadingGitBranchTargets = false,
         isSwitchingGitBranch = false,

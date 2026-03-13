@@ -413,6 +413,7 @@ class RemodexDebugViewModelTests {
         assertEquals("/tmp/project", transport.lastGitWorkingDirectory)
         assertEquals("feature/android", state.currentGitBranch)
         assertEquals("main", state.gitDefaultBranch)
+        assertEquals("main", state.selectedGitBaseBranch)
         assertEquals(listOf("main", "feature/android"), state.availableGitBranchTargets)
         assertEquals(2, state.gitRepoSync?.aheadCount)
         assertEquals(listOf("thread/resume", "thread/read", "git/branchesWithStatus"), transport.recordedMethods.takeLast(3))
@@ -454,6 +455,15 @@ class RemodexDebugViewModelTests {
         assertEquals("feature/android", transport.lastCheckedOutBranch)
         assertEquals("feature/android", state.currentGitBranch)
         assertEquals(listOf("git/checkout", "git/branchesWithStatus"), transport.recordedMethods.takeLast(2))
+    }
+
+    @Test
+    fun selectGitBaseBranchUpdatesPrTargetSelection() = runTest {
+        val viewModel = RemodexDebugViewModel(transport = FakeTransportClient())
+
+        viewModel.selectGitBaseBranch("release")
+
+        assertEquals("release", viewModel.uiState.value.selectedGitBaseBranch)
     }
 
     private class FakeTransportClient(
