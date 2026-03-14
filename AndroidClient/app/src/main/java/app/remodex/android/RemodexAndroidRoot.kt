@@ -172,9 +172,14 @@ fun RemodexAndroidRoot() {
     val scope = rememberCoroutineScope()
     var showDeveloperPanels by rememberSaveable { mutableStateOf(false) }
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
+    var showQrScanner by rememberSaveable { mutableStateOf(false) }
+    var showManualConnectionShell by rememberSaveable { mutableStateOf(false) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
-    val shouldShowConnectionShell = isConnected || uiState.isAttemptingAutoReconnect || uiState.hasSavedRelaySession
+    val shouldShowConnectionShell = isConnected ||
+        uiState.isAttemptingAutoReconnect ||
+        uiState.hasSavedRelaySession ||
+        showManualConnectionShell
     val canOpenBranchMenu = selectedThread?.cwd?.isNotBlank() == true &&
         !uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id) &&
         !uiState.isLoadingGitBranchTargets &&
@@ -195,6 +200,12 @@ fun RemodexAndroidRoot() {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(uiState.hasSavedRelaySession, isConnected) {
+        if (uiState.hasSavedRelaySession || isConnected) {
+            showManualConnectionShell = false
         }
     }
 
@@ -226,6 +237,10 @@ fun RemodexAndroidRoot() {
                         onParsePairingPayload = viewModel::parsePairingPayload,
                         onConnect = viewModel::connect,
                         onDisconnect = viewModel::disconnect,
+                        onOpenScanner = {
+                            showQrScanner = true
+                            scope.launch { drawerState.close() }
+                        },
                         onUpdateQrPayload = viewModel::updateQrPayload,
                     )
                 },
@@ -267,11 +282,27 @@ fun RemodexAndroidRoot() {
                     )
                 } else {
                     OnboardingState(
-                        onOpenSetup = {
-                            scope.launch { drawerState.open() }
+                        onOpenScanner = {
+                            showQrScanner = true
                         },
                     )
                 }
+            }
+
+            if (showQrScanner) {
+                RemodexQrScannerScreen(
+                    onDismiss = { showQrScanner = false },
+                    onOpenManualEntry = {
+                        showQrScanner = false
+                        showManualConnectionShell = true
+                        scope.launch { drawerState.open() }
+                    },
+                    onValidatedPayload = { rawPayload ->
+                        showQrScanner = false
+                        showManualConnectionShell = true
+                        viewModel.connectWithQrPayload(rawPayload)
+                    },
+                )
             }
 
             when (activePanel) {
@@ -368,6 +399,7 @@ private fun SidebarDrawer(
     onParsePairingPayload: () -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onOpenScanner: () -> Unit,
     onUpdateQrPayload: (String) -> Unit,
 ) {
     val groupedThreads = remember(uiState.threads) {
@@ -455,6 +487,7 @@ private fun SidebarDrawer(
                 onParsePairingPayload = onParsePairingPayload,
                 onConnect = onConnect,
                 onDisconnect = onDisconnect,
+                onOpenScanner = onOpenScanner,
                 onUpdateQrPayload = onUpdateQrPayload,
             )
         }
@@ -629,6 +662,7 @@ private fun SidebarConnectionPanel(
     onParsePairingPayload: () -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onOpenScanner: () -> Unit,
     onUpdateQrPayload: (String) -> Unit,
 ) {
     val connectLabel = when {
@@ -672,6 +706,9 @@ private fun SidebarConnectionPanel(
         )
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton(onClick = onOpenScanner) {
+                Text("Scan QR")
+            }
             OutlinedButton(onClick = onParsePairingPayload) {
                 Text("Parse")
             }
@@ -1195,11 +1232,11 @@ private fun EmptyConversationState(title: String, subtitle: String) {
 }
 
 @Composable
-private fun OnboardingState(onOpenSetup: () -> Unit) {
+private fun OnboardingState(onOpenScanner: () -> Unit) {
     val steps = listOf(
         "Install the package" to "npm install -g remodex",
         "Start Remodex on your Mac" to "remodex up",
-        "Scan the QR code" to "Open connection setup and pair with your local bridge.",
+        "Scan the QR code" to "Pair directly with your local bridge from the camera scanner.",
     )
 
     Box(
@@ -1261,7 +1298,7 @@ private fun OnboardingState(onOpenSetup: () -> Unit) {
                 }
             }
             Button(
-                onClick = onOpenSetup,
+                onClick = onOpenScanner,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color(0xFF111111),
                     contentColor = Color.White,

@@ -142,6 +142,42 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun connectWithQrPayloadUsesExistingConnectPipeline() = runTest {
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val store = InMemoryRemodexRelaySessionStore()
+        val viewModel = RemodexDebugViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+        val rawPayload = """{"relay":"http://localhost:9000/relay","sessionId":"session-qr"}"""
+
+        viewModel.connectWithQrPayload(rawPayload)
+        advanceUntilIdle()
+
+        assertEquals(listOf("ws://localhost:9000/relay/session-qr"), transport.connectedSessionUrls)
+        assertEquals(rawPayload, viewModel.uiState.value.qrPayload)
+        assertEquals("ws://localhost:9000/relay/session-qr", store.read()?.relaySessionUrl())
+        assertEquals("ws://localhost:9000/relay/session-qr", viewModel.uiState.value.sessionUrl)
+    }
+
+    @Test
+    fun connectWithQrPayloadSurfacesParseErrorsWithoutPersistingPairing() = runTest {
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val store = InMemoryRemodexRelaySessionStore()
+        val viewModel = RemodexDebugViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        viewModel.connectWithQrPayload("""{"relay":"ws://localhost:9000/relay"}""")
+        advanceUntilIdle()
+
+        assertTrue(transport.connectedSessionUrls.isEmpty())
+        assertNull(store.read())
+        assertEquals("QR payload is missing the session ID.", viewModel.uiState.value.errorMessage)
+    }
+
+    @Test
     fun startThreadSelectsTheCreatedLiveThread() = runTest {
         val createdThread = CodexThread(
             id = "thread-new",

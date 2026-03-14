@@ -342,31 +342,26 @@ class RemodexDebugViewModel(
                 return@launch
             }
 
-            persistRelayPairing(pairing)
-            _uiState.update { current ->
-                current.copy(
-                    parsedPairing = pairing,
-                    sessionUrl = pairing.relaySessionUrl(),
-                    isBusy = true,
-                    errorMessage = null,
-                )
+            connectWithPairing(pairing = pairing)
+        }
+    }
+
+    fun connectWithQrPayload(rawPayload: String) {
+        viewModelScope.launch {
+            val trimmedPayload = rawPayload.trim()
+            val pairing = runCatching {
+                RemodexPairingParser.parse(trimmedPayload)
+            }.getOrElse { throwable ->
+                _uiState.update { current ->
+                    current.copy(errorMessage = throwable.message)
+                }
+                return@launch
             }
 
-            runCatching {
-                connectWithAutoRecovery(
-                    pairing = pairing,
-                    performAutoRetry = true,
-                )
-            }.onSuccess { handshake ->
-                applyHandshake(handshake)
-            }.onFailure { throwable ->
-                _uiState.update { current ->
-                    current.copy(
-                        isBusy = false,
-                        errorMessage = userFacingConnectFailureMessage(throwable),
-                    )
-                }
+            _uiState.update { current ->
+                current.copy(qrPayload = trimmedPayload)
             }
+            connectWithPairing(pairing = pairing)
         }
     }
 
@@ -444,6 +439,34 @@ class RemodexDebugViewModel(
         return savedRelayPairing ?: throw IllegalStateException(
             "Paste or scan a pairing payload before connecting.",
         )
+    }
+
+    private suspend fun connectWithPairing(pairing: RemodexPairingPayload) {
+        persistRelayPairing(pairing)
+        _uiState.update { current ->
+            current.copy(
+                parsedPairing = pairing,
+                sessionUrl = pairing.relaySessionUrl(),
+                isBusy = true,
+                errorMessage = null,
+            )
+        }
+
+        runCatching {
+            connectWithAutoRecovery(
+                pairing = pairing,
+                performAutoRetry = true,
+            )
+        }.onSuccess { handshake ->
+            applyHandshake(handshake)
+        }.onFailure { throwable ->
+            _uiState.update { current ->
+                current.copy(
+                    isBusy = false,
+                    errorMessage = userFacingConnectFailureMessage(throwable),
+                )
+            }
+        }
     }
 
     private fun handleTransportStateTransition(
