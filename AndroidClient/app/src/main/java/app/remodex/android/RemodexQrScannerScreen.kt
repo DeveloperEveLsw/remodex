@@ -108,7 +108,7 @@ fun RemodexQrScannerScreen(
 
             RemodexQrCameraPermissionState.Authorized -> {
                 RemodexCameraPreview(
-                    controller = controller,
+                    scannerController = controller,
                     onValidatedPayload = onValidatedPayload,
                 )
                 ScannerOverlay(
@@ -143,7 +143,7 @@ fun RemodexQrScannerScreen(
 
 @Composable
 private fun RemodexCameraPreview(
-    controller: RemodexQrScannerController,
+    scannerController: RemodexQrScannerController,
     onValidatedPayload: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -168,7 +168,7 @@ private fun RemodexCameraPreview(
                 imageProxy = imageProxy,
                 barcodeScanner = barcodeScanner,
                 onDetected = { rawValue, rawBytes ->
-                    controller.onQrDetected(
+                    scannerController.onQrDetected(
                         rawValue = rawValue,
                         rawBytes = rawBytes,
                         onValidatedPayload = onValidatedPayload,
@@ -189,7 +189,7 @@ private fun RemodexCameraPreview(
         factory = { viewContext ->
             PreviewView(viewContext).apply {
                 scaleType = PreviewView.ScaleType.FILL_CENTER
-                controller = cameraController
+                this.controller = cameraController
             }
         },
         modifier = Modifier.fillMaxSize(),
