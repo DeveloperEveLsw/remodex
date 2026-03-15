@@ -430,7 +430,7 @@ private fun buildNewChatProjectChoices(threads: List<CodexThread>): List<NewChat
             }
         }
         .distinctBy(NewChatProjectChoice::path)
-        .sortedWith(compareBy<NewChatProjectChoice>(String.CASE_INSENSITIVE_ORDER) { it.label })
+        .sortedBy { it.label.lowercase(Locale.ROOT) }
 }
 
 @Composable
