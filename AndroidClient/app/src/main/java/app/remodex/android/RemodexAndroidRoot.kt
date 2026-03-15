@@ -174,7 +174,11 @@ fun RemodexAndroidRoot() {
     var activePanel by rememberSaveable { mutableStateOf<String?>(null) }
     var showQrScanner by rememberSaveable { mutableStateOf(false) }
     var showManualConnectionShell by rememberSaveable { mutableStateOf(false) }
+    var showNewChatProjectPicker by rememberSaveable { mutableStateOf(false) }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
+    val newChatProjectChoices = remember(uiState.threads) {
+        buildNewChatProjectChoices(uiState.threads)
+    }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
     val shouldShowConnectionShell = isConnected ||
         uiState.isAttemptingAutoReconnect ||
@@ -226,7 +230,11 @@ fun RemodexAndroidRoot() {
                         onOpenSettings = { activePanel = SETTINGS_PANEL },
                         onToggleDeveloperPanels = { showDeveloperPanels = !showDeveloperPanels },
                         onNewChat = {
-                            viewModel.startThread()
+                            if (newChatProjectChoices.isEmpty()) {
+                                viewModel.startThread(preferredProjectPath = null)
+                            } else {
+                                showNewChatProjectPicker = true
+                            }
                             scope.launch { drawerState.close() }
                         },
                         onRefreshThreads = viewModel::refreshThreads,
@@ -333,7 +341,11 @@ fun RemodexAndroidRoot() {
                     },
                     onStartThread = {
                         activePanel = null
-                        viewModel.startThread()
+                        if (newChatProjectChoices.isEmpty()) {
+                            viewModel.startThread(preferredProjectPath = null)
+                        } else {
+                            showNewChatProjectPicker = true
+                        }
                     },
                     onToggleDeveloperPanels = {
                         showDeveloperPanels = !showDeveloperPanels
@@ -383,8 +395,42 @@ fun RemodexAndroidRoot() {
                     },
                 )
             }
+
+            if (showNewChatProjectPicker) {
+                NewChatProjectPickerSheet(
+                    choices = newChatProjectChoices,
+                    onDismiss = { showNewChatProjectPicker = false },
+                    onSelectProject = { projectPath ->
+                        showNewChatProjectPicker = false
+                        viewModel.startThread(preferredProjectPath = projectPath)
+                    },
+                    onSelectWithoutProject = {
+                        showNewChatProjectPicker = false
+                        viewModel.startThread(preferredProjectPath = null)
+                    },
+                )
+            }
         }
     }
+}
+
+private data class NewChatProjectChoice(
+    val path: String,
+    val label: String,
+)
+
+private fun buildNewChatProjectChoices(threads: List<CodexThread>): List<NewChatProjectChoice> {
+    return threads
+        .mapNotNull { thread ->
+            thread.normalizedProjectPath?.let { path ->
+                NewChatProjectChoice(
+                    path = path,
+                    label = thread.projectDisplayName,
+                )
+            }
+        }
+        .distinctBy(NewChatProjectChoice::path)
+        .sortedWith(compareBy<NewChatProjectChoice>(String.CASE_INSENSITIVE_ORDER) { it.label })
 }
 
 @Composable
@@ -490,6 +536,53 @@ private fun SidebarDrawer(
                 onOpenScanner = onOpenScanner,
                 onUpdateQrPayload = onUpdateQrPayload,
             )
+        }
+    }
+}
+
+@Composable
+private fun NewChatProjectPickerSheet(
+    choices: List<NewChatProjectChoice>,
+    onDismiss: () -> Unit,
+    onSelectProject: (String) -> Unit,
+    onSelectWithoutProject: () -> Unit,
+) {
+    SheetDialog(
+        onDismiss = onDismiss,
+        topPadding = 120.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            SheetHeader(
+                title = "Start New Chat",
+                actionLabel = "Close",
+                onAction = onDismiss,
+            )
+            GroupedRowsCard {
+                choices.forEachIndexed { index, choice ->
+                    if (index > 0) {
+                        GroupedDivider()
+                    }
+                    GroupedRow(
+                        label = choice.label,
+                        value = choice.path,
+                        supporting = "Create a chat scoped to this local workspace.",
+                        onClick = { onSelectProject(choice.path) },
+                    )
+                }
+                if (choices.isNotEmpty()) {
+                    GroupedDivider()
+                }
+                GroupedRow(
+                    label = "No Workspace",
+                    supporting = "Start a chat without binding a working directory.",
+                    onClick = onSelectWithoutProject,
+                )
+            }
         }
     }
 }

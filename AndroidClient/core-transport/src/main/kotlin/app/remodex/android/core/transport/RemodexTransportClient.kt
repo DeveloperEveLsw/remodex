@@ -479,11 +479,15 @@ open class RemodexTransportClient(
     open suspend fun startThread(
         preferredProjectPath: String? = null,
         accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
+        modelIdentifier: String? = null,
     ): RemodexThreadStartResult {
         val normalizedPreferredProjectPath = CodexThread.normalizeProjectPath(preferredProjectPath)
         val response = sendRequestWithSandboxFallback(
             method = "thread/start",
-            baseParams = buildThreadStartRequestParams(normalizedPreferredProjectPath),
+            baseParams = buildThreadStartRequestParams(
+                preferredProjectPath = normalizedPreferredProjectPath,
+                modelIdentifier = modelIdentifier,
+            ),
             accessMode = accessMode,
         )
         val thread = decodeThreadFromThreadEnvelope(
@@ -605,7 +609,7 @@ open class RemodexTransportClient(
     }
 
     open suspend fun startTurn(
-        threadId: String,
+        threadId: String?,
         userInput: String,
         accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
         collaborationMode: CodexCollaborationModeKind? = null,
@@ -613,14 +617,7 @@ open class RemodexTransportClient(
         modelIdentifier: String? = null,
         reasoningEffort: String? = null,
     ): RemodexTurnStartResult {
-        val normalizedThreadId = threadId.trim()
         val trimmedInput = userInput.trim()
-        if (normalizedThreadId.isEmpty()) {
-            throw RemodexTransportException(
-                kind = RemodexTransportFailureKind.Protocol,
-                message = "turn/start requires a non-empty threadId",
-            )
-        }
         if (trimmedInput.isEmpty()) {
             throw RemodexTransportException(
                 kind = RemodexTransportFailureKind.Protocol,
@@ -629,6 +626,12 @@ open class RemodexTransportClient(
         }
 
         val normalizedPreferredProjectPath = CodexThread.normalizeProjectPath(preferredProjectPath)
+        val normalizedThreadId = resolveStartTurnThreadId(
+            preferredThreadId = threadId,
+            accessMode = accessMode,
+            preferredProjectPath = normalizedPreferredProjectPath,
+            modelIdentifier = modelIdentifier,
+        )
 
         val resumedThread = try {
             resumeThread(
@@ -1045,6 +1048,7 @@ open class RemodexTransportClient(
         val startedThread = startThread(
             preferredProjectPath = preferredProjectPath,
             accessMode = accessMode,
+            modelIdentifier = modelIdentifier,
         ).thread
         val continuationThread = if (ensureContinuationResumed) {
             resumeThread(
@@ -1184,10 +1188,32 @@ open class RemodexTransportClient(
 
     private fun buildThreadStartRequestParams(
         preferredProjectPath: String?,
+        modelIdentifier: String?,
     ): Map<String, JsonValue> {
         val params = mutableMapOf<String, JsonValue>()
         preferredProjectPath?.let { params["cwd"] = JsonPrimitive(it) }
+        if (!modelIdentifier.isNullOrBlank()) {
+            params["model"] = JsonPrimitive(modelIdentifier)
+        }
         return params
+    }
+
+    private suspend fun resolveStartTurnThreadId(
+        preferredThreadId: String?,
+        accessMode: CodexAccessMode,
+        preferredProjectPath: String?,
+        modelIdentifier: String?,
+    ): String {
+        val normalizedPreferredThreadId = preferredThreadId?.trim()?.takeIf(String::isNotEmpty)
+        if (normalizedPreferredThreadId != null) {
+            return normalizedPreferredThreadId
+        }
+
+        return startThread(
+            preferredProjectPath = preferredProjectPath,
+            accessMode = accessMode,
+            modelIdentifier = modelIdentifier,
+        ).thread.id
     }
 
     private fun buildThreadResumeRequestParams(
@@ -1336,7 +1362,14 @@ open class RemodexTransportClient(
         if (message.contains("not materialized") || message.contains("not yet materialized")) {
             return false
         }
-        return message.contains("thread not found") || message.contains("unknown thread")
+        if (message.contains("thread not found") || message.contains("unknown thread")) {
+            return true
+        }
+
+        val missingRollout = message.contains("norolloutfound")
+            || message.contains("no rollout found")
+            || message.contains("rollout not found")
+        return missingRollout && (message.contains("threadid") || message.contains("thread"))
     }
 
     private fun extractTurnId(result: JsonValue?): String? {

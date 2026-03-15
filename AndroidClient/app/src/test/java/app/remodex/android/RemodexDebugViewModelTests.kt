@@ -428,6 +428,38 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun startThreadUsesSelectedRuntimeModelAndExplicitWorkspace() = runTest {
+        val createdThread = CodexThread(
+            id = "thread-new",
+            title = "New Chat",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            startThreadResult = RemodexThreadStartResult(
+                thread = createdThread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+            modelOptions = listOf(
+                CodexModelOption(
+                    id = "model-gpt54",
+                    model = "gpt-5.4",
+                    displayName = "GPT-5.4",
+                    isDefault = true,
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.refreshRuntimeOptions()
+        advanceUntilIdle()
+        viewModel.startThread(preferredProjectPath = "/tmp/project/")
+        advanceUntilIdle()
+
+        assertEquals("/tmp/project/", transport.lastPreferredProjectPath)
+        assertEquals("gpt-5.4", transport.lastStartThreadModelIdentifier)
+    }
+
+    @Test
     fun startTurnUsesSelectedRuntimeStateForTransportRequest() = runTest {
         val thread = CodexThread(
             id = "thread-live",
@@ -474,6 +506,35 @@ class RemodexDebugViewModelTests {
         assertEquals(app.remodex.android.core.model.CodexAccessMode.FullAccess, transport.lastStartTurnAccessMode)
         assertEquals("gpt-5.4", transport.lastStartTurnModelIdentifier)
         assertEquals("high", transport.lastStartTurnReasoningEffort)
+    }
+
+    @Test
+    fun startTurnWithoutSelectedThreadUsesTransportAutoCreateFlow() = runTest {
+        val newThread = CodexThread(
+            id = "thread-new",
+            title = "New Chat",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = newThread.id,
+                threadId = newThread.id,
+                turnId = "turn-1",
+                activeThread = newThread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.updateDraftTurnInput("Create and send")
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals("thread-new", state.activeThreadId)
+        assertEquals("Create and send", state.conversation.messagesFor("thread-new").single().text)
+        assertEquals(CodexMessageDeliveryState.Confirmed, state.conversation.messagesFor("thread-new").single().deliveryState)
+        assertNull(state.errorMessage)
     }
 
     @Test
@@ -797,6 +858,7 @@ class RemodexDebugViewModelTests {
         ),
     ) : RemodexTransportClient(appVersion = "test") {
         var lastPreferredProjectPath: String? = null
+        var lastStartThreadModelIdentifier: String? = null
         var lastInterruptedTurnId: String? = null
         var lastStartTurnAccessMode: app.remodex.android.core.model.CodexAccessMode? = null
         var lastStartTurnModelIdentifier: String? = null
@@ -837,8 +899,10 @@ class RemodexDebugViewModelTests {
         override suspend fun startThread(
             preferredProjectPath: String?,
             accessMode: app.remodex.android.core.model.CodexAccessMode,
+            modelIdentifier: String?,
         ): RemodexThreadStartResult {
             lastPreferredProjectPath = preferredProjectPath
+            lastStartThreadModelIdentifier = modelIdentifier
             return startThreadResult ?: error("startThread was not stubbed")
         }
 
@@ -927,7 +991,7 @@ class RemodexDebugViewModelTests {
         }
 
         override suspend fun startTurn(
-            threadId: String,
+            threadId: String?,
             userInput: String,
             accessMode: app.remodex.android.core.model.CodexAccessMode,
             collaborationMode: app.remodex.android.core.model.CodexCollaborationModeKind?,

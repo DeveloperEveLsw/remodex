@@ -73,6 +73,50 @@ class RemodexTransportClientLifecycleTests {
     }
 
     @Test
+    fun startTurnCreatesNewThreadWhenNoThreadIdIsSelected() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("thread/resume") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("turn/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-1"))),
+                    )
+                },
+            ),
+        )
+
+        val result = transport.startTurn(
+            threadId = null,
+            userInput = "hello world",
+            preferredProjectPath = "/tmp/project/",
+            modelIdentifier = "gpt-5.4",
+        )
+
+        assertEquals(
+            listOf("thread/start", "thread/resume", "turn/start"),
+            transport.recordedMethods,
+        )
+        assertEquals("thread-new", result.requestedThreadId)
+        assertEquals("thread-new", result.threadId)
+
+        val threadStartParams = transport.recordedParams.first().second as JsonObject
+        assertEquals("/tmp/project", (threadStartParams["cwd"] as JsonPrimitive).content)
+        assertEquals("gpt-5.4", (threadStartParams["model"] as JsonPrimitive).content)
+    }
+
+    @Test
     fun startTurnCreatesContinuationWhenTurnStartReportsMissingThread() = runTest {
         val transport = ScriptedTransportClient(
             steps = listOf(
@@ -173,6 +217,55 @@ class RemodexTransportClientLifecycleTests {
     }
 
     @Test
+    fun startTurnTreatsMissingRolloutAsMissingThread() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/resume") {
+                    throw RemodexTransportException(
+                        kind = RemodexTransportFailureKind.Rpc,
+                        message = "RPC error -32600: NoRolloutFoundForThreadId 019ceee2-b668-7393-baa2-af0904e8949d",
+                        rpcError = RpcError(
+                            code = -32600,
+                            message = "NoRolloutFoundForThreadId 019ceee2-b668-7393-baa2-af0904e8949d",
+                        ),
+                    )
+                },
+                ScriptedStep("thread/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("thread/resume") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("turn/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-3"))),
+                    )
+                },
+            ),
+        )
+
+        val result = transport.startTurn(
+            threadId = "thread-stale",
+            userInput = "resume me",
+            preferredProjectPath = "/tmp/project",
+        )
+
+        assertEquals(
+            listOf("thread/resume", "thread/start", "thread/resume", "turn/start"),
+            transport.recordedMethods,
+        )
+        assertEquals("thread-stale", result.archivedThreadId)
+        assertEquals("thread-new", result.threadId)
+    }
+
+    @Test
     fun startThreadPreservesPreferredProjectPathWhenServerOmitsCwd() = runTest {
         val transport = ScriptedTransportClient(
             steps = listOf(
@@ -190,6 +283,28 @@ class RemodexTransportClientLifecycleTests {
         assertEquals("/tmp/project", result.thread.cwd)
         val threadStartParams = transport.recordedParams.single().second as JsonObject
         assertEquals("/tmp/project", (threadStartParams["cwd"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun startThreadIncludesRuntimeModelInRequest() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-new"),
+                    )
+                },
+            ),
+        )
+
+        transport.startThread(
+            preferredProjectPath = "/tmp/project",
+            modelIdentifier = "gpt-5.4",
+        )
+
+        val threadStartParams = transport.recordedParams.single().second as JsonObject
+        assertEquals("gpt-5.4", (threadStartParams["model"] as JsonPrimitive).content)
     }
 
     @Test

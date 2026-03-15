@@ -976,12 +976,8 @@ class RemodexDebugViewModel(
         }
     }
 
-    fun startThread() {
+    fun startThread(preferredProjectPath: String? = null) {
         viewModelScope.launch {
-            val preferredProjectPath = _uiState.value.threads
-                .firstOrNull { it.id == _uiState.value.activeThreadId }
-                ?.cwd
-
             _uiState.update { current ->
                 current.copy(
                     isStartingThread = true,
@@ -993,6 +989,7 @@ class RemodexDebugViewModel(
                 transport.startThread(
                     preferredProjectPath = preferredProjectPath,
                     accessMode = _uiState.value.selectedAccessMode,
+                    modelIdentifier = _uiState.value.selectedModelOption?.model,
                 )
             }.onSuccess { result ->
                 applyThreadStarted(result)
@@ -1018,13 +1015,6 @@ class RemodexDebugViewModel(
         viewModelScope.launch {
             val currentState = _uiState.value
             val selectedThreadId = currentState.activeThreadId
-            if (selectedThreadId.isNullOrBlank()) {
-                _uiState.update { current ->
-                    current.copy(errorMessage = "Select a thread before sending a turn.")
-                }
-                return@launch
-            }
-
             val trimmedInput = currentState.draftTurnInput.trim()
             if (trimmedInput.isEmpty()) {
                 _uiState.update { current ->
@@ -1033,17 +1023,23 @@ class RemodexDebugViewModel(
                 return@launch
             }
 
-            val pendingMessageId = UUID.randomUUID().toString()
+            val pendingMessageId = selectedThreadId?.takeIf(String::isNotBlank)?.let { UUID.randomUUID().toString() }
 
             _uiState.update { current ->
-                current.copy(
-                    conversation = current.conversation
+                val updatedConversation = if (pendingMessageId != null && !selectedThreadId.isNullOrBlank()) {
+                    current.conversation
                         .withActiveThread(selectedThreadId)
                         .appendUserMessage(
                             threadId = selectedThreadId,
                             text = trimmedInput,
                             messageId = pendingMessageId,
-                        ),
+                        )
+                } else {
+                    current.conversation
+                }
+
+                current.copy(
+                    conversation = updatedConversation,
                     isStartingTurn = true,
                     errorMessage = null,
                 )
@@ -1067,16 +1063,23 @@ class RemodexDebugViewModel(
                 applyTurnStarted(
                     result = result,
                     pendingMessageId = pendingMessageId,
-                    requestedThreadId = selectedThreadId,
+                    pendingMessageText = trimmedInput,
+                    requestedThreadId = selectedThreadId ?: result.requestedThreadId,
                 )
             }.onFailure { throwable ->
                 _uiState.update { current ->
-                    current.copy(
-                        conversation = current.conversation.markMessageDeliveryState(
+                    val updatedConversation = if (pendingMessageId != null && !selectedThreadId.isNullOrBlank()) {
+                        current.conversation.markMessageDeliveryState(
                             threadId = selectedThreadId,
                             messageId = pendingMessageId,
                             deliveryState = CodexMessageDeliveryState.Failed,
-                        ),
+                        )
+                    } else {
+                        current.conversation
+                    }
+
+                    current.copy(
+                        conversation = updatedConversation,
                         isStartingTurn = false,
                         errorMessage = throwable.message,
                     )
@@ -1182,6 +1185,7 @@ class RemodexDebugViewModel(
     private fun applyTurnStarted(
         result: RemodexTurnStartResult,
         pendingMessageId: String? = null,
+        pendingMessageText: String? = null,
         requestedThreadId: String = result.requestedThreadId,
     ) {
         _uiState.update { current ->
@@ -1215,6 +1219,17 @@ class RemodexDebugViewModel(
                         CodexMessageDeliveryState.Confirmed
                     },
                     turnId = resolvedTurnId,
+                )
+            } else if (!pendingMessageText.isNullOrBlank()) {
+                updatedConversation = updatedConversation.appendUserMessage(
+                    threadId = result.threadId,
+                    text = pendingMessageText,
+                    turnId = resolvedTurnId,
+                    deliveryState = if (resolvedTurnId == null) {
+                        CodexMessageDeliveryState.Pending
+                    } else {
+                        CodexMessageDeliveryState.Confirmed
+                    },
                 )
             }
 
