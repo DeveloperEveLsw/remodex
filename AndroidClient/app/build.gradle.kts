@@ -1,8 +1,34 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+val keystoreProperties = Properties().apply {
+    val propertiesFile = rootProject.file("keystore.properties")
+    if (propertiesFile.exists()) {
+        propertiesFile.inputStream().use(::load)
+    }
+}
+
+fun keystoreValue(propertyName: String, envName: String): String? {
+    val envValue = System.getenv(envName)?.takeIf { it.isNotBlank() }
+    val propertyValue = keystoreProperties.getProperty(propertyName)?.takeIf { it.isNotBlank() }
+    return envValue ?: propertyValue
+}
+
+val releaseStoreFile = keystoreValue("storeFile", "ANDROID_KEYSTORE_PATH")
+val releaseStorePassword = keystoreValue("storePassword", "ANDROID_KEYSTORE_PASSWORD")
+val releaseKeyAlias = keystoreValue("keyAlias", "ANDROID_KEY_ALIAS")
+val releaseKeyPassword = keystoreValue("keyPassword", "ANDROID_KEY_PASSWORD")
+val hasReleaseSigning = listOf(
+    releaseStoreFile,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
 
 android {
     namespace = "app.remodex.android"
@@ -21,8 +47,22 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            if (hasReleaseSigning) {
+                storeFile = rootProject.file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
