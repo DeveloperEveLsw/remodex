@@ -11,6 +11,50 @@ import org.junit.Test
 
 class RemodexConversationStateTests {
     @Test
+    fun appendAssistantDeltaPreservesLeadingSpacesBetweenStreamTokens() {
+        val threadId = "thread-1"
+
+        val conversation = RemodexConversationState()
+            .beginAssistantMessage(threadId = threadId, turnId = "turn-1", itemId = "item-1")
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = "Hello",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = " world",
+            )
+
+        assertEquals("Hello world", conversation.messagesFor(threadId).single().text)
+    }
+
+    @Test
+    fun appendAssistantDeltaMergesCumulativeSnapshotsLikeIos() {
+        val threadId = "thread-1"
+
+        val conversation = RemodexConversationState()
+            .beginAssistantMessage(threadId = threadId, turnId = "turn-1", itemId = "item-1")
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = "Hello",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = "Hello world",
+            )
+
+        assertEquals("Hello world", conversation.messagesFor(threadId).single().text)
+    }
+
+    @Test
     fun mergeHydratedThreadMessagesPreservesLiveAssistantRowDuringStreaming() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()

@@ -376,10 +376,25 @@ object RemodexConversationReducer {
     }
 
     private fun extractAssistantDelta(paramsObject: JsonObject, eventObject: JsonObject?): String? {
-        return firstNonBlank(
+        return firstNonEmptyPreservingWhitespace(
             paramsObject["delta"]?.stringValue,
+            paramsObject["textDelta"]?.stringValue,
+            paramsObject["text_delta"]?.stringValue,
+            paramsObject["text"]?.stringValue,
+            paramsObject["summary"]?.stringValue,
+            paramsObject["part"]?.stringValue,
             eventObject?.get("delta")?.stringValue,
+            eventObject?.get("textDelta")?.stringValue,
+            eventObject?.get("text_delta")?.stringValue,
+            eventObject?.get("text")?.stringValue,
+            eventObject?.get("summary")?.stringValue,
+            eventObject?.get("part")?.stringValue,
             paramsObject["event"]?.objectValue?.get("delta")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("textDelta")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("text_delta")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("text")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("summary")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("part")?.stringValue,
         )
     }
 
@@ -745,5 +760,9 @@ object RemodexConversationReducer {
 
     private fun firstNonBlank(vararg values: String?): String? {
         return values.firstOrNull { !it.isNullOrBlank() }?.trim()
+    }
+
+    private fun firstNonEmptyPreservingWhitespace(vararg values: String?): String? {
+        return values.firstOrNull { it?.isNotEmpty() == true }
     }
 }

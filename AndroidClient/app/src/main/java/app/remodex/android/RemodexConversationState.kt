@@ -403,7 +403,10 @@ data class RemodexConversationState(
         val updatedMessages = existingMessages.toMutableList()
         val targetMessage = updatedMessages[targetIndex]
         updatedMessages[targetIndex] = targetMessage.copy(
-            text = targetMessage.text + delta,
+            text = mergeAssistantDelta(
+                existingText = targetMessage.text,
+                incomingDelta = delta,
+            ),
             isStreaming = true,
             itemId = targetMessage.itemId ?: normalizeThreadId(itemId),
         )
@@ -886,6 +889,39 @@ data class RemodexConversationState(
                 return existingText
             }
             return incomingText
+        }
+
+        private fun mergeAssistantDelta(existingText: String, incomingDelta: String): String {
+            if (existingText.isEmpty()) {
+                return incomingDelta
+            }
+
+            if (incomingDelta == existingText) {
+                return existingText
+            }
+
+            if (existingText.endsWith(incomingDelta)) {
+                return existingText
+            }
+
+            if (incomingDelta.length > existingText.length && incomingDelta.startsWith(existingText)) {
+                return incomingDelta
+            }
+
+            if (existingText.length > incomingDelta.length && existingText.startsWith(incomingDelta)) {
+                return existingText
+            }
+
+            val maxOverlap = minOf(existingText.length, incomingDelta.length)
+            if (maxOverlap > 0) {
+                for (overlap in maxOverlap downTo 1) {
+                    if (existingText.takeLast(overlap) == incomingDelta.take(overlap)) {
+                        return existingText + incomingDelta.drop(overlap)
+                    }
+                }
+            }
+
+            return existingText + incomingDelta
         }
 
         private fun normalizedMessageText(text: String): String {

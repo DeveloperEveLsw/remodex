@@ -89,6 +89,67 @@ class RemodexConversationReducerTests {
     }
 
     @Test
+    fun reducerPreservesLeadingSpacesInAssistantStreamingDeltas() {
+        var conversation = RemodexConversationState().withActiveThread("thread-1")
+        val knownThreadIds = setOf("thread-1")
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "item/started",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("item-1"),
+                        "type" to JsonPrimitive("agentMessage"),
+                        "role" to JsonPrimitive("assistant"),
+                    ),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "item/agentMessage/delta",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("item-1"),
+                        "type" to JsonPrimitive("agentMessage"),
+                        "role" to JsonPrimitive("assistant"),
+                    ),
+                    "delta" to JsonPrimitive("Hello"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "item/agentMessage/delta",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("item-1"),
+                        "type" to JsonPrimitive("agentMessage"),
+                        "role" to JsonPrimitive("assistant"),
+                    ),
+                    "delta" to JsonPrimitive(" world"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        assertEquals("Hello world", conversation.messagesFor("thread-1").single().text)
+    }
+
+    @Test
     fun reducerKeepsPerThreadRunningFallbackWhenTurnIdIsMissing() {
         val conversation = RemodexConversationReducer.reduce(
             conversation = RemodexConversationState(),
