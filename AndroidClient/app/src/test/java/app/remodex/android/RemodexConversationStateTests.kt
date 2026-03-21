@@ -4,13 +4,96 @@ import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexPlanStep
+import app.remodex.android.core.model.CodexPlanStepStatus
+import app.remodex.android.core.model.CodexStructuredUserInputQuestion
+import app.remodex.android.core.model.CodexStructuredUserInputRequest
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.Instant
+import kotlinx.serialization.json.JsonPrimitive
 
 class RemodexConversationStateTests {
+    @Test
+    fun upsertPlanMessageStoresExplanationAndStepsOnSingleTimelineRow() {
+        val threadId = "thread-1"
+
+        val conversation = RemodexConversationState().upsertPlanMessage(
+            threadId = threadId,
+            turnId = "turn-1",
+            itemId = "plan-1",
+            explanation = "Inspect the repo before editing.",
+            steps = listOf(
+                CodexPlanStep(
+                    id = "step-1",
+                    step = "Inspect files",
+                    status = CodexPlanStepStatus.InProgress,
+                ),
+            ),
+            isStreaming = true,
+        )
+
+        val planMessage = conversation.messagesFor(threadId).single()
+        assertEquals(CodexMessageKind.Plan, planMessage.kind)
+        assertTrue(planMessage.isStreaming)
+        assertEquals("Inspect the repo before editing.", planMessage.planState?.explanation)
+        assertEquals(1, planMessage.planState?.steps?.size)
+        assertEquals("Inspect files", planMessage.planState?.steps?.single()?.step)
+    }
+
+    @Test
+    fun structuredUserInputPromptUpdatesInPlaceAndRemovesByRequestId() {
+        val threadId = "thread-1"
+        val requestId = JsonPrimitive("request-1")
+        val initialRequest = CodexStructuredUserInputRequest(
+            requestID = requestId,
+            questions = listOf(
+                CodexStructuredUserInputQuestion(
+                    id = "question-1",
+                    header = "Access",
+                    question = "Which mode should we use?",
+                ),
+            ),
+        )
+        val updatedRequest = initialRequest.copy(
+            questions = listOf(
+                CodexStructuredUserInputQuestion(
+                    id = "question-1",
+                    header = "Access",
+                    question = "Pick the mode for this session.",
+                ),
+            ),
+        )
+
+        val conversation = RemodexConversationState()
+            .upsertStructuredUserInputPrompt(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "prompt-1",
+                request = initialRequest,
+            )
+            .upsertStructuredUserInputPrompt(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "prompt-2",
+                request = updatedRequest,
+            )
+
+        val promptMessage = conversation.messagesFor(threadId).single()
+        assertEquals(CodexMessageKind.UserInputPrompt, promptMessage.kind)
+        assertEquals("prompt-2", promptMessage.itemId)
+        assertEquals("Access\nPick the mode for this session.", promptMessage.text)
+
+        val removed = conversation.removeStructuredUserInputPrompt(
+            requestID = requestId,
+            threadIdHint = threadId,
+        )
+        assertTrue(removed.messagesFor(threadId).isEmpty())
+    }
+
     @Test
     fun appendAssistantDeltaKeepsSeparateBlocksWhenItemChangesWithinTurn() {
         val threadId = "thread-1"
@@ -159,6 +242,46 @@ class RemodexConversationStateTests {
     }
 
     @Test
+    fun mergeHydratedThreadMessagesReconcilesThinkingByTurnWhenTextDiffersLikeIos() {
+        val threadId = "thread-1"
+        val turnId = "turn-1"
+        val existing = RemodexConversationState(
+            messagesByThread = mapOf(
+                threadId to listOf(
+                    CodexMessage(
+                        id = "thinking-local",
+                        threadId = threadId,
+                        role = CodexMessageRole.System,
+                        kind = CodexMessageKind.Thinking,
+                        text = "**Providingexact200-wordparagraph**",
+                        createdAt = Instant.parse("2026-03-22T00:00:00Z"),
+                        turnId = turnId,
+                        orderIndex = 0,
+                    ),
+                ),
+            ),
+        )
+        val hydrated = listOf(
+            CodexMessage(
+                id = "thinking-history",
+                threadId = threadId,
+                role = CodexMessageRole.System,
+                kind = CodexMessageKind.Thinking,
+                text = "**Providing exact 200-word paragraph**",
+                createdAt = Instant.parse("2026-03-22T00:00:01Z"),
+                turnId = turnId,
+                orderIndex = 0,
+            ),
+        )
+
+        val merged = existing.mergeHydratedThreadMessages(threadId, hydrated)
+        val messages = merged.messagesFor(threadId)
+
+        assertEquals(1, messages.size)
+        assertEquals("**Providing exact 200-word paragraph**", messages.single().text)
+    }
+
+    @Test
     fun appendSystemDeltaMergesLateReasoningIntoExistingRowAfterTurnCompletion() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
@@ -186,7 +309,7 @@ class RemodexConversationStateTests {
     }
 
     @Test
-    fun completeSystemMessageKeepsWorkspaceCardInOriginalTimelinePosition() {
+    fun completeSystemMessageMovesWorkspaceCardToLatestRawTimelinePositionLikeIos() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
             .appendUserMessage(threadId = threadId, text = "Apply the patch")
@@ -214,16 +337,17 @@ class RemodexConversationStateTests {
         assertEquals(
             listOf(
                 CodexMessageRole.User to CodexMessageKind.Chat,
-                CodexMessageRole.System to CodexMessageKind.FileChange,
                 CodexMessageRole.Assistant to CodexMessageKind.Chat,
+                CodexMessageRole.System to CodexMessageKind.FileChange,
             ),
             messages.map { it.role to it.kind },
         )
-        assertFalse(messages[1].isStreaming)
+        assertFalse(messages[2].isStreaming)
+        assertTrue(messages[2].orderIndex > messages[1].orderIndex)
     }
 
     @Test
-    fun completeSystemMessageKeepsCommandCardInOriginalTimelinePosition() {
+    fun completeSystemMessageMovesCommandCardToLatestRawTimelinePositionLikeIos() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
             .appendUserMessage(threadId = threadId, text = "Run tests")
@@ -251,12 +375,221 @@ class RemodexConversationStateTests {
         assertEquals(
             listOf(
                 CodexMessageRole.User to CodexMessageKind.Chat,
-                CodexMessageRole.System to CodexMessageKind.CommandExecution,
                 CodexMessageRole.Assistant to CodexMessageKind.Chat,
+                CodexMessageRole.System to CodexMessageKind.CommandExecution,
             ),
             messages.map { it.role to it.kind },
         )
-        assertFalse(messages[1].isStreaming)
+        assertFalse(messages[2].isStreaming)
+        assertTrue(messages[2].orderIndex > messages[1].orderIndex)
+    }
+
+    @Test
+    fun mergeHydratedThreadMessagesDedupesQuotedCommandPreviewByTurnLikeIos() {
+        val threadId = "thread-1"
+        val turnId = "turn-1"
+        val existing = RemodexConversationState(
+            messagesByThread = mapOf(
+                threadId to listOf(
+                    CodexMessage(
+                        id = "command-local",
+                        threadId = threadId,
+                        role = CodexMessageRole.System,
+                        kind = CodexMessageKind.CommandExecution,
+                        text = "completed /bin/zsh -lc rg --files",
+                        createdAt = Instant.parse("2026-03-22T00:00:00Z"),
+                        turnId = turnId,
+                        isStreaming = false,
+                        orderIndex = 0,
+                    ),
+                ),
+            ),
+        )
+        val hydrated = listOf(
+            CodexMessage(
+                id = "command-history",
+                threadId = threadId,
+                role = CodexMessageRole.System,
+                kind = CodexMessageKind.CommandExecution,
+                text = "completed /bin/zsh -lc \"rg --files\"",
+                createdAt = Instant.parse("2026-03-22T00:00:01Z"),
+                turnId = turnId,
+                isStreaming = false,
+                orderIndex = 0,
+            ),
+        )
+
+        val merged = existing.mergeHydratedThreadMessages(threadId, hydrated)
+        val commandRows = merged.messagesFor(threadId).filter {
+            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.CommandExecution
+        }
+
+        assertEquals(1, commandRows.size)
+        assertEquals(turnId, commandRows.single().turnId)
+    }
+
+    @Test
+    fun mergeHydratedThreadMessagesPreservesLateSystemRowChronologyLikeIos() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .appendUserMessage(threadId = threadId, text = "Run tests")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.CommandExecution,
+                delta = "running echo one",
+                turnId = "turn-1",
+                itemId = "cmd-1",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "assistant-1",
+                delta = "Waiting for output",
+            )
+            .completeSystemMessage(
+                threadId = threadId,
+                kind = CodexMessageKind.CommandExecution,
+                text = "completed echo one",
+                turnId = "turn-1",
+                itemId = "cmd-1",
+            )
+
+        val hydrated = listOf(
+            CodexMessage(
+                id = "history-user",
+                threadId = threadId,
+                role = CodexMessageRole.User,
+                text = "Run tests",
+                createdAt = Instant.parse("2026-03-22T00:00:00Z"),
+                turnId = "turn-1",
+                orderIndex = 0,
+            ),
+            CodexMessage(
+                id = "history-assistant",
+                threadId = threadId,
+                role = CodexMessageRole.Assistant,
+                text = "Waiting for output",
+                createdAt = Instant.parse("2026-03-22T00:00:01Z"),
+                turnId = "turn-1",
+                itemId = "assistant-1",
+                orderIndex = 1,
+            ),
+            CodexMessage(
+                id = "history-command",
+                threadId = threadId,
+                role = CodexMessageRole.System,
+                kind = CodexMessageKind.CommandExecution,
+                text = "completed echo one",
+                createdAt = Instant.parse("2026-03-22T00:00:02Z"),
+                turnId = "turn-1",
+                itemId = "cmd-1",
+                orderIndex = 2,
+            ),
+        )
+
+        val merged = conversation.mergeHydratedThreadMessages(threadId, hydrated)
+        val messages = merged.messagesFor(threadId)
+        val assistantMessage = messages.first { it.role == CodexMessageRole.Assistant }
+        val commandMessage = messages.first { it.kind == CodexMessageKind.CommandExecution }
+
+        assertEquals(3, messages.size)
+        assertTrue(commandMessage.orderIndex > assistantMessage.orderIndex)
+        assertEquals("completed echo one", commandMessage.text)
+    }
+
+    @Test
+    fun mergeHydratedThreadMessagesPreservesProjectedRenderOrderLikeIos() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .appendUserMessage(threadId = threadId, text = "Run tests")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.Thinking,
+                delta = "Reasoning",
+                turnId = "turn-1",
+                itemId = "thinking-1",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "assistant-1",
+                delta = "First answer",
+            )
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.CommandExecution,
+                delta = "running echo one",
+                turnId = "turn-1",
+                itemId = "cmd-1",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "assistant-2",
+                delta = "Second answer",
+            )
+
+        val hydrated = listOf(
+            CodexMessage(
+                id = "history-user",
+                threadId = threadId,
+                role = CodexMessageRole.User,
+                text = "Run tests",
+                createdAt = Instant.parse("2026-03-22T00:00:00Z"),
+                turnId = "turn-1",
+                orderIndex = 0,
+            ),
+            CodexMessage(
+                id = "history-thinking",
+                threadId = threadId,
+                role = CodexMessageRole.System,
+                kind = CodexMessageKind.Thinking,
+                text = "Reasoning",
+                createdAt = Instant.parse("2026-03-22T00:00:01Z"),
+                turnId = "turn-1",
+                itemId = "thinking-1",
+                orderIndex = 1,
+            ),
+            CodexMessage(
+                id = "history-assistant-1",
+                threadId = threadId,
+                role = CodexMessageRole.Assistant,
+                text = "First answer",
+                createdAt = Instant.parse("2026-03-22T00:00:02Z"),
+                turnId = "turn-1",
+                itemId = "assistant-1",
+                orderIndex = 2,
+            ),
+            CodexMessage(
+                id = "history-command",
+                threadId = threadId,
+                role = CodexMessageRole.System,
+                kind = CodexMessageKind.CommandExecution,
+                text = "completed echo one",
+                createdAt = Instant.parse("2026-03-22T00:00:03Z"),
+                turnId = "turn-1",
+                itemId = "cmd-1",
+                orderIndex = 3,
+            ),
+            CodexMessage(
+                id = "history-assistant-2",
+                threadId = threadId,
+                role = CodexMessageRole.Assistant,
+                text = "Second answer",
+                createdAt = Instant.parse("2026-03-22T00:00:04Z"),
+                turnId = "turn-1",
+                itemId = "assistant-2",
+                orderIndex = 4,
+            ),
+        )
+
+        val merged = conversation.mergeHydratedThreadMessages(threadId, hydrated)
+        val projected = RemodexTimelineProjector.project(merged.messagesFor(threadId)).messages
+
+        assertEquals(
+            listOf("Run tests", "Reasoning", "First answer", "completed echo one", "Second answer"),
+            projected.map(CodexMessage::text),
+        )
     }
 
     @Test

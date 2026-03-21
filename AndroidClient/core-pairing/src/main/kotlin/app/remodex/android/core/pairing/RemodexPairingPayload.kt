@@ -4,6 +4,8 @@ import java.net.URI
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 @Serializable
 data class RemodexPairingPayload(
@@ -95,8 +97,8 @@ object RemodexPairingParser {
             )
         }
 
-        val decoded = runCatching {
-            json.decodeFromString(RemodexPairingPayload.serializer(), trimmedPayload)
+        val decodedObject = runCatching {
+            json.parseToJsonElement(trimmedPayload) as? JsonObject
         }.getOrElse {
             throw RemodexPairingException(
                 RemodexPairingErrorCode.InvalidJson,
@@ -104,20 +106,38 @@ object RemodexPairingParser {
                 it,
             )
         }
+        if (decodedObject == null) {
+            throw RemodexPairingException(
+                RemodexPairingErrorCode.InvalidJson,
+                "Not a valid pairing JSON payload.",
+            )
+        }
 
-        if (decoded.relayUrl.trim().isEmpty()) {
+        val relayUrl = runCatching { decodedObject["relay"]?.jsonPrimitive?.content }
+            .getOrNull()
+            .orEmpty()
+        val sessionId = runCatching { decodedObject["sessionId"]?.jsonPrimitive?.content }
+            .getOrNull()
+            .orEmpty()
+
+        if (relayUrl.trim().isEmpty()) {
             throw RemodexPairingException(
                 RemodexPairingErrorCode.MissingRelayUrl,
                 "QR payload is missing the relay URL.",
             )
         }
 
-        if (decoded.sessionId.trim().isEmpty()) {
+        if (sessionId.trim().isEmpty()) {
             throw RemodexPairingException(
                 RemodexPairingErrorCode.MissingSessionId,
                 "QR payload is missing the session ID.",
             )
         }
+
+        val decoded = RemodexPairingPayload(
+            relayUrl = relayUrl,
+            sessionId = sessionId,
+        )
 
         return decoded.copy(
             relayUrl = decoded.normalizedRelayUrl,

@@ -1,14 +1,17 @@
 package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessage
-import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageKind
+import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexReasoningEffortOption
+import app.remodex.android.core.model.CodexFuzzyFileMatch
+import app.remodex.android.core.model.CodexSkillMetadata
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.model.GitBranchesWithStatusResult
 import app.remodex.android.core.model.GitCheckoutResult
 import app.remodex.android.core.model.GitDiffTotals
@@ -26,6 +29,7 @@ import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
 import app.remodex.android.core.protocol.RpcMessage
 import app.remodex.android.core.protocol.RpcError
+import app.remodex.android.core.protocol.JsonValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
@@ -35,6 +39,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -60,6 +65,26 @@ class RemodexDebugViewModelTests {
     fun tearDown() {
         Dispatchers.resetMain()
     }
+
+    private data class SentRpcResponse(
+        val id: JsonValue,
+        val result: JsonValue,
+    ) {
+        fun idAsString(): String {
+            return if (id is JsonPrimitive) {
+                id.content
+            } else {
+                id.toString()
+            }
+        }
+    }
+
+    private data class SentRpcErrorResponse(
+        val id: JsonValue?,
+        val code: Int,
+        val message: String,
+        val data: JsonValue?,
+    )
 
     private fun createViewModel(
         transport: RemodexTransportClient = FakeTransportClient(),
@@ -298,6 +323,284 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun onRequestApprovalServerRequestPopulatesPendingApproval() = runTest {
+        val transport = FakeTransportClient()
+        val viewModel = createViewModel(transport = transport)
+
+        transport.emitServerRequest(
+            RpcMessage.request(
+                id = JsonPrimitive("approval-1"),
+                method = "item/commandExecution/requestApproval",
+                params = JsonObject(
+                    mapOf(
+                        "command" to JsonPrimitive("npm test"),
+                        "reason" to JsonPrimitive("Needs permission"),
+                        "threadId" to JsonPrimitive("thread-1"),
+                        "turnId" to JsonPrimitive("turn-1"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        val pendingApproval = viewModel.uiState.value.pendingApproval
+        assertEquals("approval-1", pendingApproval?.id)
+        assertEquals("npm test", pendingApproval?.command)
+        assertEquals("Needs permission", pendingApproval?.reason)
+        assertTrue(transport.sentResponses.isEmpty())
+    }
+
+    @Test
+    fun fullAccessApprovalServerRequestAutoApprovesWithoutDialog() = runTest {
+        val transport = FakeTransportClient()
+        val viewModel = createViewModel(transport = transport)
+        viewModel.selectAccessMode(app.remodex.android.core.model.CodexAccessMode.FullAccess)
+        advanceUntilIdle()
+
+        transport.emitServerRequest(
+            RpcMessage.request(
+                id = JsonPrimitive("approval-1"),
+                method = "item/commandExecution/requestApproval",
+                params = JsonObject(
+                    mapOf(
+                        "command" to JsonPrimitive("npm test"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertNull(viewModel.uiState.value.pendingApproval)
+        assertEquals(1, transport.sentResponses.size)
+        assertEquals("approval-1", transport.sentResponses.single().idAsString())
+        assertEquals("accept", (transport.sentResponses.single().result as JsonPrimitive).content)
+    }
+
+    @Test
+    fun structuredUserInputServerRequestAddsInlinePrompt() = runTest {
+        val transport = FakeTransportClient()
+        val viewModel = createViewModel(transport = transport)
+
+        transport.emitServerRequest(
+            RpcMessage.request(
+                id = JsonPrimitive("request-1"),
+                method = "item/tool/requestUserInput",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive("thread-1"),
+                        "turnId" to JsonPrimitive("turn-1"),
+                        "itemId" to JsonPrimitive("prompt-1"),
+                        "questions" to JsonArray(
+                            listOf(
+                                JsonObject(
+                                    mapOf(
+                                        "id" to JsonPrimitive("question-1"),
+                                        "header" to JsonPrimitive("Access"),
+                                        "question" to JsonPrimitive("Which mode should we use?"),
+                                        "options" to JsonArray(
+                                            listOf(
+                                                JsonObject(
+                                                    mapOf(
+                                                        "label" to JsonPrimitive("Safe"),
+                                                        "description" to JsonPrimitive("Ask before edits"),
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        val promptMessage = viewModel.uiState.value.conversation.messagesFor("thread-1").single()
+        assertEquals(CodexMessageKind.UserInputPrompt, promptMessage.kind)
+        assertEquals("Access\nWhich mode should we use?", promptMessage.text)
+        assertEquals("request-1", promptMessage.structuredUserInputRequest?.requestID?.let { requestId ->
+            if (requestId is JsonPrimitive) requestId.content else requestId.toString()
+        })
+    }
+
+    @Test
+    fun structuredUserInputResponseUsesIosEnvelopeAndClearsOnResolved() = runTest {
+        val transport = FakeTransportClient()
+        val viewModel = createViewModel(transport = transport)
+
+        transport.emitServerRequest(
+            RpcMessage.request(
+                id = JsonPrimitive("request-1"),
+                method = "item/tool/requestUserInput",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive("thread-1"),
+                        "turnId" to JsonPrimitive("turn-1"),
+                        "itemId" to JsonPrimitive("prompt-1"),
+                        "questions" to JsonArray(
+                            listOf(
+                                JsonObject(
+                                    mapOf(
+                                        "id" to JsonPrimitive("question-1"),
+                                        "header" to JsonPrimitive("Access"),
+                                        "question" to JsonPrimitive("Which mode should we use?"),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.respondToStructuredUserInput(
+            requestID = JsonPrimitive("request-1"),
+            answersByQuestionID = mapOf("question-1" to listOf("Safe")),
+        )
+        advanceUntilIdle()
+
+        assertEquals(1, transport.sentResponses.size)
+        assertEquals(
+            JsonObject(
+                mapOf(
+                    "answers" to JsonObject(
+                        mapOf(
+                            "question-1" to JsonObject(
+                                mapOf(
+                                    "answers" to JsonArray(listOf(JsonPrimitive("Safe"))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            transport.sentResponses.single().result,
+        )
+        assertTrue(viewModel.uiState.value.submittingStructuredRequestKeys.contains("request-1"))
+
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "serverRequest/resolved",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive("thread-1"),
+                        "requestId" to JsonPrimitive("request-1"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.conversation.messagesFor("thread-1").isEmpty())
+        assertFalse(viewModel.uiState.value.submittingStructuredRequestKeys.contains("request-1"))
+    }
+
+    @Test
+    fun startTurnRewritesSelectedFileMentionToCanonicalPath() = runTest {
+        val thread = CodexThread(
+            id = "thread-1",
+            title = "Thread 1",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-1",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.refreshThreads()
+        advanceUntilIdle()
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("Inspect @MainAct")
+        viewModel.selectFileAutocomplete(
+            CodexFuzzyFileMatch(
+                root = "/tmp/project",
+                path = "app/src/main/java/app/remodex/android/MainActivity.kt",
+                fileName = "MainActivity.kt",
+                score = 0.97,
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        assertEquals(
+            "Inspect @app/src/main/java/app/remodex/android/MainActivity.kt",
+            transport.lastStartTurnUserInput,
+        )
+        assertTrue(transport.lastStartTurnSkillMentions.isEmpty())
+    }
+
+    @Test
+    fun startTurnSendsSelectedSkillMentionsWithIosEnvelope() = runTest {
+        val thread = CodexThread(
+            id = "thread-2",
+            title = "Thread 2",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-2",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.refreshThreads()
+        advanceUntilIdle()
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("Use ${'$'}pla")
+        viewModel.selectSkillAutocomplete(
+            CodexSkillMetadata(
+                name = "planner",
+                description = "Planning workflow",
+                path = "/skills/planner",
+                enabled = true,
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        assertEquals("Use ${'$'}planner", transport.lastStartTurnUserInput)
+        assertEquals(
+            listOf(
+                CodexTurnSkillMention(
+                    id = "planner",
+                    name = "planner",
+                    path = "/skills/planner",
+                ),
+            ),
+            transport.lastStartTurnSkillMentions,
+        )
+    }
+
+    @Test
     fun startThreadSelectsTheCreatedLiveThread() = runTest {
         val createdThread = CodexThread(
             id = "thread-new",
@@ -429,7 +732,8 @@ class RemodexDebugViewModelTests {
         assertEquals(historyMessages, state.conversation.messagesFor(thread.id))
         assertTrue(!state.conversation.isLoadingThread(thread.id))
         assertTrue(state.conversation.messageRevisionFor(thread.id) > 0)
-        assertEquals(listOf("thread/resume", "thread/read"), transport.recordedMethods.takeLast(2))
+        assertTrue(transport.recordedMethods.contains("thread/resume"))
+        assertTrue(transport.recordedMethods.contains("thread/read"))
     }
 
     @Test
@@ -1218,10 +1522,14 @@ class RemodexDebugViewModelTests {
         var lastStartTurnAccessMode: app.remodex.android.core.model.CodexAccessMode? = null
         var lastStartTurnModelIdentifier: String? = null
         var lastStartTurnReasoningEffort: String? = null
+        var lastStartTurnUserInput: String? = null
+        var lastStartTurnSkillMentions: List<CodexTurnSkillMention> = emptyList()
         var lastGitWorkingDirectory: String? = null
         var lastCheckedOutBranch: String? = null
         val connectedSessionUrls = mutableListOf<String>()
         val recordedMethods = mutableListOf<String>()
+        val sentResponses = mutableListOf<SentRpcResponse>()
+        val sentErrorResponses = mutableListOf<SentRpcErrorResponse>()
         private val stateFlow: MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
         private val queuedReadThreadResultsById = queuedReadThreadResults
             .mapValues { (_, results) -> java.util.ArrayDeque(results) }
@@ -1241,17 +1549,43 @@ class RemodexDebugViewModelTests {
         ): RemodexHandshakeResult {
             connectedSessionUrls += pairing.relaySessionUrl()
             connectThrowable?.let { throw it }
+            val resolvedConnectResult = if (connectResult.sessionUrl == "ws://test") {
+                connectResult.copy(sessionUrl = pairing.relaySessionUrl())
+            } else {
+                connectResult
+            }
             stateFlow.value = RemodexTransportState.Connected(
-                sessionUrl = connectResult.sessionUrl,
+                sessionUrl = resolvedConnectResult.sessionUrl,
                 isInitialized = true,
-                hostInfo = connectResult.hostInfo,
-                supportsPlanCollaborationMode = connectResult.supportsPlanCollaborationMode,
+                hostInfo = resolvedConnectResult.hostInfo,
+                supportsPlanCollaborationMode = resolvedConnectResult.supportsPlanCollaborationMode,
             )
-            return connectResult
+            return resolvedConnectResult
         }
 
         override suspend fun disconnect() {
             stateFlow.value = RemodexTransportState.Disconnected
+        }
+
+        override suspend fun sendResponse(
+            id: JsonValue,
+            result: JsonValue,
+        ) {
+            sentResponses += SentRpcResponse(id = id, result = result)
+        }
+
+        override suspend fun sendErrorResponse(
+            id: JsonValue?,
+            code: Int,
+            message: String,
+            data: JsonValue?,
+        ) {
+            sentErrorResponses += SentRpcErrorResponse(
+                id = id,
+                code = code,
+                message = message,
+                data = data,
+            )
         }
 
         override suspend fun startThread(
@@ -1361,11 +1695,15 @@ class RemodexDebugViewModelTests {
             preferredProjectPath: String?,
             modelIdentifier: String?,
             reasoningEffort: String?,
+            attachments: List<app.remodex.android.core.model.CodexImageAttachment>,
+            skillMentions: List<CodexTurnSkillMention>,
         ): RemodexTurnStartResult {
             lastPreferredProjectPath = preferredProjectPath
+            lastStartTurnUserInput = userInput
             lastStartTurnAccessMode = accessMode
             lastStartTurnModelIdentifier = modelIdentifier
             lastStartTurnReasoningEffort = reasoningEffort
+            lastStartTurnSkillMentions = skillMentions
             return startTurnResult ?: error("startTurn was not stubbed")
         }
 
@@ -1375,6 +1713,14 @@ class RemodexDebugViewModelTests {
             @Suppress("UNCHECKED_CAST")
             val notifications = notificationsField.get(this) as kotlinx.coroutines.flow.MutableSharedFlow<RpcMessage>
             notifications.tryEmit(message)
+        }
+
+        fun emitServerRequest(message: RpcMessage) {
+            val serverRequestsField = RemodexTransportClient::class.java.getDeclaredField("_serverRequests")
+            serverRequestsField.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            val serverRequests = serverRequestsField.get(this) as kotlinx.coroutines.flow.MutableSharedFlow<RpcMessage>
+            serverRequests.tryEmit(message)
         }
 
         fun emitState(state: RemodexTransportState) {

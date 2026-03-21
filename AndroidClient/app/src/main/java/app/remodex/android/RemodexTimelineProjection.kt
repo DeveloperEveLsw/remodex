@@ -12,7 +12,8 @@ data class RemodexTimelineProjection(
 
 object RemodexTimelineProjector {
     fun project(messages: List<CodexMessage>): RemodexTimelineProjection {
-        val reordered = enforceIntraTurnOrder(messages)
+        val visibleMessages = removeHiddenSystemMarkers(messages)
+        val reordered = enforceIntraTurnOrder(visibleMessages)
         val collapsedThinking = collapseConsecutiveThinkingMessages(reordered)
         val dedupedFileChanges = removeDuplicateFileChangeMessages(collapsedThinking)
         val dedupedAssistant = removeDuplicateAssistantMessages(dedupedFileChanges)
@@ -112,6 +113,10 @@ object RemodexTimelineProjector {
 
             CodexMessageRole.Assistant -> 4
         }
+    }
+
+    private fun removeHiddenSystemMarkers(messages: List<CodexMessage>): List<CodexMessage> {
+        return messages.filterNot(RemodexGitTimelineSupport::isHiddenTimelineMessage)
     }
 
     private fun collapseConsecutiveThinkingMessages(messages: List<CodexMessage>): List<CodexMessage> {

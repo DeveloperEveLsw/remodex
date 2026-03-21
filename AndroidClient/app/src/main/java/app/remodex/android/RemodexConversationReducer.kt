@@ -1,7 +1,10 @@
 package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessageKind
+import app.remodex.android.core.model.CodexPlanStep
+import app.remodex.android.core.model.CodexPlanStepStatus
 import app.remodex.android.core.model.CodexTurnTerminalState
+import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcMessage
 import app.remodex.android.core.protocol.arrayValue
 import app.remodex.android.core.protocol.objectValue
@@ -9,6 +12,27 @@ import app.remodex.android.core.protocol.stringValue
 import kotlinx.serialization.json.JsonObject
 
 object RemodexConversationReducer {
+    private enum class CommandRunPhase {
+        Running,
+        Completed,
+        Failed,
+        Stopped,
+    }
+
+    private data class CommandRunViewState(
+        val itemId: String?,
+        val phase: CommandRunPhase,
+        val shortCommand: String,
+        val fullCommand: String,
+        val activityLine: String?,
+    )
+
+    private data class CommandExecutionMessageContext(
+        val threadId: String,
+        val turnId: String?,
+        val itemId: String?,
+    )
+
     fun reduce(
         conversation: RemodexConversationState,
         message: RpcMessage,
@@ -28,6 +52,34 @@ object RemodexConversationReducer {
 
             "turn/completed" -> reduceTurnCompleted(
                 conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "turn/plan/updated" -> reduceTurnPlanUpdated(
+                conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "codex/event/exec_command_begin",
+            "codex/event/exec_command_output_delta",
+            "codex/event/exec_command_end" -> reduceLegacyCommandExecutionEvent(
+                conversation = conversation,
+                normalizedMethod = normalizedMethod,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "codex/event/background_event",
+            "codex/event/read",
+            "codex/event/search",
+            "codex/event/list_files" -> reduceEssentialActivityEvent(
+                conversation = conversation,
+                normalizedMethod = normalizedMethod,
                 paramsObject = paramsObject,
                 eventObject = eventObject,
                 knownThreadIds = knownThreadIds,
@@ -76,12 +128,6 @@ object RemodexConversationReducer {
 
             "item/filechange/outputdelta",
             "item/filechange/output_delta",
-            "item/commandexecution/outputdelta",
-            "item/commandexecution/output_delta",
-            "item/command_execution/outputdelta",
-            "item/command_execution/output_delta",
-            "item/toolcall/outputdelta",
-            "item/toolcall/output_delta",
             "turn/diff/updated",
             "codex/event/turn_diff_updated",
             "codex/event/turn_diff" -> reduceRepoAffectingDelta(
@@ -92,8 +138,33 @@ object RemodexConversationReducer {
                 knownThreadIds = knownThreadIds,
             )
 
+            "item/commandexecution/outputdelta",
+            "item/commandexecution/output_delta",
+            "item/command_execution/outputdelta",
+            "item/command_execution/output_delta" -> reduceCommandExecutionDelta(
+                conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "item/toolcall/outputdelta",
+            "item/toolcall/output_delta" -> reduceToolCallDelta(
+                conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
             "item/commandexecution/terminalinteraction",
             "item/command_execution/terminalinteraction" -> reduceCommandExecutionTerminalInteraction(
+                conversation = conversation,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "serverrequest/resolved" -> reduceServerRequestResolved(
                 conversation = conversation,
                 paramsObject = paramsObject,
                 eventObject = eventObject,
@@ -142,6 +213,182 @@ object RemodexConversationReducer {
             turnId = turnId,
             terminalState = parseTurnTerminalState(paramsObject, eventObject),
         )
+    }
+
+    private fun reduceTurnPlanUpdated(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val turnId = extractTurnId(paramsObject, eventObject) ?: return conversation
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+
+        return conversation.upsertPlanMessage(
+            threadId = threadId,
+            turnId = turnId,
+            itemId = extractItemId(
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                itemObject = extractItemObject(paramsObject, eventObject),
+            ),
+            explanation = firstNonBlank(
+                paramsObject["explanation"]?.stringValue,
+                eventObject?.get("explanation")?.stringValue,
+            ),
+            steps = decodePlanSteps(
+                paramsObject["plan"] ?: eventObject?.get("plan"),
+            ),
+            isStreaming = true,
+        )
+    }
+
+    private fun reduceLegacyCommandExecutionEvent(
+        conversation: RemodexConversationState,
+        normalizedMethod: String,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val payloadObject = eventObject ?: paramsObject
+        val eventType = normalizedMethod.substringAfterLast('/')
+        val turnId = extractTurnId(paramsObject, eventObject, allowTopLevelId = true)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val resolvedTurnId = normalizeThreadId(turnId) ?: conversation.activeTurnIdByThread[threadId]
+        val state = decodeCommandRunViewState(
+            payloadObject = payloadObject,
+            paramsObject = paramsObject,
+            eventType = eventType,
+        )
+        val itemId = state.itemId ?: extractItemId(paramsObject, eventObject, extractItemObject(paramsObject, eventObject))
+
+        if (eventType == "exec_command_output_delta") {
+            if (!itemId.isNullOrBlank()) {
+                val hasExistingRunRow = conversation.messagesFor(threadId).any { message ->
+                    message.role == app.remodex.android.core.model.CodexMessageRole.System &&
+                        message.kind == CodexMessageKind.CommandExecution &&
+                        message.itemId == itemId
+                }
+                if (!hasExistingRunRow) {
+                    return publishCommandExecutionStatus(
+                        conversation = conversation,
+                        context = CommandExecutionMessageContext(
+                            threadId = threadId,
+                            turnId = resolvedTurnId,
+                            itemId = itemId,
+                        ),
+                        statusText = commandExecutionStatusText(state),
+                        isStreaming = true,
+                    )
+                }
+            }
+            return conversation
+        }
+
+        var nextConversation = publishCommandExecutionStatus(
+            conversation = conversation,
+            context = CommandExecutionMessageContext(
+                threadId = threadId,
+                turnId = resolvedTurnId,
+                itemId = itemId,
+            ),
+            statusText = commandExecutionStatusText(state),
+            isStreaming = state.phase == CommandRunPhase.Running,
+        )
+
+        if (state.activityLine != null) {
+            nextConversation = nextConversation.appendThinkingActivityLine(
+                threadId = threadId,
+                turnId = resolvedTurnId,
+                line = state.activityLine,
+            )
+        }
+
+        return nextConversation
+    }
+
+    private fun reduceEssentialActivityEvent(
+        conversation: RemodexConversationState,
+        normalizedMethod: String,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val payloadObject = eventObject ?: paramsObject
+        val eventType = normalizedMethod.substringAfterLast('/')
+        val line = essentialActivityLine(eventType, payloadObject) ?: return conversation
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val resolvedTurnId = normalizeThreadId(turnId) ?: conversation.activeTurnIdByThread[threadId]
+        return conversation.appendThinkingActivityLine(
+            threadId = threadId,
+            turnId = resolvedTurnId,
+            line = line,
+        )
+    }
+
+    private fun reduceToolCallDelta(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val delta = extractAssistantDelta(paramsObject, eventObject) ?: return conversation
+        if (delta.isBlank()) {
+            return conversation
+        }
+
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val resolvedTurnId = normalizeThreadId(turnId) ?: conversation.activeTurnIdByThread[threadId]
+        val itemObject = extractItemObject(paramsObject, eventObject)
+
+        if (isLikelyFileChangeToolCall(itemObject, delta)) {
+            return conversation.appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.FileChange,
+                delta = delta,
+                turnId = resolvedTurnId,
+                itemId = extractItemId(paramsObject, eventObject, itemObject),
+            )
+        }
+
+        val activityLines = extractToolCallActivityLines(delta)
+        if (activityLines.isEmpty()) {
+            return conversation
+        }
+
+        return activityLines.fold(conversation) { current, line ->
+            current.appendThinkingActivityLine(
+                threadId = threadId,
+                turnId = resolvedTurnId,
+                line = line,
+            )
+        }
     }
 
     private fun reduceItemStarted(
@@ -319,6 +566,31 @@ object RemodexConversationReducer {
         )
     }
 
+    private fun reduceServerRequestResolved(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val requestId = paramsObject["requestId"]
+            ?: paramsObject["requestID"]
+            ?: eventObject?.get("requestId")
+            ?: eventObject?.get("requestID")
+            ?: return conversation
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = extractTurnId(paramsObject, eventObject),
+        )
+
+        return conversation.removeStructuredUserInputPrompt(
+            requestID = requestId,
+            threadIdHint = threadId,
+        )
+    }
+
     private fun reduceSystemDelta(
         conversation: RemodexConversationState,
         kind: CodexMessageKind,
@@ -343,6 +615,52 @@ object RemodexConversationReducer {
             delta = delta,
             turnId = turnId,
             itemId = itemId,
+        )
+    }
+
+    private fun reduceCommandExecutionDelta(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val itemObject = extractItemObject(paramsObject, eventObject)
+        val payloadObject = itemObject ?: eventObject ?: paramsObject
+        val context = resolveCommandExecutionMessageContext(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            itemObject = itemObject,
+        ) ?: return conversation
+
+        if (!context.itemId.isNullOrBlank()) {
+            val hasCommandHint = extractCommandExecutionCommand(payloadObject) != null ||
+                payloadObject["command"] != null ||
+                payloadObject["cmd"] != null
+            if (!hasCommandHint) {
+                val hasExistingRunRow = conversation.messagesFor(context.threadId).any { message ->
+                    message.role == app.remodex.android.core.model.CodexMessageRole.System &&
+                        message.kind == CodexMessageKind.CommandExecution &&
+                        message.itemId == context.itemId
+                }
+                if (hasExistingRunRow) {
+                    return conversation
+                }
+            }
+        }
+
+        return publishCommandExecutionStatus(
+            conversation = conversation,
+            context = context,
+            statusText = commandExecutionStatusText(
+                decodeCommandRunViewState(
+                    payloadObject = payloadObject,
+                    paramsObject = paramsObject,
+                    eventType = commandExecutionEventType(eventObject, paramsObject),
+                ),
+            ),
+            isStreaming = true,
         )
     }
 
@@ -391,38 +709,460 @@ object RemodexConversationReducer {
         eventObject: JsonObject?,
         knownThreadIds: Set<String>,
     ): RemodexConversationState {
-        val itemObject = extractItemObject(paramsObject, eventObject) ?: return conversation
-        if (resolveSystemItemKind(itemObject) != CodexMessageKind.CommandExecution) {
+        val context = resolveCommandExecutionMessageContext(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+        ) ?: return conversation
+        val itemId = context.itemId ?: return conversation
+        val state = decodeCommandRunViewState(
+            payloadObject = eventObject ?: paramsObject,
+            paramsObject = paramsObject,
+            eventType = commandExecutionEventType(eventObject, paramsObject),
+        )
+        val statusText = commandExecutionStatusText(state)
+        val existingRunRow = conversation.messagesFor(context.threadId).firstOrNull { message ->
+            message.role == app.remodex.android.core.model.CodexMessageRole.System &&
+                message.kind == CodexMessageKind.CommandExecution &&
+                message.itemId == itemId
+        }
+
+        if (existingRunRow != null) {
+            if (!existingRunRow.isStreaming && state.phase == CommandRunPhase.Running) {
+                return conversation
+            }
+            if (state.shortCommand.lowercase() != "command" || state.phase != CommandRunPhase.Running) {
+                return publishCommandExecutionStatus(
+                    conversation = conversation,
+                    context = context,
+                    statusText = statusText,
+                    isStreaming = state.phase == CommandRunPhase.Running,
+                )
+            }
             return conversation
         }
 
-        val turnId = extractTurnId(paramsObject, eventObject)
+        return publishCommandExecutionStatus(
+            conversation = conversation,
+            context = context,
+            statusText = statusText,
+            isStreaming = state.phase == CommandRunPhase.Running,
+        )
+    }
+
+    private fun publishCommandExecutionStatus(
+        conversation: RemodexConversationState,
+        context: CommandExecutionMessageContext,
+        statusText: String,
+        isStreaming: Boolean,
+    ): RemodexConversationState {
+        if (!context.itemId.isNullOrBlank()) {
+            return if (isStreaming) {
+                conversation.upsertSystemMessage(
+                    threadId = context.threadId,
+                    kind = CodexMessageKind.CommandExecution,
+                    text = statusText,
+                    turnId = context.turnId,
+                    itemId = context.itemId,
+                    isStreaming = true,
+                )
+            } else {
+                conversation.completeSystemMessage(
+                    threadId = context.threadId,
+                    kind = CodexMessageKind.CommandExecution,
+                    text = statusText,
+                    turnId = context.turnId,
+                    itemId = context.itemId,
+                )
+            }
+        }
+
+        if (!context.turnId.isNullOrBlank()) {
+            return if (isStreaming) {
+                conversation.upsertSystemMessage(
+                    threadId = context.threadId,
+                    kind = CodexMessageKind.CommandExecution,
+                    text = statusText,
+                    turnId = context.turnId,
+                    isStreaming = true,
+                )
+            } else {
+                conversation.completeSystemMessage(
+                    threadId = context.threadId,
+                    kind = CodexMessageKind.CommandExecution,
+                    text = statusText,
+                    turnId = context.turnId,
+                )
+            }
+        }
+
+        return conversation.appendSystemMessage(
+            threadId = context.threadId,
+            kind = CodexMessageKind.CommandExecution,
+            text = statusText,
+            turnId = context.turnId,
+            itemId = context.itemId,
+            isStreaming = isStreaming,
+        )
+    }
+
+    private fun resolveCommandExecutionMessageContext(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+        itemObject: JsonObject? = null,
+    ): CommandExecutionMessageContext? {
+        val turnId = extractTurnId(paramsObject, eventObject, allowTopLevelId = true)
         val threadId = resolveThreadId(
             conversation = conversation,
             paramsObject = paramsObject,
             eventObject = eventObject,
             knownThreadIds = knownThreadIds,
             turnIdHint = turnId,
-        ) ?: return conversation
+        ) ?: return null
+        val resolvedTurnId = normalizeThreadId(turnId) ?: conversation.activeTurnIdByThread[threadId]
         val itemId = extractItemId(paramsObject, eventObject, itemObject)
-        val text = extractCommandExecutionText(
-            itemObject = itemObject,
-            paramsObject = paramsObject,
-            eventObject = eventObject,
-            isCompleted = true,
-        )
-
-        return conversation.completeSystemMessage(
+        return CommandExecutionMessageContext(
             threadId = threadId,
-            kind = CodexMessageKind.CommandExecution,
-            text = text,
-            turnId = turnId,
+            turnId = resolvedTurnId,
             itemId = itemId,
         )
     }
 
+    private fun commandExecutionEventType(eventObject: JsonObject?, paramsObject: JsonObject): String? {
+        return firstNonBlank(
+            eventObject?.get("type")?.stringValue,
+            eventObject?.get("event_type")?.stringValue,
+            paramsObject["type"]?.stringValue,
+            paramsObject["event_type"]?.stringValue,
+        )?.lowercase()
+    }
+
+    private fun commandExecutionStatusText(state: CommandRunViewState): String {
+        val phase = when (state.phase) {
+            CommandRunPhase.Running -> "running"
+            CommandRunPhase.Completed -> "completed"
+            CommandRunPhase.Failed -> "failed"
+            CommandRunPhase.Stopped -> "stopped"
+        }
+        return "$phase ${state.shortCommand}"
+    }
+
+    private fun decodeCommandRunViewState(
+        payloadObject: JsonObject,
+        paramsObject: JsonObject?,
+        eventType: String?,
+    ): CommandRunViewState {
+        val status = firstNonBlank(
+            payloadObject["status"]?.stringValue,
+            payloadObject["result"]?.objectValue?.get("status")?.stringValue,
+            payloadObject["output"]?.objectValue?.get("status")?.stringValue,
+            paramsObject?.get("status")?.stringValue,
+            paramsObject?.get("event")?.objectValue?.get("status")?.stringValue,
+        )
+        val phase = commandRunPhase(status, eventType)
+        val rawCommand = extractCommandExecutionCommand(payloadObject) ?: "command"
+        val shortCommand = shortCommandPreview(rawCommand)
+        val itemId = firstNonBlank(
+            payloadObject["id"]?.stringValue,
+            payloadObject["call_id"]?.stringValue,
+            payloadObject["callId"]?.stringValue,
+            paramsObject?.get("itemId")?.stringValue,
+            paramsObject?.get("item_id")?.stringValue,
+        )
+        return CommandRunViewState(
+            itemId = itemId,
+            phase = phase,
+            shortCommand = shortCommand,
+            fullCommand = rawCommand,
+            activityLine = if (phase == CommandRunPhase.Running) "Running $shortCommand" else null,
+        )
+    }
+
+    private fun extractCommandExecutionCommand(itemObject: JsonObject): String? {
+        extractLegacyCommandArray(itemObject["command"])?.let { return it }
+
+        val candidates = listOf("command", "cmd", "raw_command", "rawCommand", "input", "invocation")
+        for (key in candidates) {
+            firstStringDeep(key, itemObject)?.let { return it }
+        }
+        return null
+    }
+
+    private fun extractLegacyCommandArray(value: JsonValue?): String? {
+        val array = value?.arrayValue ?: return value?.stringValue?.trim()?.takeIf(String::isNotEmpty)
+        val parts = array.mapNotNull { item ->
+            item.stringValue?.trim()?.takeIf(String::isNotEmpty)
+        }
+        return parts.takeIf { it.isNotEmpty() }?.joinToString(separator = " ")
+    }
+
+    private fun shortCommandPreview(rawCommand: String, maxLength: Int = 92): String {
+        val trimmed = rawCommand.trim()
+        if (trimmed.isEmpty()) {
+            return "command"
+        }
+        val compact = trimmed.replace(Regex("\\s+"), " ")
+        val unwrapped = unwrapShellCommandIfPresent(compact)
+        var preview = unwrapped.replace(Regex("\\s+"), " ").trim()
+        if (preview.isEmpty()) {
+            preview = "command"
+        }
+        if (preview.length > maxLength) {
+            preview = preview.take(maxLength - 1) + "..."
+        }
+        return preview
+    }
+
+    private fun unwrapShellCommandIfPresent(command: String): String {
+        val tokens = command.split(Regex("\\s+")).filter(String::isNotBlank)
+        if (tokens.isEmpty()) {
+            return command
+        }
+
+        val shellNames = listOf("bash", "zsh", "sh", "fish")
+        var shellIndex = 0
+        if (tokens.size >= 2) {
+            val first = tokens[0].lowercase()
+            val second = tokens[1].lowercase()
+            if ((first == "env" || first.endsWith("/env")) &&
+                shellNames.any { second == it || second.endsWith("/$it") }
+            ) {
+                shellIndex = 1
+            }
+        }
+
+        val shell = tokens[shellIndex].lowercase()
+        if (shellNames.none { shell == it || shell.endsWith("/$it") }) {
+            return command
+        }
+
+        var index = shellIndex + 1
+        while (index < tokens.size) {
+            val token = tokens[index]
+            if (token == "-c" || token == "-lc" || token == "-cl" || token == "-ic" || token == "-ci") {
+                index += 1
+                return if (index < tokens.size) {
+                    stripWrappingQuotes(tokens.drop(index).joinToString(separator = " "))
+                } else {
+                    command
+                }
+            }
+            if (token.startsWith("-")) {
+                index += 1
+                continue
+            }
+            return stripWrappingQuotes(tokens.drop(index).joinToString(separator = " "))
+        }
+
+        return command
+    }
+
+    private fun stripWrappingQuotes(input: String): String {
+        val trimmed = input.trim()
+        if (trimmed.length < 2) {
+            return trimmed
+        }
+        return if ((trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+            (trimmed.startsWith("\"") && trimmed.endsWith("\""))
+        ) {
+            trimmed.drop(1).dropLast(1)
+        } else {
+            trimmed
+        }
+    }
+
+    private fun commandRunPhase(rawStatus: String?, eventType: String?): CommandRunPhase {
+        val normalizedStatus = rawStatus?.trim()?.lowercase().orEmpty()
+        val normalizedEventType = eventType?.trim()?.lowercase().orEmpty()
+        return when {
+            normalizedStatus.contains("fail") || normalizedStatus.contains("error") -> CommandRunPhase.Failed
+            normalizedStatus.contains("cancel") ||
+                normalizedStatus.contains("abort") ||
+                normalizedStatus.contains("interrupt") -> CommandRunPhase.Stopped
+            normalizedStatus.contains("complete") ||
+                normalizedStatus.contains("success") ||
+                normalizedStatus.contains("done") -> CommandRunPhase.Completed
+            normalizedEventType == "exec_command_end" -> CommandRunPhase.Completed
+            else -> CommandRunPhase.Running
+        }
+    }
+
+    private fun essentialActivityLine(eventType: String, payloadObject: JsonObject): String? {
+        return when (eventType) {
+            "background_event" -> {
+                val message = firstNonBlank(
+                    payloadObject["message"]?.stringValue,
+                    payloadObject["text"]?.stringValue,
+                    payloadObject["body"]?.stringValue,
+                    firstStringDeep("message", payloadObject),
+                    firstStringDeep("text", payloadObject),
+                    firstStringDeep("body", payloadObject),
+                ) ?: return null
+                if (message.length > 140) {
+                    return null
+                }
+                message
+            }
+
+            "read" -> firstNonBlank(
+                firstStringDeep("path", payloadObject),
+                firstStringDeep("file_path", payloadObject),
+                firstStringDeep("file", payloadObject),
+            )?.let { "Read $it" } ?: "Read file"
+
+            "search" -> firstNonBlank(
+                firstStringDeep("query", payloadObject),
+                firstStringDeep("pattern", payloadObject),
+                firstStringDeep("regex", payloadObject),
+            )?.let { "Search $it" } ?: "Search files"
+
+            "list_files" -> firstNonBlank(
+                firstStringDeep("path", payloadObject),
+                firstStringDeep("cwd", payloadObject),
+            )?.let { "List files $it" } ?: "List files"
+
+            else -> null
+        }
+    }
+
+    private fun extractToolCallActivityLines(delta: String): List<String> {
+        val acceptedPrefixes = listOf(
+            "running ",
+            "read ",
+            "search ",
+            "searched ",
+            "exploring ",
+            "list ",
+            "listing ",
+            "open ",
+            "opened ",
+            "find ",
+            "finding ",
+            "edit ",
+            "edited ",
+            "write ",
+            "wrote ",
+            "apply ",
+            "applied ",
+        )
+
+        val seen = mutableSetOf<String>()
+        val result = mutableListOf<String>()
+        for (line in delta.split('\n')) {
+            val trimmed = line.trim()
+            if (trimmed.isEmpty()) {
+                continue
+            }
+            if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+                (trimmed.startsWith("[") && trimmed.endsWith("]"))
+            ) {
+                continue
+            }
+            val normalized = trimmed.lowercase()
+            if (acceptedPrefixes.none(normalized::startsWith)) {
+                continue
+            }
+            if (seen.add(normalized)) {
+                result += trimmed
+            }
+        }
+        return result
+    }
+
+    private fun isLikelyFileChangeToolCall(itemObject: JsonObject?, fallbackText: String?): Boolean {
+        if (itemObject == null) {
+            return looksLikePatchText(fallbackText.orEmpty())
+        }
+
+        val descriptor = buildList {
+            add(itemObject["kind"]?.stringValue)
+            add(itemObject["name"]?.stringValue)
+            add(itemObject["tool"]?.stringValue)
+            add(itemObject["tool_name"]?.stringValue)
+            add(itemObject["toolName"]?.stringValue)
+            add(itemObject["title"]?.stringValue)
+            add(itemObject["tool"]?.objectValue?.get("kind")?.stringValue)
+            add(itemObject["tool"]?.objectValue?.get("name")?.stringValue)
+            add(itemObject["call"]?.objectValue?.get("kind")?.stringValue)
+            add(itemObject["call"]?.objectValue?.get("name")?.stringValue)
+        }.filterNotNull().joinToString(separator = " ")
+            .lowercase()
+            .replace("_", "")
+            .replace("-", "")
+            .replace(" ", "")
+
+        val hasToolHint = descriptor.contains("filechange") ||
+            descriptor.contains("applypatch") ||
+            descriptor.contains("patchapply") ||
+            descriptor.contains("diff") ||
+            descriptor.contains("edit") ||
+            descriptor.contains("write") ||
+            descriptor.contains("rename") ||
+            descriptor.contains("delete") ||
+            descriptor.contains("remove") ||
+            descriptor.contains("create") ||
+            descriptor.contains("add") ||
+            descriptor.contains("move")
+        val hasStructuredChanges = itemObject["changes"] != null
+        val hasDiffPayload = looksLikePatchText(
+            firstNonBlank(
+                itemObject["diff"]?.stringValue,
+                itemObject["unified_diff"]?.stringValue,
+                itemObject["patch"]?.stringValue,
+                firstStringDeep("diff", itemObject),
+                firstStringDeep("unified_diff", itemObject),
+                firstStringDeep("patch", itemObject),
+            ).orEmpty(),
+        )
+        val hasPatchLikeText = looksLikePatchText(fallbackText.orEmpty())
+        return (hasToolHint && (hasStructuredChanges || hasDiffPayload || hasPatchLikeText)) ||
+            hasDiffPayload ||
+            hasPatchLikeText
+    }
+
+    private fun looksLikePatchText(text: String): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) {
+            return false
+        }
+        return trimmed.contains("diff --git ") ||
+            trimmed.contains("\n@@ ") ||
+            trimmed.startsWith("@@ ") ||
+            (trimmed.contains("\n+++ ") && trimmed.contains("\n--- ")) ||
+            (trimmed.contains("\nPath: ") && trimmed.contains("\nKind: "))
+    }
+
     private fun extractEventObject(paramsObject: JsonObject): JsonObject? {
         return paramsObject["msg"]?.objectValue ?: paramsObject["event"]?.objectValue
+    }
+
+    private fun decodePlanSteps(value: JsonValue?): List<CodexPlanStep> {
+        val items = value?.arrayValue ?: return emptyList()
+        return items.mapIndexedNotNull { index, itemValue ->
+            val itemObject = itemValue.objectValue ?: return@mapIndexedNotNull null
+            val step = itemObject["step"]?.stringValue?.trim().orEmpty()
+            val rawStatus = itemObject["status"]?.stringValue?.trim().orEmpty()
+            val status = when (rawStatus) {
+                "pending" -> CodexPlanStepStatus.Pending
+                "in_progress" -> CodexPlanStepStatus.InProgress
+                "completed" -> CodexPlanStepStatus.Completed
+                else -> null
+            } ?: return@mapIndexedNotNull null
+
+            if (step.isEmpty()) {
+                return@mapIndexedNotNull null
+            }
+
+            CodexPlanStep(
+                id = itemObject["id"]?.stringValue?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: "plan-step-$index",
+                step = step,
+                status = status,
+            )
+        }
     }
 
     private fun extractItemObject(paramsObject: JsonObject, eventObject: JsonObject?): JsonObject? {
@@ -729,30 +1469,12 @@ object RemodexConversationReducer {
         eventObject: JsonObject?,
         isCompleted: Boolean,
     ): String {
-        val command = firstNonBlank(
-            itemObject["command"]?.stringValue,
-            itemObject["cmd"]?.stringValue,
-            itemObject["title"]?.stringValue,
-            itemObject["label"]?.stringValue,
-            paramsObject["command"]?.stringValue,
-            eventObject?.get("command")?.stringValue,
-        ).orEmpty().trim()
-        val status = firstNonBlank(
-            itemObject["status"]?.stringValue,
-            paramsObject["status"]?.stringValue,
-            eventObject?.get("status")?.stringValue,
-        )?.trim()
-        val resolvedStatus = if (status.isNullOrEmpty()) {
-            if (isCompleted) "completed" else "running"
-        } else {
-            status
-        }
-
-        return if (command.isNotEmpty()) {
-            "$resolvedStatus $command"
-        } else {
-            "Command $resolvedStatus"
-        }
+        val state = decodeCommandRunViewState(
+            payloadObject = itemObject,
+            paramsObject = paramsObject,
+            eventType = if (isCompleted) "exec_command_end" else "exec_command_begin",
+        )
+        return commandExecutionStatusText(state)
     }
 
     private fun extractFileChangeText(
@@ -931,6 +1653,34 @@ object RemodexConversationReducer {
             return conversation.activeThreadId
         }
 
+        return null
+    }
+
+    private fun normalizeThreadId(threadId: String?): String? {
+        val trimmed = threadId?.trim().orEmpty()
+        return trimmed.ifEmpty { null }
+    }
+
+    private fun firstStringDeep(key: String, root: JsonValue?, maxDepth: Int = 8): String? {
+        if (root == null || maxDepth < 0) {
+            return null
+        }
+
+        val objectValue = root.objectValue
+        if (objectValue != null) {
+            objectValue[key]?.stringValue?.trim()?.takeIf(String::isNotEmpty)?.let { return it }
+            for (value in objectValue.values) {
+                firstStringDeep(key, value, maxDepth - 1)?.let { return it }
+            }
+            return null
+        }
+
+        val arrayValue = root.arrayValue
+        if (arrayValue != null) {
+            for (value in arrayValue) {
+                firstStringDeep(key, value, maxDepth - 1)?.let { return it }
+            }
+        }
         return null
     }
 

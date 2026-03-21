@@ -1,10 +1,13 @@
 package app.remodex.android.core.transport
 
+import app.remodex.android.core.model.CodexImageAttachment
+import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
 import app.remodex.android.core.protocol.RpcMessage
 import java.net.SocketException
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
@@ -406,6 +409,13 @@ class RemodexTransportClientLifecycleTests {
                 },
             ),
         )
+        transport.emitState(
+            RemodexTransportState.Connected(
+                sessionUrl = "ws://test",
+                isInitialized = true,
+                supportsPlanCollaborationMode = true,
+            ),
+        )
 
         transport.startTurn(
             threadId = "thread-live",
@@ -427,6 +437,173 @@ class RemodexTransportClientLifecycleTests {
         val settings = collaboration["settings"] as JsonObject
         assertEquals("gpt-5.4", (settings["model"] as JsonPrimitive).content)
         assertEquals("high", (settings["reasoning_effort"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun startTurnBuildsIosOrderedMixedInputPayload() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/resume") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-live", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("turn/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-1"))),
+                    )
+                },
+            ),
+        )
+
+        transport.startTurn(
+            threadId = "thread-live",
+            userInput = "inspect this",
+            attachments = listOf(
+                CodexImageAttachment(
+                    id = "image-1",
+                    thumbnailBase64JPEG = "thumb",
+                    payloadDataURL = "data:image/jpeg;base64,abc123",
+                ),
+            ),
+            skillMentions = listOf(
+                CodexTurnSkillMention(
+                    id = "planner",
+                    name = "planner",
+                    path = "/skills/planner",
+                ),
+            ),
+        )
+
+        val turnStartParams = transport.recordedParams[1].second as JsonObject
+        val input = turnStartParams["input"] as JsonArray
+
+        val imageItem = input[0] as JsonObject
+        val textItem = input[1] as JsonObject
+        val skillItem = input[2] as JsonObject
+
+        assertEquals("image", (imageItem["type"] as JsonPrimitive).content)
+        assertEquals("data:image/jpeg;base64,abc123", (imageItem["url"] as JsonPrimitive).content)
+        assertEquals("text", (textItem["type"] as JsonPrimitive).content)
+        assertEquals("inspect this", (textItem["text"] as JsonPrimitive).content)
+        assertEquals("skill", (skillItem["type"] as JsonPrimitive).content)
+        assertEquals("planner", (skillItem["id"] as JsonPrimitive).content)
+        assertEquals("planner", (skillItem["name"] as JsonPrimitive).content)
+        assertEquals("/skills/planner", (skillItem["path"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun listSkillsFallsBackToLegacyCwdParameter() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("skills/list") {
+                    throw RemodexTransportException(
+                        kind = RemodexTransportFailureKind.Rpc,
+                        message = "RPC error -32602: unknown field cwds",
+                        rpcError = RpcError(code = -32602, message = "unknown field cwds"),
+                    )
+                },
+                ScriptedStep("skills/list") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "data" to JsonArray(
+                                    listOf(
+                                        JsonObject(
+                                            mapOf(
+                                                "skills" to JsonArray(
+                                                    listOf(
+                                                        JsonObject(
+                                                            mapOf(
+                                                                "name" to JsonPrimitive("planner"),
+                                                                "description" to JsonPrimitive("Planning workflow"),
+                                                                "path" to JsonPrimitive("/skills/planner"),
+                                                                "enabled" to JsonPrimitive(true),
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        val skills = transport.listSkills(cwds = listOf("/tmp/project"))
+
+        assertEquals(listOf("skills/list", "skills/list"), transport.recordedMethods)
+        val firstParams = transport.recordedParams[0].second as JsonObject
+        val secondParams = transport.recordedParams[1].second as JsonObject
+        assertEquals("/tmp/project", ((firstParams["cwds"] as JsonArray)[0] as JsonPrimitive).content)
+        assertEquals("/tmp/project", (secondParams["cwd"] as JsonPrimitive).content)
+        assertEquals(listOf("planner"), skills.map { it.name })
+    }
+
+    @Test
+    fun readThreadDecodesHistoryMessagesWithRealAndSyntheticTimestamps() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/read") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "thread" to JsonObject(
+                                    mapOf(
+                                        "id" to JsonPrimitive("thread-live"),
+                                        "title" to JsonPrimitive("Conversation"),
+                                        "createdAt" to JsonPrimitive("2026-03-22T00:00:00Z"),
+                                        "turns" to JsonArray(
+                                            listOf(
+                                                JsonObject(
+                                                    mapOf(
+                                                        "id" to JsonPrimitive("turn-1"),
+                                                        "createdAt" to JsonPrimitive("2026-03-22T00:00:10Z"),
+                                                        "items" to JsonArray(
+                                                            listOf(
+                                                                JsonObject(
+                                                                    mapOf(
+                                                                        "id" to JsonPrimitive("assistant-1"),
+                                                                        "type" to JsonPrimitive("agentMessage"),
+                                                                        "text" to JsonPrimitive("First reply"),
+                                                                        "createdAt" to JsonPrimitive("2026-03-22T00:00:11Z"),
+                                                                    ),
+                                                                ),
+                                                                JsonObject(
+                                                                    mapOf(
+                                                                        "id" to JsonPrimitive("assistant-2"),
+                                                                        "type" to JsonPrimitive("agentMessage"),
+                                                                        "text" to JsonPrimitive("Second reply"),
+                                                                    ),
+                                                                ),
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        val result = transport.readThread(threadId = "thread-live")
+
+        assertEquals(2, result.messages.size)
+        assertEquals("2026-03-22T00:00:11Z", result.messages[0].createdAt?.toString())
+        assertEquals("2026-03-22T00:00:10.001Z", result.messages[1].createdAt?.toString())
     }
 
     private data class ScriptedStep(
@@ -455,6 +632,14 @@ class RemodexTransportClientLifecycleTests {
             assertEquals(step.expectedMethod, method)
             return step.action(params)
         }
+    }
+
+    private fun ScriptedTransportClient.emitState(state: RemodexTransportState) {
+        val field = RemodexTransportClient::class.java.getDeclaredField("_state")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val stateFlow = field.get(this) as kotlinx.coroutines.flow.MutableStateFlow<RemodexTransportState>
+        stateFlow.value = state
     }
 
     private fun threadEnvelope(

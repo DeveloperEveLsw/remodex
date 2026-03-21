@@ -3,14 +3,23 @@ package app.remodex.android
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import app.remodex.android.core.model.CodexAccessMode
+import app.remodex.android.core.model.CodexApprovalRequest
 import app.remodex.android.core.model.CodexCollaborationModeKind
+import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
+import app.remodex.android.core.model.CodexPlanStep
+import app.remodex.android.core.model.CodexPlanStepStatus
+import app.remodex.android.core.model.CodexStructuredUserInputOption
+import app.remodex.android.core.model.CodexStructuredUserInputQuestion
+import app.remodex.android.core.model.CodexStructuredUserInputRequest
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.model.CodexSkillMetadata
+import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
@@ -23,6 +32,11 @@ import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
+import app.remodex.android.core.protocol.JsonValue
+import app.remodex.android.core.protocol.arrayValue
+import app.remodex.android.core.protocol.boolValue
+import app.remodex.android.core.protocol.objectValue
+import app.remodex.android.core.protocol.stringValue
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +45,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 data class RemodexDebugUiState(
     val qrPayload: String = "",
@@ -51,6 +68,19 @@ data class RemodexDebugUiState(
     val selectedAccessMode: CodexAccessMode = CodexAccessMode.OnRequest,
     val availableCollaborationModes: List<CodexCollaborationModeKind> = listOf(CodexCollaborationModeKind.Default),
     val selectedCollaborationMode: CodexCollaborationModeKind = CodexCollaborationModeKind.Default,
+    val pendingApproval: CodexApprovalRequest? = null,
+    val isHandlingPendingApproval: Boolean = false,
+    val submittingStructuredRequestKeys: Set<String> = emptySet(),
+    val composerMentionedFiles: List<RemodexComposerMentionedFile> = emptyList(),
+    val composerMentionedSkills: List<RemodexComposerMentionedSkill> = emptyList(),
+    val fileAutocompleteItems: List<CodexFuzzyFileMatch> = emptyList(),
+    val isFileAutocompleteVisible: Boolean = false,
+    val isFileAutocompleteLoading: Boolean = false,
+    val fileAutocompleteQuery: String = "",
+    val skillAutocompleteItems: List<CodexSkillMetadata> = emptyList(),
+    val isSkillAutocompleteVisible: Boolean = false,
+    val isSkillAutocompleteLoading: Boolean = false,
+    val skillAutocompleteQuery: String = "",
     val currentGitBranch: String = "",
     val gitDefaultBranch: String = "",
     val selectedGitBaseBranch: String = "",
@@ -115,6 +145,39 @@ private data class RemodexRunningThreadWatch(
     val expiresAtMillis: Long,
 )
 
+data class RemodexComposerMentionedFile(
+    val id: String = UUID.randomUUID().toString(),
+    val fileName: String,
+    val path: String,
+)
+
+data class RemodexComposerMentionedSkill(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val path: String? = null,
+    val description: String? = null,
+)
+
+private data class RemodexTrailingFileAutocompleteToken(
+    val query: String,
+    val tokenRange: IntRange,
+)
+
+private data class RemodexTrailingSkillAutocompleteToken(
+    val query: String,
+    val tokenRange: IntRange,
+)
+
+private data class RemodexTrailingToken(
+    val query: String,
+    val tokenRange: IntRange,
+)
+
+private data class RemodexSkillSearchIndexEntry(
+    val skill: CodexSkillMetadata,
+    val searchBlob: String,
+)
+
 class RemodexDebugViewModel(
     private val transport: RemodexTransportClient = RemodexTransportClient(appVersion = APP_VERSION),
     private val relaySessionStore: RemodexRelaySessionStore = InMemoryRemodexRelaySessionStore(),
@@ -126,12 +189,16 @@ class RemodexDebugViewModel(
     private var threadListSyncJob: Job? = null
     private var activeThreadSyncJob: Job? = null
     private var runningThreadWatchSyncJob: Job? = null
+    private var fileAutocompleteDebounceJob: Job? = null
+    private var skillAutocompleteDebounceJob: Job? = null
     private var gitBranchRefreshThreadId: String? = null
     private var hasAttemptedInitialAutoConnect = false
     private var isAppInForeground = true
     private var isRunningAutoReconnect = false
     private var savedRelayPairing: RemodexPairingPayload? = null
     private val runningThreadWatchById = linkedMapOf<String, RemodexRunningThreadWatch>()
+    private val cachedSkillSearchIndexByRoot = mutableMapOf<String, List<RemodexSkillSearchIndexEntry>>()
+    private val unsupportedSkillsAutocompleteRoots = mutableSetOf<String>()
 
     init {
         restoreSavedRelayPairing()
@@ -176,6 +243,7 @@ class RemodexDebugViewModel(
                 var refreshGitBranchesForActiveThread = false
                 var scheduleGitStatusRefreshForActiveThread = false
                 var activeThreadIdForRefresh: String? = null
+                val resolvedStructuredRequestKey = resolvedStructuredRequestKey(message)
                 _uiState.update { current ->
                     val activeThreadId = current.activeThreadId
                     val previousRepoRefreshSignal = repoRefreshSignal(
@@ -201,6 +269,22 @@ class RemodexDebugViewModel(
                     current.copy(
                         lastNotificationMethod = message.method,
                         conversation = updatedConversation,
+                        pendingApproval = current.pendingApproval?.takeUnless { request ->
+                            resolvedStructuredRequestKey != null &&
+                                serverRequestKey(request.requestID) == resolvedStructuredRequestKey
+                        },
+                        isHandlingPendingApproval = if (
+                            resolvedStructuredRequestKey != null &&
+                            current.pendingApproval != null &&
+                            serverRequestKey(current.pendingApproval.requestID) == resolvedStructuredRequestKey
+                        ) {
+                            false
+                        } else {
+                            current.isHandlingPendingApproval
+                        },
+                        submittingStructuredRequestKeys = resolvedStructuredRequestKey?.let { requestKey ->
+                            current.submittingStructuredRequestKeys - requestKey
+                        } ?: current.submittingStructuredRequestKeys,
                     )
                 }
                 if (refreshGitBranchesForActiveThread) {
@@ -217,6 +301,13 @@ class RemodexDebugViewModel(
             transport.serverRequests.collect { message ->
                 _uiState.update { current ->
                     current.copy(lastServerRequestMethod = message.method)
+                }
+                runCatching {
+                    handleServerRequest(message)
+                }.onFailure { throwable ->
+                    _uiState.update { current ->
+                        current.copy(errorMessage = throwable.message)
+                    }
                 }
             }
         }
@@ -274,6 +365,7 @@ class RemodexDebugViewModel(
                 errorMessage = null,
             )
         }
+        refreshComposerAutocomplete(value)
     }
 
     fun selectRuntimeModel(modelId: String?) {
@@ -317,6 +409,154 @@ class RemodexDebugViewModel(
                 },
                 errorMessage = null,
             )
+        }
+    }
+
+    fun selectFileAutocomplete(item: CodexFuzzyFileMatch) {
+        val fullPath = item.path.trim().ifEmpty { item.fileName }
+        val updatedInput = replacingTrailingFileAutocompleteToken(
+            text = _uiState.value.draftTurnInput,
+            selectedPath = item.fileName,
+        ) ?: _uiState.value.draftTurnInput
+
+        _uiState.update { current ->
+            current.copy(
+                draftTurnInput = updatedInput,
+                composerMentionedFiles = if (current.composerMentionedFiles.any { it.path == fullPath }) {
+                    current.composerMentionedFiles
+                } else {
+                    current.composerMentionedFiles + RemodexComposerMentionedFile(
+                        fileName = item.fileName,
+                        path = fullPath,
+                    )
+                },
+                fileAutocompleteItems = emptyList(),
+                isFileAutocompleteVisible = false,
+                isFileAutocompleteLoading = false,
+                fileAutocompleteQuery = "",
+            )
+        }
+        resetFileAutocompleteState()
+    }
+
+    fun selectSkillAutocomplete(skill: CodexSkillMetadata) {
+        val normalizedSkillName = skill.name.trim()
+        if (normalizedSkillName.isEmpty()) {
+            resetSkillAutocompleteState()
+            return
+        }
+
+        val updatedInput = replacingTrailingSkillAutocompleteToken(
+            text = _uiState.value.draftTurnInput,
+            selectedSkill = normalizedSkillName,
+        ) ?: _uiState.value.draftTurnInput
+
+        _uiState.update { current ->
+            current.copy(
+                draftTurnInput = updatedInput,
+                composerMentionedSkills = if (
+                    current.composerMentionedSkills.any { it.name.equals(normalizedSkillName, ignoreCase = true) }
+                ) {
+                    current.composerMentionedSkills
+                } else {
+                    current.composerMentionedSkills + RemodexComposerMentionedSkill(
+                        name = normalizedSkillName,
+                        path = skill.path?.trim()?.takeIf(String::isNotEmpty),
+                        description = skill.description,
+                    )
+                },
+                skillAutocompleteItems = emptyList(),
+                isSkillAutocompleteVisible = false,
+                isSkillAutocompleteLoading = false,
+                skillAutocompleteQuery = "",
+            )
+        }
+        resetSkillAutocompleteState()
+    }
+
+    fun removeMentionedFile(id: String) {
+        _uiState.update { current ->
+            val mention = current.composerMentionedFiles.firstOrNull { it.id == id } ?: return@update current
+            val ambiguousKeys = ambiguousFileNameAliasKeys(current.composerMentionedFiles)
+            val collisionKey = fileNameAliasCollisionKey(mention.fileName)
+            val allowFileNameAliases = collisionKey?.let { it !in ambiguousKeys } ?: true
+
+            current.copy(
+                draftTurnInput = removingFileMentionAliases(
+                    mention = mention,
+                    text = current.draftTurnInput,
+                    allowFileNameAliases = allowFileNameAliases,
+                ),
+                composerMentionedFiles = current.composerMentionedFiles.filterNot { it.id == id },
+            )
+        }
+    }
+
+    fun removeMentionedSkill(id: String) {
+        _uiState.update { current ->
+            val mention = current.composerMentionedSkills.firstOrNull { it.id == id } ?: return@update current
+            current.copy(
+                draftTurnInput = removeBoundedToken(
+                    token = "${'$'}${mention.name}",
+                    text = current.draftTurnInput,
+                    caseInsensitive = false,
+                ),
+                composerMentionedSkills = current.composerMentionedSkills.filterNot { it.id == id },
+            )
+        }
+    }
+
+    fun approvePendingRequest() {
+        respondToPendingApproval(decision = "accept")
+    }
+
+    fun declinePendingRequest() {
+        respondToPendingApproval(decision = "decline")
+    }
+
+    fun respondToStructuredUserInput(
+        requestID: JsonValue,
+        answersByQuestionID: Map<String, List<String>>,
+    ) {
+        val requestKey = serverRequestKey(requestID)
+        if (requestKey.isBlank()) {
+            return
+        }
+
+        val normalizedAnswers = answersByQuestionID
+            .mapValues { (_, answers) ->
+                answers.map(String::trim).filter(String::isNotEmpty)
+            }
+            .filterValues(List<String>::isNotEmpty)
+        if (normalizedAnswers.isEmpty()) {
+            return
+        }
+
+        _uiState.update { current ->
+            if (requestKey in current.submittingStructuredRequestKeys) {
+                current
+            } else {
+                current.copy(
+                    submittingStructuredRequestKeys = current.submittingStructuredRequestKeys + requestKey,
+                    errorMessage = null,
+                )
+            }
+        }
+
+        viewModelScope.launch {
+            runCatching {
+                transport.sendResponse(
+                    id = requestID,
+                    result = buildStructuredUserInputResponse(normalizedAnswers),
+                )
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    current.copy(
+                        submittingStructuredRequestKeys = current.submittingStructuredRequestKeys - requestKey,
+                        errorMessage = throwable.message,
+                    )
+                }
+            }
         }
     }
 
@@ -392,6 +632,8 @@ class RemodexDebugViewModel(
 
     fun disconnect() {
         viewModelScope.launch {
+            resetFileAutocompleteState()
+            resetSkillAutocompleteState()
             gitStatusRefreshJob?.cancel()
             gitStatusRefreshJob = null
             gitBranchRefreshThreadId = null
@@ -416,8 +658,21 @@ class RemodexDebugViewModel(
                     threads = emptyList(),
                     conversation = RemodexConversationState(),
                     draftTurnInput = "",
+                    composerMentionedFiles = emptyList(),
+                    composerMentionedSkills = emptyList(),
+                    fileAutocompleteItems = emptyList(),
+                    isFileAutocompleteVisible = false,
+                    isFileAutocompleteLoading = false,
+                    fileAutocompleteQuery = "",
+                    skillAutocompleteItems = emptyList(),
+                    isSkillAutocompleteVisible = false,
+                    isSkillAutocompleteLoading = false,
+                    skillAutocompleteQuery = "",
                     lastStartedTurnId = null,
                     lastTurnStartSummary = null,
+                    pendingApproval = null,
+                    isHandlingPendingApproval = false,
+                    submittingStructuredRequestKeys = emptySet(),
                     errorMessage = null,
                 )
             }
@@ -509,6 +764,9 @@ class RemodexDebugViewModel(
                         isBusy = false,
                         isAttemptingAutoReconnect = false,
                         shouldAutoReconnectOnForeground = false,
+                        pendingApproval = null,
+                        isHandlingPendingApproval = false,
+                        submittingStructuredRequestKeys = emptySet(),
                     )
                 }
             }
@@ -554,6 +812,9 @@ class RemodexDebugViewModel(
             _uiState.update { current ->
                 current.copy(
                     isBusy = false,
+                    pendingApproval = null,
+                    isHandlingPendingApproval = false,
+                    submittingStructuredRequestKeys = emptySet(),
                     errorMessage = state.message,
                 )
             }
@@ -567,6 +828,9 @@ class RemodexDebugViewModel(
                 isBusy = false,
                 shouldAutoReconnectOnForeground = shouldSuppressMessage || shouldAttemptAutoRecovery,
                 isAttemptingAutoReconnect = false,
+                pendingApproval = null,
+                isHandlingPendingApproval = false,
+                submittingStructuredRequestKeys = emptySet(),
                 errorMessage = if (shouldSuppressMessage || shouldAttemptAutoRecovery) {
                     null
                 } else {
@@ -1181,8 +1445,19 @@ class RemodexDebugViewModel(
         viewModelScope.launch {
             val currentState = _uiState.value
             val selectedThreadId = currentState.activeThreadId
-            val trimmedInput = currentState.draftTurnInput.trim()
-            if (trimmedInput.isEmpty()) {
+            val payload = buildPayloadWithMentions(
+                text = currentState.draftTurnInput,
+                mentions = currentState.composerMentionedFiles,
+            )
+            val trimmedPayload = payload.trim()
+            val skillMentions = currentState.composerMentionedSkills.map {
+                CodexTurnSkillMention(
+                    id = it.name,
+                    name = it.name,
+                    path = it.path,
+                )
+            }
+            if (trimmedPayload.isEmpty()) {
                 _uiState.update { current ->
                     current.copy(errorMessage = "Enter a prompt before sending a turn.")
                 }
@@ -1190,6 +1465,9 @@ class RemodexDebugViewModel(
             }
 
             val pendingMessageId = selectedThreadId?.takeIf(String::isNotBlank)?.let { UUID.randomUUID().toString() }
+            val rawInput = currentState.draftTurnInput
+            val rawFileMentions = currentState.composerMentionedFiles
+            val rawSkillMentions = currentState.composerMentionedSkills
 
             _uiState.update { current ->
                 val updatedConversation = if (pendingMessageId != null && !selectedThreadId.isNullOrBlank()) {
@@ -1197,7 +1475,7 @@ class RemodexDebugViewModel(
                         .withActiveThread(selectedThreadId)
                         .appendUserMessage(
                             threadId = selectedThreadId,
-                            text = trimmedInput,
+                            text = trimmedPayload,
                             messageId = pendingMessageId,
                         )
                 } else {
@@ -1206,15 +1484,28 @@ class RemodexDebugViewModel(
 
                 current.copy(
                     conversation = updatedConversation,
+                    draftTurnInput = "",
+                    composerMentionedFiles = emptyList(),
+                    composerMentionedSkills = emptyList(),
+                    fileAutocompleteItems = emptyList(),
+                    isFileAutocompleteVisible = false,
+                    isFileAutocompleteLoading = false,
+                    fileAutocompleteQuery = "",
+                    skillAutocompleteItems = emptyList(),
+                    isSkillAutocompleteVisible = false,
+                    isSkillAutocompleteLoading = false,
+                    skillAutocompleteQuery = "",
                     isStartingTurn = true,
                     errorMessage = null,
                 )
             }
+            resetFileAutocompleteState()
+            resetSkillAutocompleteState()
 
             runCatching {
                 transport.startTurn(
                     threadId = selectedThreadId,
-                    userInput = trimmedInput,
+                    userInput = trimmedPayload,
                     accessMode = currentState.selectedAccessMode,
                     collaborationMode = currentState.selectedCollaborationMode.takeUnless {
                         it == CodexCollaborationModeKind.Default
@@ -1224,12 +1515,13 @@ class RemodexDebugViewModel(
                         ?.cwd,
                     modelIdentifier = currentState.selectedModelOption?.model,
                     reasoningEffort = currentState.selectedReasoningEffort,
+                    skillMentions = skillMentions,
                 )
             }.onSuccess { result ->
                 applyTurnStarted(
                     result = result,
                     pendingMessageId = pendingMessageId,
-                    pendingMessageText = trimmedInput,
+                    pendingMessageText = trimmedPayload,
                     requestedThreadId = selectedThreadId ?: result.requestedThreadId,
                 )
             }.onFailure { throwable ->
@@ -1246,10 +1538,14 @@ class RemodexDebugViewModel(
 
                     current.copy(
                         conversation = updatedConversation,
+                        draftTurnInput = rawInput,
+                        composerMentionedFiles = rawFileMentions,
+                        composerMentionedSkills = rawSkillMentions,
                         isStartingTurn = false,
                         errorMessage = throwable.message,
                     )
                 }
+                refreshComposerAutocomplete(rawInput)
             }
         }
     }
@@ -1310,6 +1606,846 @@ class RemodexDebugViewModel(
         }
     }
 
+    private fun refreshComposerAutocomplete(text: String) {
+        val currentState = _uiState.value
+        if (currentState.isStartingTurn || currentState.isStartingThread) {
+            clearFileAutocompleteState()
+            clearSkillAutocompleteState()
+            return
+        }
+        refreshFileAutocomplete(text)
+        refreshSkillAutocomplete(text)
+    }
+
+    private fun refreshFileAutocomplete(text: String) {
+        val currentState = _uiState.value
+        val selectedThread = currentState.threads.firstOrNull { it.id == currentState.activeThreadId }
+        val root = selectedThread?.let(::normalizedAutocompleteRoot)
+        val token = trailingFileAutocompleteToken(text)
+        val isConnected = isTransportConnectedAndInitialized()
+        if (!isConnected || selectedThread == null || root == null || token == null) {
+            clearFileAutocompleteState()
+            return
+        }
+
+        clearSkillAutocompleteState()
+
+        val query = token.query.trim()
+        if (query.length < MIN_AUTOCOMPLETE_QUERY_LENGTH) {
+            resetFileAutocompleteState()
+            _uiState.update { current ->
+                current.copy(
+                    fileAutocompleteItems = emptyList(),
+                    isFileAutocompleteVisible = false,
+                    isFileAutocompleteLoading = false,
+                    fileAutocompleteQuery = query,
+                )
+            }
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                fileAutocompleteQuery = query,
+                isFileAutocompleteVisible = true,
+                isFileAutocompleteLoading = true,
+            )
+        }
+        resetFileAutocompleteState()
+
+        val expectedQuery = query
+        val searchRoots = listOf(root)
+        val cancellationToken = fileAutocompleteCancellationToken(selectedThread.id)
+        fileAutocompleteDebounceJob = viewModelScope.launch {
+            delay(AUTOCOMPLETE_DEBOUNCE_MILLIS)
+            runCatching {
+                transport.fuzzyFileSearch(
+                    query = expectedQuery,
+                    roots = searchRoots,
+                    cancellationToken = cancellationToken,
+                )
+            }.onSuccess { matches ->
+                _uiState.update { current ->
+                    if (current.fileAutocompleteQuery != expectedQuery) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        fileAutocompleteItems = matches.take(MAX_FILE_AUTOCOMPLETE_ITEMS),
+                        isFileAutocompleteLoading = false,
+                        isFileAutocompleteVisible = true,
+                    )
+                }
+            }.onFailure {
+                _uiState.update { current ->
+                    if (current.fileAutocompleteQuery != expectedQuery) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        fileAutocompleteItems = emptyList(),
+                        isFileAutocompleteLoading = false,
+                        isFileAutocompleteVisible = false,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun refreshSkillAutocomplete(text: String) {
+        val currentState = _uiState.value
+        val selectedThread = currentState.threads.firstOrNull { it.id == currentState.activeThreadId }
+        val root = selectedThread?.let(::normalizedAutocompleteRoot)
+        val token = trailingSkillAutocompleteToken(text)
+        val isConnected = isTransportConnectedAndInitialized()
+        if (!isConnected || selectedThread == null || root == null || token == null) {
+            clearSkillAutocompleteState()
+            return
+        }
+
+        clearFileAutocompleteState()
+
+        val query = token.query.trim()
+        if (query.length < MIN_AUTOCOMPLETE_QUERY_LENGTH) {
+            resetSkillAutocompleteState()
+            _uiState.update { current ->
+                current.copy(
+                    skillAutocompleteItems = emptyList(),
+                    isSkillAutocompleteVisible = false,
+                    isSkillAutocompleteLoading = false,
+                    skillAutocompleteQuery = query,
+                )
+            }
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                skillAutocompleteQuery = query,
+                isSkillAutocompleteVisible = true,
+                isSkillAutocompleteLoading = cachedSkillSearchIndexByRoot[root] == null &&
+                    root !in unsupportedSkillsAutocompleteRoots,
+            )
+        }
+        resetSkillAutocompleteState()
+
+        val expectedQuery = query
+        skillAutocompleteDebounceJob = viewModelScope.launch {
+            delay(AUTOCOMPLETE_DEBOUNCE_MILLIS)
+
+            if (root in unsupportedSkillsAutocompleteRoots &&
+                cachedSkillSearchIndexByRoot[root] == null
+            ) {
+                _uiState.update { current ->
+                    if (current.skillAutocompleteQuery != expectedQuery) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        skillAutocompleteItems = emptyList(),
+                        isSkillAutocompleteLoading = false,
+                        isSkillAutocompleteVisible = false,
+                    )
+                }
+                return@launch
+            }
+
+            runCatching {
+                cachedSkillSearchIndexByRoot[root] ?: transport.listSkills(
+                    cwds = listOf(root),
+                    forceReload = false,
+                ).filter(CodexSkillMetadata::enabled)
+                    .map { skill ->
+                        RemodexSkillSearchIndexEntry(
+                            skill = skill,
+                            searchBlob = buildSkillSearchBlob(skill),
+                        )
+                    }.also { cachedSkillSearchIndexByRoot[root] = it }
+            }.onSuccess { indexedSkills ->
+                _uiState.update { current ->
+                    if (current.skillAutocompleteQuery != expectedQuery) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        skillAutocompleteItems = filteredSkillAutocompleteItems(expectedQuery, indexedSkills),
+                        isSkillAutocompleteLoading = false,
+                        isSkillAutocompleteVisible = true,
+                    )
+                }
+            }.onFailure { throwable ->
+                if (isMethodNotFoundRpcError(throwable)) {
+                    unsupportedSkillsAutocompleteRoots += root
+                }
+                _uiState.update { current ->
+                    if (current.skillAutocompleteQuery != expectedQuery) {
+                        return@update current
+                    }
+
+                    current.copy(
+                        skillAutocompleteItems = emptyList(),
+                        isSkillAutocompleteLoading = false,
+                        isSkillAutocompleteVisible = false,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun clearFileAutocompleteState() {
+        resetFileAutocompleteState()
+        _uiState.update { current ->
+            current.copy(
+                fileAutocompleteItems = emptyList(),
+                isFileAutocompleteVisible = false,
+                isFileAutocompleteLoading = false,
+                fileAutocompleteQuery = "",
+            )
+        }
+    }
+
+    private fun clearSkillAutocompleteState() {
+        resetSkillAutocompleteState()
+        _uiState.update { current ->
+            current.copy(
+                skillAutocompleteItems = emptyList(),
+                isSkillAutocompleteVisible = false,
+                isSkillAutocompleteLoading = false,
+                skillAutocompleteQuery = "",
+            )
+        }
+    }
+
+    private fun resetFileAutocompleteState() {
+        fileAutocompleteDebounceJob?.cancel()
+        fileAutocompleteDebounceJob = null
+    }
+
+    private fun resetSkillAutocompleteState() {
+        skillAutocompleteDebounceJob?.cancel()
+        skillAutocompleteDebounceJob = null
+    }
+
+    private fun normalizedAutocompleteRoot(thread: CodexThread): String? {
+        return thread.normalizedProjectPath
+            ?: thread.cwd?.trim()?.takeIf(String::isNotEmpty)
+    }
+
+    private fun fileAutocompleteCancellationToken(threadId: String): String {
+        return "android-at-file-$threadId"
+    }
+
+    private fun buildSkillSearchBlob(skill: CodexSkillMetadata): String {
+        val name = skill.name.lowercase()
+        val description = skill.description?.lowercase().orEmpty()
+        return if (description.isEmpty()) {
+            name
+        } else {
+            "$name $description"
+        }
+    }
+
+    private fun filteredSkillAutocompleteItems(
+        query: String,
+        indexedSkills: List<RemodexSkillSearchIndexEntry>,
+    ): List<CodexSkillMetadata> {
+        val needle = query.lowercase()
+        return indexedSkills.asSequence()
+            .filter { it.searchBlob.contains(needle) }
+            .map(RemodexSkillSearchIndexEntry::skill)
+            .take(MAX_SKILL_AUTOCOMPLETE_ITEMS)
+            .toList()
+    }
+
+    private fun buildPayloadWithMentions(
+        text: String,
+        mentions: List<RemodexComposerMentionedFile>,
+    ): String {
+        var payload = text.trim()
+        if (mentions.isEmpty()) {
+            return payload
+        }
+
+        val ambiguousKeys = ambiguousFileNameAliasKeys(mentions)
+        for (mention in mentions) {
+            val collisionKey = fileNameAliasCollisionKey(mention.fileName)
+            val allowFileNameAliases = collisionKey?.let { it !in ambiguousKeys } ?: true
+            payload = replacingFileMentionAliases(
+                text = payload,
+                mention = mention,
+                allowFileNameAliases = allowFileNameAliases,
+            )
+        }
+
+        return payload
+    }
+
+    private fun trailingFileAutocompleteToken(text: String): RemodexTrailingFileAutocompleteToken? {
+        if (text.isEmpty() || text.last().isWhitespace()) {
+            return null
+        }
+
+        val triggerIndex = text.lastIndexOf('@')
+        if (triggerIndex < 0) {
+            return null
+        }
+        if (triggerIndex > 0 && !text[triggerIndex - 1].isWhitespace()) {
+            return null
+        }
+
+        val rawQuery = text.substring(triggerIndex + 1)
+        val query = rawQuery.trim()
+        if (query.isEmpty() || rawQuery.any { it == '\n' || it == '\r' }) {
+            return null
+        }
+        if (query.any(Char::isWhitespace)) {
+            val looksFileLike = query.contains('/') || query.contains('\\') || query.contains('.')
+            if (!looksFileLike) {
+                return null
+            }
+        }
+
+        return RemodexTrailingFileAutocompleteToken(
+            query = query,
+            tokenRange = triggerIndex..text.lastIndex,
+        )
+    }
+
+    private fun trailingSkillAutocompleteToken(text: String): RemodexTrailingSkillAutocompleteToken? {
+        val token = trailingToken(text, '$') ?: return null
+        if (!token.query.any(Char::isLetter)) {
+            return null
+        }
+
+        return RemodexTrailingSkillAutocompleteToken(
+            query = token.query,
+            tokenRange = token.tokenRange,
+        )
+    }
+
+    private fun trailingToken(text: String, trigger: Char): RemodexTrailingToken? {
+        if (text.isEmpty()) {
+            return null
+        }
+
+        var tokenStart = 0
+        for (index in text.lastIndex downTo 0) {
+            if (text[index].isWhitespace()) {
+                tokenStart = index + 1
+                break
+            }
+        }
+
+        if (tokenStart >= text.length || text[tokenStart] != trigger) {
+            return null
+        }
+
+        val query = text.substring(tokenStart + 1)
+        if (query.isEmpty() || query.any(Char::isWhitespace)) {
+            return null
+        }
+
+        return RemodexTrailingToken(
+            query = query,
+            tokenRange = tokenStart..text.lastIndex,
+        )
+    }
+
+    private fun replacingTrailingFileAutocompleteToken(text: String, selectedPath: String): String? {
+        val trimmedPath = selectedPath.trim()
+        val token = trailingFileAutocompleteToken(text) ?: return null
+        if (trimmedPath.isEmpty()) {
+            return null
+        }
+
+        return text.replaceRange(token.tokenRange.first, token.tokenRange.last + 1, "@$trimmedPath ")
+    }
+
+    private fun replacingTrailingSkillAutocompleteToken(text: String, selectedSkill: String): String? {
+        val trimmedSkill = selectedSkill.trim()
+        val token = trailingSkillAutocompleteToken(text) ?: return null
+        if (trimmedSkill.isEmpty()) {
+            return null
+        }
+
+        return text.replaceRange(token.tokenRange.first, token.tokenRange.last + 1, "${'$'}$trimmedSkill ")
+    }
+
+    private fun replacingFileMentionAliases(
+        text: String,
+        mention: RemodexComposerMentionedFile,
+        allowFileNameAliases: Boolean,
+    ): String {
+        val replacement = "@${mention.path}"
+        val placeholder = "__remodex_file_mention__${mention.path.hashCode()}__"
+        val replacedText = fileMentionAliases(
+            fileName = mention.fileName,
+            path = mention.path,
+            allowFileNameAliases = allowFileNameAliases,
+        ).fold(text) { partialText, alias ->
+            replaceBoundedToken(
+                token = "@$alias",
+                replacement = placeholder,
+                text = partialText,
+                caseInsensitive = true,
+            )
+        }
+        return replacedText.replace(placeholder, replacement)
+    }
+
+    private fun removingFileMentionAliases(
+        mention: RemodexComposerMentionedFile,
+        text: String,
+        allowFileNameAliases: Boolean,
+    ): String {
+        return fileMentionAliases(
+            fileName = mention.fileName,
+            path = mention.path,
+            allowFileNameAliases = allowFileNameAliases,
+        ).fold(text) { partialText, alias ->
+            removeBoundedToken(
+                token = "@$alias",
+                text = partialText,
+                caseInsensitive = true,
+            )
+        }
+    }
+
+    private fun fileMentionAliases(
+        fileName: String,
+        path: String,
+        allowFileNameAliases: Boolean,
+    ): List<String> {
+        val aliases = linkedSetOf<String>()
+        val seeds = mutableListOf(path, deletingPathExtension(path))
+        if (allowFileNameAliases) {
+            seeds.add(0, fileName)
+            seeds += deletingPathExtension(fileName)
+        }
+
+        for (seed in seeds) {
+            val trimmedSeed = seed.trim()
+            if (trimmedSeed.isEmpty()) {
+                continue
+            }
+            aliases += trimmedSeed
+            appendNormalizedFileMentionAliases(trimmedSeed, aliases)
+        }
+
+        return aliases
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .sortedWith(compareByDescending<String> { it.length }.thenBy { it.lowercase() })
+    }
+
+    private fun appendNormalizedFileMentionAliases(seed: String, aliases: MutableSet<String>) {
+        val trimmedSeed = seed.trim()
+        if (trimmedSeed.isEmpty()) {
+            return
+        }
+
+        val extension = trimmedSeed.substringAfterLast('.', "")
+            .takeIf { '.' in trimmedSeed && it.isNotEmpty() }
+            ?.lowercase()
+            .orEmpty()
+        val stem = if (extension.isEmpty()) trimmedSeed else trimmedSeed.substringBeforeLast('.')
+        val tokens = mentionSearchTokens(stem)
+        if (tokens.isEmpty()) {
+            return
+        }
+
+        val baseVariants = linkedSetOf(
+            tokens.joinToString(" "),
+            tokens.joinToString("-"),
+            tokens.joinToString("_"),
+            tokens.joinToString(""),
+            lowerCamelCase(tokens),
+            upperCamelCase(tokens),
+        ).filter(String::isNotEmpty)
+
+        for (variant in baseVariants) {
+            aliases += variant
+            if (extension.isNotEmpty()) {
+                aliases += "$variant.$extension"
+            }
+        }
+    }
+
+    private fun mentionSearchTokens(value: String): List<String> {
+        val trimmedValue = value.trim()
+        if (trimmedValue.isEmpty()) {
+            return emptyList()
+        }
+
+        return trimmedValue
+            .split(Regex("[^A-Za-z0-9]+"))
+            .filter(String::isNotEmpty)
+            .flatMap(::tokensFromMentionSegment)
+    }
+
+    private fun tokensFromMentionSegment(segment: String): List<String> {
+        val trimmedSegment = segment.trim()
+        if (trimmedSegment.isEmpty()) {
+            return emptyList()
+        }
+
+        val rawTokens = FILE_MENTION_SEGMENT_REGEX.findAll(trimmedSegment)
+            .map { it.value }
+            .toList()
+            .ifEmpty { listOf(trimmedSegment.lowercase()) }
+
+        val normalizedTokens = mutableListOf<String>()
+        var index = 0
+        while (index < rawTokens.size) {
+            val token = rawTokens[index]
+            if (token.length == 1 &&
+                token == token.lowercase() &&
+                index + 1 < rawTokens.size &&
+                isAllCapsAcronym(rawTokens[index + 1])
+            ) {
+                normalizedTokens += (token + rawTokens[index + 1]).lowercase()
+                index += 2
+                continue
+            }
+
+            normalizedTokens += token.lowercase()
+            index += 1
+        }
+        return normalizedTokens
+    }
+
+    private fun isAllCapsAcronym(token: String): Boolean {
+        return token.length > 1 && token.all { it.isUpperCase() || it.isDigit() }
+    }
+
+    private fun lowerCamelCase(tokens: List<String>): String {
+        val first = tokens.firstOrNull() ?: return ""
+        return first + tokens.drop(1).joinToString("") { capitalizedToken(it) }
+    }
+
+    private fun upperCamelCase(tokens: List<String>): String {
+        return tokens.joinToString("") { capitalizedToken(it) }
+    }
+
+    private fun capitalizedToken(token: String): String {
+        return token.replaceFirstChar { character ->
+            if (character.isLowerCase()) character.titlecase() else character.toString()
+        }
+    }
+
+    private fun deletingPathExtension(value: String): String {
+        val trimmedValue = value.trim()
+        if (trimmedValue.isEmpty()) {
+            return ""
+        }
+        val lastDotIndex = trimmedValue.lastIndexOf('.')
+        return if (lastDotIndex <= 0) {
+            trimmedValue
+        } else {
+            trimmedValue.substring(0, lastDotIndex)
+        }
+    }
+
+    private fun fileNameAliasCollisionKey(fileName: String): String? {
+        val trimmedName = fileName.trim()
+        if (trimmedName.isEmpty()) {
+            return null
+        }
+
+        val extension = trimmedName.substringAfterLast('.', "")
+            .takeIf { '.' in trimmedName && it.isNotEmpty() }
+            ?.lowercase()
+            .orEmpty()
+        val stem = deletingPathExtension(trimmedName)
+        val tokens = mentionSearchTokens(stem)
+        if (tokens.isEmpty()) {
+            return if (extension.isEmpty()) null else ".$extension"
+        }
+
+        val tokenKey = tokens.joinToString("|")
+        return if (extension.isEmpty()) tokenKey else "$tokenKey.$extension"
+    }
+
+    private fun ambiguousFileNameAliasKeys(mentions: List<RemodexComposerMentionedFile>): Set<String> {
+        return mentions.mapNotNull { fileNameAliasCollisionKey(it.fileName) }
+            .groupingBy { it }
+            .eachCount()
+            .filterValues { it > 1 }
+            .keys
+    }
+
+    private fun replaceBoundedToken(
+        token: String,
+        replacement: String,
+        text: String,
+        caseInsensitive: Boolean,
+    ): String {
+        val regex = Regex(
+            pattern = Regex.escape(token) + "(?=[\\s,.;:!?)\\]}>]|$)",
+            options = if (caseInsensitive) setOf(RegexOption.IGNORE_CASE) else emptySet(),
+        )
+        return regex.replace(text, replacement)
+    }
+
+    private fun removeBoundedToken(
+        token: String,
+        text: String,
+        caseInsensitive: Boolean,
+    ): String {
+        val regex = Regex(
+            pattern = Regex.escape(token) + "(?:[\\s,.;:!?)\\]}>]|$)",
+            options = if (caseInsensitive) setOf(RegexOption.IGNORE_CASE) else emptySet(),
+        )
+        return regex.replaceFirst(text, "")
+    }
+
+    private fun isMethodNotFoundRpcError(throwable: Throwable): Boolean {
+        val message = throwable.message?.lowercase().orEmpty()
+        return message.contains("method not found") ||
+            message.contains("unsupported") ||
+            message.contains("code -32601")
+    }
+
+    private fun respondToPendingApproval(decision: String) {
+        val pendingApproval = _uiState.value.pendingApproval ?: return
+        if (_uiState.value.isHandlingPendingApproval) {
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                isHandlingPendingApproval = true,
+                errorMessage = null,
+            )
+        }
+
+        viewModelScope.launch {
+            runCatching {
+                transport.sendResponse(
+                    id = pendingApproval.requestID,
+                    result = JsonPrimitive(decision),
+                )
+            }.onSuccess {
+                _uiState.update { current ->
+                    current.copy(
+                        pendingApproval = current.pendingApproval?.takeUnless { it.id == pendingApproval.id },
+                        isHandlingPendingApproval = false,
+                        errorMessage = null,
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update { current ->
+                    current.copy(
+                        isHandlingPendingApproval = false,
+                        errorMessage = throwable.message,
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun handleServerRequest(message: app.remodex.android.core.protocol.RpcMessage) {
+        val method = message.method?.trim().orEmpty()
+        val requestID = message.id ?: return
+        val normalizedMethod = normalizeServerRequestMethod(method)
+
+        when {
+            normalizedMethod == "item/tool/requestuserinput" -> {
+                handleStructuredUserInputRequest(
+                    requestID = requestID,
+                    paramsObject = message.params?.objectValue,
+                )
+            }
+
+            normalizedMethod.endsWith("requestapproval") -> {
+                handleApprovalRequest(
+                    method = method,
+                    requestID = requestID,
+                    params = message.params,
+                )
+            }
+
+            else -> {
+                transport.sendErrorResponse(
+                    id = requestID,
+                    code = -32601,
+                    message = "Unsupported request method: $method",
+                )
+            }
+        }
+    }
+
+    private fun handleStructuredUserInputRequest(
+        requestID: JsonValue,
+        paramsObject: JsonObject?,
+    ) {
+        val threadId = paramsObject.resolveRequestString("threadId", "thread_id") ?: return
+        val turnId = paramsObject.resolveRequestString("turnId", "turn_id") ?: return
+        val itemId = paramsObject.resolveRequestString("itemId", "item_id")
+            ?: "request-${serverRequestKey(requestID)}"
+        val questions = decodeStructuredUserInputQuestions(paramsObject?.get("questions"))
+        if (questions.isEmpty()) {
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                conversation = current.conversation.upsertStructuredUserInputPrompt(
+                    threadId = threadId,
+                    turnId = turnId,
+                    itemId = itemId,
+                    request = CodexStructuredUserInputRequest(
+                        requestID = requestID,
+                        questions = questions,
+                    ),
+                ),
+                errorMessage = null,
+            )
+        }
+    }
+
+    private suspend fun handleApprovalRequest(
+        method: String,
+        requestID: JsonValue,
+        params: JsonValue?,
+    ) {
+        val paramsObject = params?.objectValue
+        val request = CodexApprovalRequest(
+            id = serverRequestKey(requestID),
+            requestID = requestID,
+            method = method,
+            command = paramsObject.resolveRequestString("command", "cmd"),
+            reason = paramsObject.resolveRequestString("reason"),
+            threadId = paramsObject.resolveRequestString("threadId", "thread_id"),
+            turnId = paramsObject.resolveRequestString("turnId", "turn_id"),
+            params = params,
+        )
+
+        if (_uiState.value.selectedAccessMode == CodexAccessMode.FullAccess) {
+            runCatching {
+                transport.sendResponse(
+                    id = requestID,
+                    result = JsonPrimitive("accept"),
+                )
+            }.onFailure {
+                _uiState.update { current ->
+                    current.copy(
+                        pendingApproval = request,
+                        isHandlingPendingApproval = false,
+                    )
+                }
+            }
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                pendingApproval = request,
+                isHandlingPendingApproval = false,
+                errorMessage = null,
+            )
+        }
+    }
+
+    private fun decodeStructuredUserInputQuestions(value: JsonValue?): List<CodexStructuredUserInputQuestion> {
+        val items = value?.arrayValue ?: return emptyList()
+        return items.mapIndexedNotNull { index, questionValue ->
+            val questionObject = questionValue.objectValue ?: return@mapIndexedNotNull null
+            val id = questionObject.resolveRequestString("id") ?: return@mapIndexedNotNull null
+            val header = questionObject.resolveRequestText("header") ?: return@mapIndexedNotNull null
+            val question = questionObject.resolveRequestText("question") ?: return@mapIndexedNotNull null
+            val options = (questionObject["options"]?.arrayValue ?: JsonArray(emptyList())).mapIndexedNotNull { optionIndex, optionValue ->
+                val optionObject = optionValue.objectValue ?: return@mapIndexedNotNull null
+                val label = optionObject.resolveRequestString("label") ?: return@mapIndexedNotNull null
+                val description = optionObject.resolveRequestText("description") ?: ""
+                CodexStructuredUserInputOption(
+                    id = optionObject.resolveRequestString("id") ?: "$id-option-$optionIndex",
+                    label = label,
+                    description = description,
+                )
+            }
+
+            CodexStructuredUserInputQuestion(
+                id = id,
+                header = header,
+                question = question,
+                isOther = questionObject["isOther"]?.boolValue == true,
+                isSecret = questionObject["isSecret"]?.boolValue == true,
+                options = options,
+            )
+        }
+    }
+
+    private fun buildStructuredUserInputResponse(
+        answersByQuestionID: Map<String, List<String>>,
+    ): JsonObject {
+        return JsonObject(
+            mapOf(
+                "answers" to JsonObject(
+                    answersByQuestionID.mapValues { (_, answers) ->
+                        JsonObject(
+                            mapOf(
+                                "answers" to JsonArray(answers.map(::JsonPrimitive)),
+                            ),
+                        )
+                    },
+                ),
+            ),
+        )
+    }
+
+    private fun resolvedStructuredRequestKey(message: app.remodex.android.core.protocol.RpcMessage): String? {
+        val normalizedMethod = message.method?.trim()?.lowercase() ?: return null
+        if (normalizedMethod != "serverrequest/resolved") {
+            return null
+        }
+
+        val paramsObject = message.params?.objectValue ?: return null
+        val requestID = paramsObject["requestId"] ?: paramsObject["requestID"] ?: return null
+        return serverRequestKey(requestID)
+    }
+
+    private fun normalizeServerRequestMethod(method: String): String {
+        return method
+            .trim()
+            .lowercase()
+            .replace("_", "")
+            .replace("-", "")
+    }
+
+    private fun JsonObject?.resolveRequestString(vararg keys: String): String? {
+        if (this == null) {
+            return null
+        }
+
+        for (key in keys) {
+            val value = this[key]?.stringValue?.trim()
+            if (!value.isNullOrEmpty()) {
+                return value
+            }
+        }
+        return null
+    }
+
+    private fun JsonObject?.resolveRequestText(vararg keys: String): String? {
+        if (this == null) {
+            return null
+        }
+
+        for (key in keys) {
+            val value = this[key]?.stringValue ?: continue
+            return value
+        }
+        return null
+    }
+
+    private fun serverRequestKey(requestID: JsonValue): String {
+        return when (requestID) {
+            is JsonPrimitive -> requestID.content
+            else -> requestID.toString()
+        }
+    }
+
     private fun applyHandshake(handshake: RemodexHandshakeResult) {
         _uiState.update { current ->
             current.copy(
@@ -1319,6 +2455,9 @@ class RemodexDebugViewModel(
                 sessionUrl = handshake.sessionUrl,
                 hostInfo = handshake.hostInfo,
                 supportsPlanCollaborationMode = handshake.supportsPlanCollaborationMode,
+                pendingApproval = null,
+                isHandlingPendingApproval = false,
+                submittingStructuredRequestKeys = emptySet(),
                 errorMessage = null,
             )
         }
@@ -1329,7 +2468,12 @@ class RemodexDebugViewModel(
         private const val GIT_STATUS_REFRESH_DEBOUNCE_MILLIS = 350L
         private const val CONNECTING_POLL_DELAY_MILLIS = 300L
         private const val MAX_FOREGROUND_RECONNECT_ATTEMPTS = 20
+        private const val MIN_AUTOCOMPLETE_QUERY_LENGTH = 2
+        private const val AUTOCOMPLETE_DEBOUNCE_MILLIS = 180L
+        private const val MAX_FILE_AUTOCOMPLETE_ITEMS = 6
+        private const val MAX_SKILL_AUTOCOMPLETE_ITEMS = 6
         private val AUTO_RECONNECT_BACKOFF_MILLIS = listOf(1_000L, 3_000L)
+        private val FILE_MENTION_SEGMENT_REGEX = Regex("[A-Z]+(?=$|[A-Z][a-z]|\\d)|[A-Z]?[a-z]+|\\d+")
     }
 
     private fun applyThreadStarted(result: RemodexThreadStartResult) {
@@ -1486,7 +2630,7 @@ class RemodexDebugViewModel(
                 selectedGitBaseBranch = "",
                 availableGitBranchTargets = emptyList(),
                 gitRepoSync = null,
-                isLoadingGitBranchTargets = selectedThreadWorkingDirectory(threadId, current.threads) != null,
+                isLoadingGitBranchTargets = false,
                 errorMessage = if (surfaceErrors) {
                     null
                 } else {
@@ -1495,7 +2639,7 @@ class RemodexDebugViewModel(
             )
         }
 
-        val isConnected = (_uiState.value.connectionState as? RemodexTransportState.Connected)?.isInitialized == true
+        val isConnected = (transport.state.value as? RemodexTransportState.Connected)?.isInitialized == true
         if (!isConnected) {
             _uiState.update { current ->
                 current.copy(
@@ -1969,11 +3113,12 @@ class RemodexDebugViewModel(
 
     private fun watchRunningThreadIfNeeded(
         threadId: String?,
+        nextActiveThreadId: String? = _uiState.value.activeThreadId,
         ttlMillis: Long = realtimeSyncPolicy.runningThreadWatchTtlMillis,
     ) {
         val normalizedThreadId = normalizeThreadId(threadId) ?: return
         val currentState = _uiState.value
-        if (normalizedThreadId == currentState.activeThreadId ||
+        if (normalizedThreadId == normalizeThreadId(nextActiveThreadId) ||
             !currentState.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
         ) {
             return
@@ -2004,7 +3149,10 @@ class RemodexDebugViewModel(
             return
         }
 
-        watchRunningThreadIfNeeded(normalizedPreviousThreadId)
+        watchRunningThreadIfNeeded(
+            threadId = normalizedPreviousThreadId,
+            nextActiveThreadId = normalizedNextThreadId,
+        )
         clearRunningThreadWatch(normalizedNextThreadId)
     }
 
@@ -2195,6 +3343,12 @@ class RemodexDebugViewModel(
             return null
         }
         return trimmed.split("/", limit = 2).firstOrNull()?.takeIf(String::isNotEmpty)
+    }
+
+    override fun onCleared() {
+        resetFileAutocompleteState()
+        resetSkillAutocompleteState()
+        super.onCleared()
     }
 }
 

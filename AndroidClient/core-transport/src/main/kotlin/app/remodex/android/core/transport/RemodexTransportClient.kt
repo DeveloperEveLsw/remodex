@@ -2,13 +2,17 @@ package app.remodex.android.core.transport
 
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexCollaborationModeKind
+import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexImageAttachment
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
+import app.remodex.android.core.model.CodexSkillMetadata
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
+import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.model.GitBranchesWithStatusResult
 import app.remodex.android.core.model.GitCheckoutResult
 import app.remodex.android.core.model.GitRepoSyncResult
@@ -22,6 +26,7 @@ import java.net.ConnectException
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -39,6 +44,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -68,6 +74,8 @@ open class RemodexTransportClient(
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<RpcMessage>>()
     private val pendingRequestMethods = ConcurrentHashMap<String, String>()
     private val resumedThreadsById = ConcurrentHashMap<String, CodexThread>()
+    private var supportsStructuredSkillInput = true
+    private var supportsTurnCollaborationMode = true
 
     private val _state = MutableStateFlow<RemodexTransportState>(RemodexTransportState.Disconnected)
     val state: StateFlow<RemodexTransportState> = _state.asStateFlow()
@@ -162,6 +170,8 @@ open class RemodexTransportClient(
             currentWebSocket = null
             currentSessionUrl = null
             resumedThreadsById.clear()
+            supportsStructuredSkillInput = true
+            supportsTurnCollaborationMode = true
             failAllPendingRequests(
                 RemodexTransportException(
                     kind = RemodexTransportFailureKind.Disconnected,
@@ -210,11 +220,11 @@ open class RemodexTransportClient(
         sendMessage(RpcMessage.notification(method = method, params = params))
     }
 
-    suspend fun sendResponse(id: JsonValue, result: JsonValue) {
+    open suspend fun sendResponse(id: JsonValue, result: JsonValue) {
         sendMessage(RpcMessage.success(id = id, result = result))
     }
 
-    suspend fun sendErrorResponse(
+    open suspend fun sendErrorResponse(
         id: JsonValue?,
         code: Int,
         message: String,
@@ -627,6 +637,102 @@ open class RemodexTransportClient(
         return supportedModes.toList()
     }
 
+    open suspend fun fuzzyFileSearch(
+        query: String,
+        roots: List<String>,
+        cancellationToken: String? = null,
+    ): List<CodexFuzzyFileMatch> {
+        val normalizedQuery = query.trim()
+        if (normalizedQuery.isEmpty()) {
+            return emptyList()
+        }
+
+        val normalizedRoots = roots
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+        if (normalizedRoots.isEmpty()) {
+            return emptyList()
+        }
+
+        val response = sendRequest(
+            method = "fuzzyFileSearch",
+            params = JsonObject(
+                buildMap {
+                    put("query", JsonPrimitive(normalizedQuery))
+                    put("roots", JsonArray(normalizedRoots.map(::JsonPrimitive)))
+                    put(
+                        "cancellationToken",
+                        cancellationToken?.trim()?.takeIf(String::isNotEmpty)?.let(::JsonPrimitive)
+                            ?: kotlinx.serialization.json.JsonNull,
+                    )
+                },
+            ),
+        )
+
+        return decodeFuzzyFileMatches(response.result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "fuzzyFileSearch response missing result.files",
+            )
+    }
+
+    open suspend fun listSkills(
+        cwds: List<String>?,
+        forceReload: Boolean = false,
+    ): List<CodexSkillMetadata> {
+        val normalizedCwds = cwds.orEmpty()
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+
+        val response = try {
+            sendRequest(
+                method = "skills/list",
+                params = JsonObject(
+                    buildMap {
+                        if (normalizedCwds.isNotEmpty()) {
+                            put("cwds", JsonArray(normalizedCwds.map(::JsonPrimitive)))
+                        }
+                        if (forceReload) {
+                            put("forceReload", JsonPrimitive(true))
+                        }
+                    },
+                ),
+            )
+        } catch (throwable: Throwable) {
+            val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+            if (normalizedCwds.isEmpty() || !shouldRetrySkillsListWithCwdFallback(classified)) {
+                throw classified
+            }
+
+            sendRequest(
+                method = "skills/list",
+                params = JsonObject(
+                    buildMap {
+                        put("cwd", JsonPrimitive(normalizedCwds.first()))
+                        if (forceReload) {
+                            put("forceReload", JsonPrimitive(true))
+                        }
+                    },
+                ),
+            )
+        }
+
+        val decodedSkills = decodeSkillMetadata(response.result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "skills/list response missing result.data[].skills",
+            )
+
+        return decodedSkills
+            .groupBy(CodexSkillMetadata::normalizedName)
+            .values
+            .mapNotNull { bucket ->
+                bucket.firstOrNull { it.enabled } ?: bucket.firstOrNull()
+            }
+            .filter { it.name.trim().isNotEmpty() }
+            .sortedBy { it.name.lowercase() }
+    }
+
     open suspend fun startTurn(
         threadId: String?,
         userInput: String,
@@ -635,12 +741,14 @@ open class RemodexTransportClient(
         preferredProjectPath: String? = null,
         modelIdentifier: String? = null,
         reasoningEffort: String? = null,
+        attachments: List<CodexImageAttachment> = emptyList(),
+        skillMentions: List<CodexTurnSkillMention> = emptyList(),
     ): RemodexTurnStartResult {
         val trimmedInput = userInput.trim()
-        if (trimmedInput.isEmpty()) {
+        if (trimmedInput.isEmpty() && attachments.isEmpty()) {
             throw RemodexTransportException(
                 kind = RemodexTransportFailureKind.Protocol,
-                message = "turn/start requires non-empty user input",
+                message = "turn/start requires non-empty user input or attachments",
             )
         }
 
@@ -673,6 +781,8 @@ open class RemodexTransportClient(
                 ensureContinuationResumed = true,
                 modelIdentifier = modelIdentifier,
                 reasoningEffort = reasoningEffort,
+                attachments = attachments,
+                skillMentions = skillMentions,
             )
         }
 
@@ -684,6 +794,8 @@ open class RemodexTransportClient(
                 collaborationMode = collaborationMode,
                 modelIdentifier = modelIdentifier,
                 reasoningEffort = reasoningEffort,
+                attachments = attachments,
+                skillMentions = skillMentions,
             )
             return RemodexTurnStartResult(
                 requestedThreadId = normalizedThreadId,
@@ -709,6 +821,8 @@ open class RemodexTransportClient(
                 ensureContinuationResumed = false,
                 modelIdentifier = modelIdentifier,
                 reasoningEffort = reasoningEffort,
+                attachments = attachments,
+                skillMentions = skillMentions,
             )
         }
     }
@@ -784,6 +898,8 @@ open class RemodexTransportClient(
             currentWebSocket = null
             currentSessionUrl = sessionUrl
             resumedThreadsById.clear()
+            supportsStructuredSkillInput = true
+            supportsTurnCollaborationMode = true
             failAllPendingRequests(
                 RemodexTransportException(
                     kind = RemodexTransportFailureKind.Disconnected,
@@ -1066,6 +1182,8 @@ open class RemodexTransportClient(
         ensureContinuationResumed: Boolean,
         modelIdentifier: String?,
         reasoningEffort: String?,
+        attachments: List<CodexImageAttachment>,
+        skillMentions: List<CodexTurnSkillMention>,
     ): RemodexTurnStartResult {
         val startedThread = startThread(
             preferredProjectPath = preferredProjectPath,
@@ -1088,6 +1206,8 @@ open class RemodexTransportClient(
             collaborationMode = collaborationMode,
             modelIdentifier = modelIdentifier,
             reasoningEffort = reasoningEffort,
+            attachments = attachments,
+            skillMentions = skillMentions,
         )
 
         return RemodexTurnStartResult(
@@ -1110,14 +1230,24 @@ open class RemodexTransportClient(
         collaborationMode: CodexCollaborationModeKind?,
         modelIdentifier: String?,
         reasoningEffort: String?,
+        attachments: List<CodexImageAttachment>,
+        skillMentions: List<CodexTurnSkillMention>,
     ): TurnStartRequestResult {
+        var includeStructuredSkillItems = supportsStructuredSkillInput && skillMentions.isNotEmpty()
+        var imageUrlKey = "url"
         var effectiveCollaborationMode = collaborationMode
+            ?.takeIf { supportsTurnCollaborationMode }
+            ?.takeIf { (_state.value as? RemodexTransportState.Connected)?.supportsPlanCollaborationMode == true }
         var downgradedCollaborationMode = false
 
         while (true) {
             val requestParams = buildTurnStartRequestParams(
                 threadId = threadId,
                 userInput = userInput,
+                attachments = attachments,
+                skillMentions = skillMentions,
+                imageUrlKey = imageUrlKey,
+                includeStructuredSkillItems = includeStructuredSkillItems,
                 collaborationMode = effectiveCollaborationMode,
                 modelIdentifier = modelIdentifier,
                 reasoningEffort = reasoningEffort,
@@ -1137,9 +1267,24 @@ open class RemodexTransportClient(
                 )
             } catch (throwable: Throwable) {
                 val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+                if (includeStructuredSkillItems &&
+                    shouldRetryTurnStartWithoutSkillItems(classified)
+                ) {
+                    supportsStructuredSkillInput = false
+                    includeStructuredSkillItems = false
+                    continue
+                }
+                if (imageUrlKey == "url" &&
+                    attachments.isNotEmpty() &&
+                    shouldRetryTurnStartWithImageUrlField(classified)
+                ) {
+                    imageUrlKey = "image_url"
+                    continue
+                }
                 if (effectiveCollaborationMode != null &&
                     shouldRetryTurnStartWithoutCollaborationMode(classified)
                 ) {
+                    supportsTurnCollaborationMode = false
                     effectiveCollaborationMode = null
                     downgradedCollaborationMode = true
                     continue
@@ -1254,6 +1399,10 @@ open class RemodexTransportClient(
     private fun buildTurnStartRequestParams(
         threadId: String,
         userInput: String,
+        attachments: List<CodexImageAttachment>,
+        skillMentions: List<CodexTurnSkillMention>,
+        imageUrlKey: String,
+        includeStructuredSkillItems: Boolean,
         collaborationMode: CodexCollaborationModeKind?,
         modelIdentifier: String?,
         reasoningEffort: String?,
@@ -1261,13 +1410,12 @@ open class RemodexTransportClient(
         val params = mutableMapOf<String, JsonValue>(
             "threadId" to JsonPrimitive(threadId),
             "input" to JsonArray(
-                listOf(
-                    JsonObject(
-                        mapOf(
-                            "type" to JsonPrimitive("text"),
-                            "text" to JsonPrimitive(userInput),
-                        ),
-                    ),
+                makeTurnInputPayload(
+                    userInput = userInput,
+                    attachments = attachments,
+                    imageUrlKey = imageUrlKey,
+                    skillMentions = skillMentions,
+                    includeStructuredSkillItems = includeStructuredSkillItems,
                 ),
             ),
         )
@@ -1288,6 +1436,60 @@ open class RemodexTransportClient(
         }
 
         return params
+    }
+
+    private fun makeTurnInputPayload(
+        userInput: String,
+        attachments: List<CodexImageAttachment>,
+        imageUrlKey: String,
+        skillMentions: List<CodexTurnSkillMention>,
+        includeStructuredSkillItems: Boolean,
+    ): List<JsonValue> {
+        val inputItems = mutableListOf<JsonValue>()
+
+        for (attachment in attachments) {
+            val payloadDataUrl = attachment.payloadDataURL?.trim().orEmpty()
+            if (payloadDataUrl.isEmpty()) {
+                continue
+            }
+
+            inputItems += JsonObject(
+                mapOf(
+                    "type" to JsonPrimitive("image"),
+                    imageUrlKey to JsonPrimitive(payloadDataUrl),
+                ),
+            )
+        }
+
+        val trimmedText = userInput.trim()
+        if (trimmedText.isNotEmpty()) {
+            inputItems += JsonObject(
+                mapOf(
+                    "type" to JsonPrimitive("text"),
+                    "text" to JsonPrimitive(trimmedText),
+                ),
+            )
+        }
+
+        if (includeStructuredSkillItems) {
+            for (mention in skillMentions) {
+                val normalizedSkillId = mention.id.trim()
+                if (normalizedSkillId.isEmpty()) {
+                    continue
+                }
+
+                inputItems += JsonObject(
+                    buildMap {
+                        put("type", JsonPrimitive("skill"))
+                        put("id", JsonPrimitive(normalizedSkillId))
+                        mention.name?.trim()?.takeIf(String::isNotEmpty)?.let { put("name", JsonPrimitive(it)) }
+                        mention.path?.trim()?.takeIf(String::isNotEmpty)?.let { put("path", JsonPrimitive(it)) }
+                    },
+                )
+            }
+        }
+
+        return inputItems
     }
 
     private fun decodeThreadFromThreadEnvelope(
@@ -1377,6 +1579,65 @@ open class RemodexTransportClient(
             || message.contains("invalid")
             || message.contains("field")
             || message.contains("mode")
+    }
+
+    private fun shouldRetryTurnStartWithImageUrlField(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        val message = rpcError.message.lowercase()
+        if (!message.contains("image_url")) {
+            return false
+        }
+
+        return message.contains("missing")
+            || message.contains("unknown field")
+            || message.contains("expected")
+            || message.contains("invalid")
+    }
+
+    private fun shouldRetryTurnStartWithoutSkillItems(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        val message = rpcError.message.lowercase()
+        if (!message.contains("skill")) {
+            return false
+        }
+
+        return message.contains("unknown")
+            || message.contains("unsupported")
+            || message.contains("invalid")
+            || message.contains("expected")
+            || message.contains("unrecognized")
+            || message.contains("type")
+    }
+
+    private fun shouldRetrySkillsListWithCwdFallback(error: RemodexTransportException): Boolean {
+        if (error.kind != RemodexTransportFailureKind.Rpc) {
+            return false
+        }
+
+        val rpcError = error.rpcError ?: return false
+        if (rpcError.code != -32600 && rpcError.code != -32602) {
+            return false
+        }
+
+        val message = rpcError.message.lowercase()
+        return message.contains("cwds") &&
+            (
+                message.contains("unknown") ||
+                    message.contains("unsupported") ||
+                    message.contains("unexpected") ||
+                    message.contains("unrecognized") ||
+                    message.contains("invalid") ||
+                    message.contains("field") ||
+                    message.contains("array")
+                )
     }
 
     private fun shouldTreatAsThreadNotFound(error: RemodexTransportException): Boolean {
@@ -1569,6 +1830,60 @@ open class RemodexTransportClient(
         return runCatching {
             json.decodeFromJsonElement(GitCheckoutResult.serializer(), value)
         }.getOrNull()
+    }
+
+    private fun decodeFuzzyFileMatches(result: JsonValue?): List<CodexFuzzyFileMatch>? {
+        val resultObject = result as? JsonObject ?: return null
+        val filesValue = resultObject["files"] ?: return null
+        return runCatching {
+            json.decodeFromJsonElement(ListSerializer(CodexFuzzyFileMatch.serializer()), filesValue)
+        }.getOrNull()
+    }
+
+    private fun decodeSkillMetadata(result: JsonValue?): List<CodexSkillMetadata>? {
+        val resultObject = result as? JsonObject ?: return null
+        val collectedSkills = mutableListOf<CodexSkillMetadata>()
+        var hasSkillContainer = false
+
+        val dataItems = resultObject["data"] as? JsonArray
+        if (dataItems != null) {
+            hasSkillContainer = true
+            for (item in dataItems) {
+                val itemObject = item as? JsonObject ?: continue
+                val skillsValue = itemObject["skills"] ?: continue
+                val decodedSkills = runCatching {
+                    json.decodeFromJsonElement(ListSerializer(CodexSkillMetadata.serializer()), skillsValue)
+                }.getOrNull()
+                if (decodedSkills != null) {
+                    collectedSkills += decodedSkills
+                }
+            }
+
+            if (collectedSkills.isEmpty()) {
+                val decodedSkills = runCatching {
+                    json.decodeFromJsonElement(
+                        ListSerializer(CodexSkillMetadata.serializer()),
+                        JsonArray(dataItems.toList()),
+                    )
+                }.getOrNull()
+                if (decodedSkills != null) {
+                    collectedSkills += decodedSkills
+                }
+            }
+        }
+
+        val skillsValue = resultObject["skills"]
+        if (skillsValue != null) {
+            hasSkillContainer = true
+            val decodedSkills = runCatching {
+                json.decodeFromJsonElement(ListSerializer(CodexSkillMetadata.serializer()), skillsValue)
+            }.getOrNull()
+            if (decodedSkills != null) {
+                collectedSkills += decodedSkills
+            }
+        }
+
+        return if (hasSkillContainer) collectedSkills else null
     }
 
     private fun decodeHostInfo(value: JsonValue?): CodexHostInfo? {
@@ -1782,13 +2097,16 @@ open class RemodexTransportClient(
         threadId: String,
         threadObject: JsonObject,
     ): List<CodexMessage> {
+        val baseInstant = decodeHistoryBaseInstant(threadObject)
         val turns = threadObject["turns"] as? JsonArray ?: return emptyList()
         var orderIndex = 0
+        var offsetMillis = 0L
         val messages = mutableListOf<CodexMessage>()
 
         for (turnValue in turns) {
             val turnObject = turnValue as? JsonObject ?: continue
             val turnId = turnObject["id"].stringValueOrNull()
+            val turnTimestamp = decodeHistoryInstant(turnObject)
             val items = turnObject["items"] as? JsonArray ?: continue
 
             for (itemValue in items) {
@@ -1799,6 +2117,9 @@ open class RemodexTransportClient(
                 if (decodedText.isBlank()) {
                     continue
                 }
+                val syntheticTimestamp = (turnTimestamp ?: baseInstant).plusMillis(offsetMillis)
+                val timestamp = decodeHistoryInstant(itemObject) ?: syntheticTimestamp
+                offsetMillis += 1
 
                 val messageRole = when (itemType) {
                     "usermessage" -> CodexMessageRole.User
@@ -1824,7 +2145,7 @@ open class RemodexTransportClient(
                     role = messageRole,
                     kind = messageKind,
                     text = decodedText,
-                    createdAt = null,
+                    createdAt = timestamp,
                     turnId = turnId,
                     itemId = itemId,
                     orderIndex = orderIndex,
@@ -1834,6 +2155,36 @@ open class RemodexTransportClient(
         }
 
         return messages
+    }
+
+    private fun decodeHistoryBaseInstant(threadObject: JsonObject): Instant {
+        return decodeHistoryInstant(threadObject)
+            ?: Instant.EPOCH
+    }
+
+    private fun decodeHistoryInstant(objectValue: JsonObject): Instant? {
+        val numericKeys = listOf("createdAt", "created_at", "timestamp", "time", "updatedAt", "updated_at")
+        for (key in numericKeys) {
+            val rawValue = objectValue[key]
+            when (rawValue) {
+                is JsonPrimitive -> {
+                    rawValue.intOrNull?.let { return decodeUnixTimestamp(it.toDouble()) }
+                    rawValue.contentOrNull?.trim()?.takeIf(String::isNotEmpty)?.let { text ->
+                        text.toDoubleOrNull()?.let { return decodeUnixTimestamp(it) }
+                        runCatching { Instant.parse(text) }.getOrNull()?.let { return it }
+                    }
+                }
+
+                else -> Unit
+            }
+        }
+        return null
+    }
+
+    private fun decodeUnixTimestamp(rawValue: Double): Instant {
+        val secondsValue = if (rawValue > 10_000_000_000) rawValue / 1000.0 else rawValue
+        val millis = (secondsValue * 1000).toLong()
+        return Instant.ofEpochMilli(millis)
     }
 
     private fun extractThreadTurnStateSnapshot(threadObject: JsonObject): RemodexThreadTurnStateSnapshot {
