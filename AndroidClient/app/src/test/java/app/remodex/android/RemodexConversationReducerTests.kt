@@ -1,5 +1,6 @@
 package app.remodex.android
 
+import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.protocol.RpcMessage
 import kotlinx.serialization.json.JsonObject
@@ -89,6 +90,77 @@ class RemodexConversationReducerTests {
     }
 
     @Test
+    fun reducerFinalizesSeparateAssistantItemsWhenTurnCompletes() {
+        var conversation = RemodexConversationState().withActiveThread("thread-1")
+        val knownThreadIds = setOf("thread-1")
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "turn/started",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "item/agentMessage/delta",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("item-1"),
+                        "type" to JsonPrimitive("agentMessage"),
+                        "role" to JsonPrimitive("assistant"),
+                    ),
+                    "delta" to JsonPrimitive("First"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "item/agentMessage/delta",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("item-2"),
+                        "type" to JsonPrimitive("agentMessage"),
+                        "role" to JsonPrimitive("assistant"),
+                    ),
+                    "delta" to JsonPrimitive("Second"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "turn/completed",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "status" to JsonPrimitive("completed"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        val assistantMessages = conversation.messagesFor("thread-1").filter { it.role == CodexMessageRole.Assistant }
+        assertEquals(2, assistantMessages.size)
+        assertTrue(assistantMessages.all { !it.isStreaming })
+    }
+
+    @Test
     fun reducerPreservesLeadingSpacesInAssistantStreamingDeltas() {
         var conversation = RemodexConversationState().withActiveThread("thread-1")
         val knownThreadIds = setOf("thread-1")
@@ -147,6 +219,47 @@ class RemodexConversationReducerTests {
         )
 
         assertEquals("Hello world", conversation.messagesFor("thread-1").single().text)
+    }
+
+    @Test
+    fun reducerAcceptsLegacyMsgEnvelopeForReasoningDelta() {
+        var conversation = RemodexConversationState().withActiveThread("thread-1")
+        val knownThreadIds = setOf("thread-1")
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "turn/started",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        conversation = RemodexConversationReducer.reduce(
+            conversation = conversation,
+            message = RpcMessage.notification(
+                method = "item/reasoning/textDelta",
+                params = jsonObject(
+                    "msg" to jsonObject(
+                        "threadId" to JsonPrimitive("thread-1"),
+                        "turnId" to JsonPrimitive("turn-1"),
+                        "item" to jsonObject(
+                            "id" to JsonPrimitive("reasoning-1"),
+                            "type" to JsonPrimitive("reasoning"),
+                        ),
+                        "delta" to JsonPrimitive("Reviewing files"),
+                    ),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        val messages = conversation.messagesFor("thread-1")
+        assertEquals(1, messages.size)
+        assertEquals("Reviewing files", messages.single().text)
     }
 
     @Test

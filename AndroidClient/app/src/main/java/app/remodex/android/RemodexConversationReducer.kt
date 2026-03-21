@@ -16,7 +16,7 @@ object RemodexConversationReducer {
     ): RemodexConversationState {
         val normalizedMethod = message.method?.lowercase() ?: return conversation
         val paramsObject = message.params?.objectValue ?: return conversation
-        val eventObject = paramsObject["event"]?.objectValue
+        val eventObject = extractEventObject(paramsObject)
 
         return when (normalizedMethod) {
             "turn/started" -> reduceTurnStarted(
@@ -56,10 +56,30 @@ object RemodexConversationReducer {
                 knownThreadIds = knownThreadIds,
             )
 
+            "item/plan/delta" -> reduceSystemDelta(
+                conversation = conversation,
+                kind = CodexMessageKind.Plan,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "item/reasoning/summarytextdelta",
+            "item/reasoning/summarypartadded",
+            "item/reasoning/textdelta" -> reduceSystemDelta(
+                conversation = conversation,
+                kind = CodexMessageKind.Thinking,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
             "item/filechange/outputdelta",
             "item/filechange/output_delta",
             "item/commandexecution/outputdelta",
             "item/commandexecution/output_delta",
+            "item/command_execution/outputdelta",
+            "item/command_execution/output_delta",
             "item/toolcall/outputdelta",
             "item/toolcall/output_delta",
             "turn/diff/updated",
@@ -67,6 +87,14 @@ object RemodexConversationReducer {
             "codex/event/turn_diff" -> reduceRepoAffectingDelta(
                 conversation = conversation,
                 normalizedMethod = normalizedMethod,
+                paramsObject = paramsObject,
+                eventObject = eventObject,
+                knownThreadIds = knownThreadIds,
+            )
+
+            "item/commandexecution/terminalinteraction",
+            "item/command_execution/terminalinteraction" -> reduceCommandExecutionTerminalInteraction(
+                conversation = conversation,
                 paramsObject = paramsObject,
                 eventObject = eventObject,
                 knownThreadIds = knownThreadIds,
@@ -109,13 +137,10 @@ object RemodexConversationReducer {
             turnIdHint = turnId,
         ) ?: return conversation
 
-        return conversation.withTurnCompleted(
+        return conversation.markTurnCompleted(
             threadId = threadId,
             turnId = turnId,
             terminalState = parseTurnTerminalState(paramsObject, eventObject),
-        ).completeStreamingSystemMessages(
-            threadId = threadId,
-            turnId = turnId,
         )
     }
 
@@ -294,6 +319,33 @@ object RemodexConversationReducer {
         )
     }
 
+    private fun reduceSystemDelta(
+        conversation: RemodexConversationState,
+        kind: CodexMessageKind,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val itemId = extractItemId(paramsObject, eventObject, extractItemObject(paramsObject, eventObject))
+        val delta = extractAssistantDelta(paramsObject, eventObject) ?: return conversation
+
+        return conversation.appendSystemDelta(
+            threadId = threadId,
+            kind = kind,
+            delta = delta,
+            turnId = turnId,
+            itemId = itemId,
+        )
+    }
+
     private fun reduceRepoAffectingDelta(
         conversation: RemodexConversationState,
         normalizedMethod: String,
@@ -333,8 +385,52 @@ object RemodexConversationReducer {
         )
     }
 
+    private fun reduceCommandExecutionTerminalInteraction(
+        conversation: RemodexConversationState,
+        paramsObject: JsonObject,
+        eventObject: JsonObject?,
+        knownThreadIds: Set<String>,
+    ): RemodexConversationState {
+        val itemObject = extractItemObject(paramsObject, eventObject) ?: return conversation
+        if (resolveSystemItemKind(itemObject) != CodexMessageKind.CommandExecution) {
+            return conversation
+        }
+
+        val turnId = extractTurnId(paramsObject, eventObject)
+        val threadId = resolveThreadId(
+            conversation = conversation,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            knownThreadIds = knownThreadIds,
+            turnIdHint = turnId,
+        ) ?: return conversation
+        val itemId = extractItemId(paramsObject, eventObject, itemObject)
+        val text = extractCommandExecutionText(
+            itemObject = itemObject,
+            paramsObject = paramsObject,
+            eventObject = eventObject,
+            isCompleted = true,
+        )
+
+        return conversation.completeSystemMessage(
+            threadId = threadId,
+            kind = CodexMessageKind.CommandExecution,
+            text = text,
+            turnId = turnId,
+            itemId = itemId,
+        )
+    }
+
+    private fun extractEventObject(paramsObject: JsonObject): JsonObject? {
+        return paramsObject["msg"]?.objectValue ?: paramsObject["event"]?.objectValue
+    }
+
     private fun extractItemObject(paramsObject: JsonObject, eventObject: JsonObject?): JsonObject? {
-        return paramsObject["item"]?.objectValue ?: eventObject?.get("item")?.objectValue
+        return paramsObject["item"]?.objectValue
+            ?: eventObject?.get("item")?.objectValue
+            ?: paramsObject["event"]?.objectValue?.get("item")?.objectValue
+            ?: paramsObject.takeIf(::isLikelyIncomingItemPayload)
+            ?: eventObject?.takeIf(::isLikelyIncomingItemPayload)
     }
 
     private fun isAssistantMessageItem(itemObject: JsonObject): Boolean {
@@ -351,13 +447,21 @@ object RemodexConversationReducer {
         allowTopLevelId: Boolean = false,
     ): String? {
         return firstNonBlank(
+            paramsObject["turn"]?.objectValue?.get("id")?.stringValue,
             paramsObject["turnId"]?.stringValue,
             paramsObject["turn_id"]?.stringValue,
-            paramsObject["turn"]?.objectValue?.get("id")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("turnId")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("turn_id")?.stringValue,
             eventObject?.get("turnId")?.stringValue,
             eventObject?.get("turn_id")?.stringValue,
             eventObject?.get("turn")?.objectValue?.get("id")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("turnId")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("turn_id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("turnId")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("turn_id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("turn")?.objectValue?.get("id")?.stringValue,
             paramsObject["id"]?.stringValue?.takeIf { allowTopLevelId },
+            eventObject?.get("id")?.stringValue?.takeIf { allowTopLevelId },
         )
     }
 
@@ -368,10 +472,32 @@ object RemodexConversationReducer {
     ): String? {
         return firstNonBlank(
             itemObject?.get("id")?.stringValue,
+            itemObject?.get("itemId")?.stringValue,
+            itemObject?.get("item_id")?.stringValue,
+            itemObject?.get("messageId")?.stringValue,
+            itemObject?.get("message_id")?.stringValue,
             paramsObject["itemId"]?.stringValue,
             paramsObject["item_id"]?.stringValue,
+            paramsObject["messageId"]?.stringValue,
+            paramsObject["message_id"]?.stringValue,
+            paramsObject["item"]?.objectValue?.get("id")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("itemId")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("item_id")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("messageId")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("message_id")?.stringValue,
             eventObject?.get("itemId")?.stringValue,
             eventObject?.get("item_id")?.stringValue,
+            eventObject?.get("messageId")?.stringValue,
+            eventObject?.get("message_id")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("id")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("itemId")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("item_id")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("messageId")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("message_id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("item")?.objectValue?.get("id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("messageId")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("message_id")?.stringValue,
+            eventObject?.get("id")?.stringValue,
         )
     }
 
@@ -720,6 +846,23 @@ object RemodexConversationReducer {
             .replace(" ", "")
     }
 
+    private fun isLikelyIncomingItemPayload(objectValue: JsonObject): Boolean {
+        val normalizedType = normalizeItemType(objectValue["type"]?.stringValue) ?: return false
+        if (normalizedType.isEmpty()) {
+            return false
+        }
+        return objectValue["content"] != null ||
+            objectValue["status"] != null ||
+            objectValue["output"] != null ||
+            objectValue["changes"] != null ||
+            objectValue["files"] != null ||
+            objectValue["diff"] != null ||
+            objectValue["patch"] != null ||
+            objectValue["result"] != null ||
+            objectValue["payload"] != null ||
+            objectValue["data"] != null
+    }
+
     private fun streamingPlaceholderText(kind: CodexMessageKind): String {
         return when (kind) {
             CodexMessageKind.Thinking -> "Thinking..."
@@ -741,10 +884,29 @@ object RemodexConversationReducer {
         val directThreadId = firstNonBlank(
             paramsObject["threadId"]?.stringValue,
             paramsObject["thread_id"]?.stringValue,
+            paramsObject["conversationId"]?.stringValue,
+            paramsObject["conversation_id"]?.stringValue,
             paramsObject["thread"]?.objectValue?.get("id")?.stringValue,
+            paramsObject["turn"]?.objectValue?.get("threadId")?.stringValue,
+            paramsObject["turn"]?.objectValue?.get("thread_id")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("threadId")?.stringValue,
+            paramsObject["item"]?.objectValue?.get("thread_id")?.stringValue,
             eventObject?.get("threadId")?.stringValue,
             eventObject?.get("thread_id")?.stringValue,
+            eventObject?.get("conversationId")?.stringValue,
+            eventObject?.get("conversation_id")?.stringValue,
             eventObject?.get("thread")?.objectValue?.get("id")?.stringValue,
+            eventObject?.get("turn")?.objectValue?.get("threadId")?.stringValue,
+            eventObject?.get("turn")?.objectValue?.get("thread_id")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("threadId")?.stringValue,
+            eventObject?.get("item")?.objectValue?.get("thread_id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("threadId")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("thread_id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("conversationId")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("conversation_id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("thread")?.objectValue?.get("id")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("turn")?.objectValue?.get("threadId")?.stringValue,
+            paramsObject["event"]?.objectValue?.get("turn")?.objectValue?.get("thread_id")?.stringValue,
         )
         if (directThreadId != null) {
             return directThreadId
@@ -755,6 +917,10 @@ object RemodexConversationReducer {
             if (mappedThreadId != null) {
                 return mappedThreadId
             }
+        }
+
+        if (conversation.activeTurnIdByThread.size == 1) {
+            return conversation.activeTurnIdByThread.keys.first()
         }
 
         if (knownThreadIds.size == 1) {

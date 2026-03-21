@@ -1,6 +1,7 @@
 package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessage
+import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexThreadRunBadgeState
@@ -10,6 +11,40 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemodexConversationStateTests {
+    @Test
+    fun appendAssistantDeltaKeepsSeparateBlocksWhenItemChangesWithinTurn() {
+        val threadId = "thread-1"
+
+        val conversation = RemodexConversationState()
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = "First",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = " chunk",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-2",
+                delta = "Second",
+            )
+
+        val assistantMessages = conversation.messagesFor(threadId).filter { it.role == CodexMessageRole.Assistant }
+        assertEquals(2, assistantMessages.count())
+        assertEquals("item-1", assistantMessages[0].itemId)
+        assertEquals("First chunk", assistantMessages[0].text)
+        assertFalse(assistantMessages[0].isStreaming)
+        assertEquals("item-2", assistantMessages[1].itemId)
+        assertEquals("Second", assistantMessages[1].text)
+        assertTrue(assistantMessages[1].isStreaming)
+    }
+
     @Test
     fun appendAssistantDeltaPreservesLeadingSpacesBetweenStreamTokens() {
         val threadId = "thread-1"
@@ -86,6 +121,91 @@ class RemodexConversationStateTests {
         assertTrue(assistantMessage.isStreaming)
         assertEquals("item-1", assistantMessage.itemId)
         assertTrue(merged.isHydratedThread(threadId))
+    }
+
+    @Test
+    fun mergeHydratedThreadMessagesReconcilesStreamingFileChangeRowLikeIos() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .withTurnStarted(threadId, "turn-1")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.FileChange,
+                delta = "Path: App.kt\nKind: update",
+                turnId = "turn-1",
+            )
+
+        val hydrated = listOf(
+            CodexMessage(
+                id = "filechange-1",
+                threadId = threadId,
+                role = CodexMessageRole.System,
+                kind = CodexMessageKind.FileChange,
+                text = "Path: App.kt\nKind: update\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```",
+                turnId = "turn-1",
+                itemId = "filechange-1",
+                isStreaming = false,
+                orderIndex = 0,
+            ),
+        )
+
+        val merged = conversation.mergeHydratedThreadMessages(threadId, hydrated)
+        val messages = merged.messagesFor(threadId)
+
+        assertEquals(1, messages.size)
+        assertEquals(CodexMessageKind.FileChange, messages.single().kind)
+        assertTrue(messages.single().isStreaming)
+        assertEquals("turn-1", messages.single().turnId)
+    }
+
+    @Test
+    fun appendSystemDeltaMergesLateReasoningIntoExistingRowAfterTurnCompletion() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .withTurnStarted(threadId, "turn-1")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.Thinking,
+                delta = "Reviewing files",
+                turnId = "turn-1",
+                itemId = "thinking-1",
+            )
+            .markTurnCompleted(threadId, "turn-1")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.Thinking,
+                delta = " carefully",
+                turnId = "turn-1",
+                itemId = "thinking-1",
+            )
+
+        val thinkingMessages = conversation.messagesFor(threadId).filter { it.kind == CodexMessageKind.Thinking }
+        assertEquals(1, thinkingMessages.size)
+        assertEquals("Reviewing files carefully", thinkingMessages.single().text)
+        assertFalse(thinkingMessages.single().isStreaming)
+    }
+
+    @Test
+    fun markTurnCompletedFinalizesAllAssistantItemsForTurn() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-1",
+                delta = "A",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "item-2",
+                delta = "B",
+            )
+            .markTurnCompleted(threadId, "turn-1")
+
+        val assistantMessages = conversation.messagesFor(threadId).filter { it.role == CodexMessageRole.Assistant }
+        assertEquals(2, assistantMessages.size)
+        assertTrue(assistantMessages.all { !it.isStreaming })
     }
 
     @Test
