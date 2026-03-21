@@ -82,12 +82,6 @@ class RemodexTransportClientLifecycleTests {
                         result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
                     )
                 },
-                ScriptedStep("thread/resume") {
-                    RpcMessage.success(
-                        id = null,
-                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
-                    )
-                },
                 ScriptedStep("turn/start") {
                     RpcMessage.success(
                         id = null,
@@ -105,11 +99,12 @@ class RemodexTransportClientLifecycleTests {
         )
 
         assertEquals(
-            listOf("thread/start", "thread/resume", "turn/start"),
+            listOf("thread/start", "turn/start"),
             transport.recordedMethods,
         )
         assertEquals("thread-new", result.requestedThreadId)
         assertEquals("thread-new", result.threadId)
+        assertEquals("thread-new", result.activeThread?.id)
 
         val threadStartParams = transport.recordedParams.first().second as JsonObject
         assertEquals("/tmp/project", (threadStartParams["cwd"] as JsonPrimitive).content)
@@ -186,12 +181,6 @@ class RemodexTransportClientLifecycleTests {
                         result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
                     )
                 },
-                ScriptedStep("thread/resume") {
-                    RpcMessage.success(
-                        id = null,
-                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
-                    )
-                },
                 ScriptedStep("turn/start") {
                     RpcMessage.success(
                         id = null,
@@ -208,12 +197,13 @@ class RemodexTransportClientLifecycleTests {
         )
 
         assertEquals(
-            listOf("thread/resume", "thread/start", "thread/resume", "turn/start"),
+            listOf("thread/resume", "thread/start", "turn/start"),
             transport.recordedMethods,
         )
         assertEquals("thread-missing", result.archivedThreadId)
         assertEquals("thread-new", result.threadId)
         assertEquals("turn-3", result.turnId)
+        assertEquals("thread-new", result.activeThread?.id)
     }
 
     @Test
@@ -236,12 +226,6 @@ class RemodexTransportClientLifecycleTests {
                         result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
                     )
                 },
-                ScriptedStep("thread/resume") {
-                    RpcMessage.success(
-                        id = null,
-                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
-                    )
-                },
                 ScriptedStep("turn/start") {
                     RpcMessage.success(
                         id = null,
@@ -258,11 +242,42 @@ class RemodexTransportClientLifecycleTests {
         )
 
         assertEquals(
-            listOf("thread/resume", "thread/start", "thread/resume", "turn/start"),
+            listOf("thread/resume", "thread/start", "turn/start"),
             transport.recordedMethods,
         )
         assertEquals("thread-stale", result.archivedThreadId)
         assertEquals("thread-new", result.threadId)
+        assertEquals("thread-new", result.activeThread?.id)
+    }
+
+    @Test
+    fun startTurnSkipsResumeForFreshlyStartedThreadJustLikeIos() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = threadEnvelope(threadId = "thread-new", cwd = "/tmp/project"),
+                    )
+                },
+                ScriptedStep("turn/start") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-4"))),
+                    )
+                },
+            ),
+        )
+
+        transport.startThread(preferredProjectPath = "/tmp/project")
+        val result = transport.startTurn(
+            threadId = "thread-new",
+            userInput = "hello again",
+        )
+
+        assertEquals(listOf("thread/start", "turn/start"), transport.recordedMethods)
+        assertEquals("thread-new", result.threadId)
+        assertEquals("thread-new", result.activeThread?.id)
     }
 
     @Test

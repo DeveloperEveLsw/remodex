@@ -652,6 +652,35 @@ data class RemodexConversationState(
         )
     }
 
+    fun handleMissingThread(threadId: String): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val updatedActiveTurnIds = activeTurnIdByThread.toMutableMap()
+        updatedActiveTurnIds.remove(normalizedThreadId)
+        val updatedThreadIdsByTurnId = threadIdByTurnId.filterValues { it != normalizedThreadId }
+
+        val clearedState = clearOutcomeBadge(normalizedThreadId).copy(
+            activeTurnIdByThread = updatedActiveTurnIds,
+            threadIdByTurnId = updatedThreadIdsByTurnId,
+            runningThreadIds = runningThreadIds - normalizedThreadId,
+            loadingThreadIds = loadingThreadIds - normalizedThreadId,
+            hydratedThreadIds = hydratedThreadIds - normalizedThreadId,
+        )
+
+        val existingMessages = messagesFor(normalizedThreadId)
+        if (existingMessages.none(CodexMessage::isStreaming)) {
+            return clearedState
+        }
+
+        val updatedMessages = existingMessages.map { message ->
+            if (message.isStreaming) {
+                message.copy(isStreaming = false)
+            } else {
+                message
+            }
+        }
+        return clearedState.replaceThreadMessages(normalizedThreadId, updatedMessages)
+    }
+
     companion object {
         private fun normalizeThreadId(threadId: String?): String? {
             val trimmed = threadId?.trim().orEmpty()

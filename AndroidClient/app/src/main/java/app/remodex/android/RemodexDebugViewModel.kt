@@ -1188,16 +1188,18 @@ class RemodexDebugViewModel(
         pendingMessageText: String? = null,
         requestedThreadId: String = result.requestedThreadId,
     ) {
+        result.archivedThreadId?.let(transport::clearResumedThread)
         _uiState.update { current ->
             var updatedThreads = current.threads
+            var updatedConversation = current.conversation
             result.archivedThreadId?.let { archivedThreadId ->
                 updatedThreads = markThreadArchived(updatedThreads, archivedThreadId)
+                updatedConversation = updatedConversation.handleMissingThread(archivedThreadId)
             }
             result.activeThread?.let { activeThread ->
                 updatedThreads = upsertThread(updatedThreads, activeThread)
             }
 
-            var updatedConversation = current.conversation
             val resolvedPendingThreadId = if (pendingMessageId != null && requestedThreadId != result.threadId) {
                 updatedConversation = updatedConversation.moveMessageToThread(
                     sourceThreadId = requestedThreadId,
@@ -1328,6 +1330,10 @@ class RemodexDebugViewModel(
                 }
             }
         }.onFailure { throwable ->
+            if (shouldTreatAsMissingThread(throwable)) {
+                handleMissingThreadLocally(threadId)
+                return
+            }
             _uiState.update { current ->
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
@@ -1437,6 +1443,32 @@ class RemodexDebugViewModel(
             "already stopped",
         )
         return hints.any(message::contains)
+    }
+
+    private fun handleMissingThreadLocally(threadId: String) {
+        transport.clearResumedThread(threadId)
+        _uiState.update { current ->
+            current.copy(
+                threads = markThreadArchived(current.threads, threadId),
+                conversation = current.conversation.handleMissingThread(threadId),
+                isLoadingGitBranchTargets = false,
+                errorMessage = null,
+            )
+        }
+    }
+
+    private fun shouldTreatAsMissingThread(throwable: Throwable): Boolean {
+        val message = throwable.message?.lowercase() ?: return false
+        if (message.contains("not materialized") || message.contains("not yet materialized")) {
+            return false
+        }
+        if (message.contains("thread not found") || message.contains("unknown thread")) {
+            return true
+        }
+        val missingRollout = message.contains("norolloutfound")
+            || message.contains("no rollout found")
+            || message.contains("rollout not found")
+        return missingRollout && (message.contains("threadid") || message.contains("thread"))
     }
 
     private fun selectResolvedModel(

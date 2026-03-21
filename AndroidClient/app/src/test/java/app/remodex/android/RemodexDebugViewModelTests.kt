@@ -19,9 +19,12 @@ import app.remodex.android.core.transport.RemodexThreadTurnStateSnapshot
 import app.remodex.android.core.transport.RemodexThreadReadResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportClient
+import app.remodex.android.core.transport.RemodexTransportException
+import app.remodex.android.core.transport.RemodexTransportFailureKind
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
 import app.remodex.android.core.protocol.RpcMessage
+import app.remodex.android.core.protocol.RpcError
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
@@ -335,6 +338,39 @@ class RemodexDebugViewModelTests {
             listOf("thread/resume", "thread/read", "thread/resume"),
             transport.recordedMethods.takeLast(3),
         )
+    }
+
+    @Test
+    fun selectMissingRolloutThreadArchivesLocallyWithoutShowingError() = runTest {
+        val thread = CodexThread(
+            id = "thread-fresh",
+            title = "Fresh",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            resumeThreadThrowable = RemodexTransportException(
+                kind = RemodexTransportFailureKind.Rpc,
+                message = "RPC error -32600: NoRolloutFoundForThreadId ${thread.id}",
+                rpcError = RpcError(
+                    code = -32600,
+                    message = "NoRolloutFoundForThreadId ${thread.id}",
+                ),
+            ),
+        )
+        val viewModel = RemodexDebugViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals(thread.id, state.activeThreadId)
+        assertNull(state.errorMessage)
+        assertFalse(state.conversation.isLoadingThread(thread.id))
+        assertEquals(CodexThreadSyncState.ArchivedLocal, state.threads.first().syncState)
     }
 
     @Test
@@ -841,6 +877,7 @@ class RemodexDebugViewModelTests {
         private val threadListResult: List<CodexThread> = emptyList(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
+        private val resumeThreadThrowable: Throwable? = null,
         private val modelOptions: List<CodexModelOption> = emptyList(),
         private val gitBranchesWithStatusResult: GitBranchesWithStatusResult = GitBranchesWithStatusResult(),
         private val gitBranchesWithStatusThrowable: Throwable? = null,
@@ -932,6 +969,7 @@ class RemodexDebugViewModelTests {
             modelIdentifier: String?,
         ): RemodexThreadResumeResult {
             recordedMethods += "thread/resume"
+            resumeThreadThrowable?.let { throw it }
             return RemodexThreadResumeResult(
                 threadId = threadId,
                 thread = readThreadResults[threadId]?.thread,

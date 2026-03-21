@@ -66,6 +66,7 @@ open class RemodexTransportClient(
     private val connectMutex = Mutex()
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<RpcMessage>>()
     private val pendingRequestMethods = ConcurrentHashMap<String, String>()
+    private val resumedThreadsById = ConcurrentHashMap<String, CodexThread>()
 
     private val _state = MutableStateFlow<RemodexTransportState>(RemodexTransportState.Disconnected)
     val state: StateFlow<RemodexTransportState> = _state.asStateFlow()
@@ -159,6 +160,7 @@ open class RemodexTransportClient(
             currentWebSocket?.close(1000, "Client disconnect")
             currentWebSocket = null
             currentSessionUrl = null
+            resumedThreadsById.clear()
             failAllPendingRequests(
                 RemodexTransportException(
                     kind = RemodexTransportFailureKind.Disconnected,
@@ -495,6 +497,7 @@ open class RemodexTransportClient(
             method = "thread/start",
             preferredProjectPath = normalizedPreferredProjectPath,
         )
+        resumedThreadsById[thread.id] = thread.copy(syncState = CodexThreadSyncState.Live)
         return RemodexThreadStartResult(
             thread = thread,
             response = response,
@@ -513,6 +516,13 @@ open class RemodexTransportClient(
                 message = "thread/resume requires a non-empty threadId",
             )
         }
+        resumedThreadsById[normalizedThreadId]?.let { cachedThread ->
+            return RemodexThreadResumeResult(
+                threadId = normalizedThreadId,
+                thread = cachedThread,
+                response = RpcMessage.success(id = null, result = JsonObject(emptyMap<String, JsonValue>())),
+            )
+        }
 
         val response = sendRequestWithSandboxFallback(
             method = "thread/resume",
@@ -528,12 +538,20 @@ open class RemodexTransportClient(
         val resumedThread = threadObject
             ?.let(::decodeThread)
             ?.copy(syncState = CodexThreadSyncState.Live)
+        if (resumedThread != null) {
+            resumedThreadsById[normalizedThreadId] = resumedThread
+        }
 
         return RemodexThreadResumeResult(
             threadId = normalizedThreadId,
             thread = resumedThread,
             response = response,
         )
+    }
+
+    open fun clearResumedThread(threadId: String?) {
+        val normalizedThreadId = threadId?.trim()?.takeIf(String::isNotEmpty) ?: return
+        resumedThreadsById.remove(normalizedThreadId)
     }
 
     open suspend fun interruptTurn(
@@ -764,6 +782,7 @@ open class RemodexTransportClient(
             currentWebSocket?.cancel()
             currentWebSocket = null
             currentSessionUrl = sessionUrl
+            resumedThreadsById.clear()
             failAllPendingRequests(
                 RemodexTransportException(
                     kind = RemodexTransportFailureKind.Disconnected,
