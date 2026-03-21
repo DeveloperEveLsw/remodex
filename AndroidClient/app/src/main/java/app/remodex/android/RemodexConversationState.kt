@@ -696,7 +696,9 @@ data class RemodexConversationState(
                     else -> existingMessage.itemId
                 },
                 isStreaming = isStreaming,
-                orderIndex = nextOrderIndex(updatedMessages),
+                // Preserve the original slot in the timeline when a system row
+                // transitions from streaming -> completed or receives more output.
+                orderIndex = existingMessage.orderIndex,
             )
             val prunedMessages = pruneDuplicateSystemRows(
                 threadMessages = updatedMessages,

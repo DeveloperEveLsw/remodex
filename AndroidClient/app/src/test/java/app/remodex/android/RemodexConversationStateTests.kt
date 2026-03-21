@@ -186,6 +186,80 @@ class RemodexConversationStateTests {
     }
 
     @Test
+    fun completeSystemMessageKeepsWorkspaceCardInOriginalTimelinePosition() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .appendUserMessage(threadId = threadId, text = "Apply the patch")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.FileChange,
+                delta = "Path: App.kt\nKind: update",
+                turnId = "turn-1",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "assistant-1",
+                delta = "Patched it",
+            )
+            .completeSystemMessage(
+                threadId = threadId,
+                kind = CodexMessageKind.FileChange,
+                text = "Path: App.kt\nKind: update\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```",
+                turnId = "turn-1",
+            )
+
+        val messages = conversation.messagesFor(threadId)
+
+        assertEquals(
+            listOf(
+                CodexMessageRole.User to CodexMessageKind.Chat,
+                CodexMessageRole.System to CodexMessageKind.FileChange,
+                CodexMessageRole.Assistant to CodexMessageKind.Chat,
+            ),
+            messages.map { it.role to it.kind },
+        )
+        assertFalse(messages[1].isStreaming)
+    }
+
+    @Test
+    fun completeSystemMessageKeepsCommandCardInOriginalTimelinePosition() {
+        val threadId = "thread-1"
+        val conversation = RemodexConversationState()
+            .appendUserMessage(threadId = threadId, text = "Run tests")
+            .appendSystemDelta(
+                threadId = threadId,
+                kind = CodexMessageKind.CommandExecution,
+                delta = "npm test\nstatus: running",
+                turnId = "turn-1",
+            )
+            .appendAssistantDelta(
+                threadId = threadId,
+                turnId = "turn-1",
+                itemId = "assistant-1",
+                delta = "Waiting for test output",
+            )
+            .completeSystemMessage(
+                threadId = threadId,
+                kind = CodexMessageKind.CommandExecution,
+                text = "npm test\nstatus: completed",
+                turnId = "turn-1",
+            )
+
+        val messages = conversation.messagesFor(threadId)
+
+        assertEquals(
+            listOf(
+                CodexMessageRole.User to CodexMessageKind.Chat,
+                CodexMessageRole.System to CodexMessageKind.CommandExecution,
+                CodexMessageRole.Assistant to CodexMessageKind.Chat,
+            ),
+            messages.map { it.role to it.kind },
+        )
+        assertFalse(messages[1].isStreaming)
+    }
+
+    @Test
     fun markTurnCompletedFinalizesAllAssistantItemsForTurn() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
