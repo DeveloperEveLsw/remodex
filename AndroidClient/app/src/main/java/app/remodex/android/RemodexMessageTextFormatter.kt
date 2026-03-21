@@ -100,33 +100,48 @@ object RemodexMessageTextFormatter {
         val replacements = linkedMapOf<String, RemodexStyledTextToken>()
         var placeholderIndex = 0
 
-        fun placeholderFor(token: RemodexStyledTextToken): String {
+        fun nextPlaceholder(token: RemodexStyledTextToken): String {
             val placeholder = "\u0000${placeholderIndex++}\u0000"
             replacements[placeholder] = token
             return placeholder
         }
 
-        var transformed = replaceMatchesReversed(line, markdownLinkTokenRegex) { match ->
-            structuredReferenceToken(match.value)
-        } { token ->
-            placeholderFor(token)
-        }
+        var transformed = replaceMatchesReversed(
+            text = line,
+            regex = markdownLinkTokenRegex,
+            replacementToken = { match ->
+                structuredReferenceToken(match.value)
+            },
+            placeholderFor = { token ->
+                nextPlaceholder(token)
+            },
+        )
 
-        transformed = replaceMatchesReversed(transformed, inlineCodeContentRegex) { match ->
-            val inlineContent = match.groups[1]?.value ?: return@replaceMatchesReversed null
-            structuredReferenceToken(inlineContent)
-        } { token ->
-            placeholderFor(token)
-        }
+        transformed = replaceMatchesReversed(
+            text = transformed,
+            regex = inlineCodeContentRegex,
+            replacementToken = { match ->
+                val inlineContent = match.groups[1]?.value ?: return@replaceMatchesReversed null
+                structuredReferenceToken(inlineContent)
+            },
+            placeholderFor = { token ->
+                nextPlaceholder(token)
+            },
+        )
 
-        transformed = replaceMatchesReversed(transformed, genericPathRegex) { match ->
-            if (!isEligiblePathToken(match.range, transformed)) {
-                return@replaceMatchesReversed null
-            }
-            structuredReferenceToken(match.value)
-        } { token ->
-            placeholderFor(token)
-        }
+        transformed = replaceMatchesReversed(
+            text = transformed,
+            regex = genericPathRegex,
+            replacementToken = { match ->
+                if (!isEligiblePathToken(match.range, transformed)) {
+                    return@replaceMatchesReversed null
+                }
+                structuredReferenceToken(match.value)
+            },
+            placeholderFor = { token ->
+                nextPlaceholder(token)
+            },
+        )
 
         return expandPlaceholders(transformed, replacements)
     }
