@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -53,6 +54,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -88,6 +90,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -102,17 +105,22 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.remodex.android.core.model.CodexAccessMode
+import app.remodex.android.core.model.CodexApprovalRequest
 import app.remodex.android.core.model.CodexCollaborationModeKind
+import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexSkillMetadata
+import app.remodex.android.core.model.CodexStructuredUserInputQuestion
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportState
+import app.remodex.android.core.protocol.JsonValue
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -278,8 +286,14 @@ fun RemodexAndroidRoot() {
                         onOpenReasoningPicker = { activePanel = REASONING_PICKER_PANEL },
                         onOpenAccessPicker = { activePanel = ACCESS_PICKER_PANEL },
                         onPromptChange = viewModel::updateDraftTurnInput,
+                        onSelectFileAutocomplete = viewModel::selectFileAutocomplete,
+                        onSelectSkillAutocomplete = viewModel::selectSkillAutocomplete,
+                        onRemoveMentionedFile = viewModel::removeMentionedFile,
+                        onRemoveMentionedSkill = viewModel::removeMentionedSkill,
                         onSendPrompt = viewModel::startTurn,
                         onStopTurn = viewModel::interruptTurn,
+                        onSubmitStructuredUserInput = viewModel::respondToStructuredUserInput,
+                        submittingStructuredRequestKeys = uiState.submittingStructuredRequestKeys,
                         onRefreshGitBranches = { viewModel.refreshGitBranchTargets() },
                         onSelectGitBaseBranch = { branch ->
                             viewModel.selectGitBaseBranch(branch)
@@ -298,6 +312,15 @@ fun RemodexAndroidRoot() {
                         },
                     )
                 }
+            }
+
+            uiState.pendingApproval?.let { pendingApproval ->
+                ApprovalRequestDialog(
+                    request = pendingApproval,
+                    isHandling = uiState.isHandlingPendingApproval,
+                    onApprove = viewModel::approvePendingRequest,
+                    onDecline = viewModel::declinePendingRequest,
+                )
             }
 
             if (showQrScanner) {
@@ -925,8 +948,14 @@ private fun MainConversationPane(
     onOpenReasoningPicker: () -> Unit,
     onOpenAccessPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
+    onSelectFileAutocomplete: (CodexFuzzyFileMatch) -> Unit,
+    onSelectSkillAutocomplete: (CodexSkillMetadata) -> Unit,
+    onRemoveMentionedFile: (String) -> Unit,
+    onRemoveMentionedSkill: (String) -> Unit,
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
+    onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
+    submittingStructuredRequestKeys: Set<String>,
     onRefreshGitBranches: () -> Unit,
     onSelectGitBaseBranch: (String) -> Unit,
     onSelectBranch: (String) -> Unit,
@@ -980,6 +1009,8 @@ private fun MainConversationPane(
                         isLoadingThread = isLoadingSelectedThread,
                         isThreadRunning = isRunningSelectedThread,
                         activeTurnId = selectedActiveTurnId,
+                        onSubmitStructuredUserInput = onSubmitStructuredUserInput,
+                        submittingStructuredRequestKeys = submittingStructuredRequestKeys,
                         modifier = Modifier.weight(1f),
                     )
                     AnimatedVisibility(visible = showDeveloperPanels) {
@@ -990,6 +1021,16 @@ private fun MainConversationPane(
                     }
                     ComposerArea(
                         prompt = uiState.draftTurnInput,
+                        composerMentionedFiles = uiState.composerMentionedFiles,
+                        composerMentionedSkills = uiState.composerMentionedSkills,
+                        fileAutocompleteItems = uiState.fileAutocompleteItems,
+                        isFileAutocompleteVisible = uiState.isFileAutocompleteVisible,
+                        isFileAutocompleteLoading = uiState.isFileAutocompleteLoading,
+                        fileAutocompleteQuery = uiState.fileAutocompleteQuery,
+                        skillAutocompleteItems = uiState.skillAutocompleteItems,
+                        isSkillAutocompleteVisible = uiState.isSkillAutocompleteVisible,
+                        isSkillAutocompleteLoading = uiState.isSkillAutocompleteLoading,
+                        skillAutocompleteQuery = uiState.skillAutocompleteQuery,
                         isSending = uiState.isStartingTurn || uiState.isStartingThread,
                         selectedThreadId = uiState.activeThreadId,
                         isRunningSelectedThread = isRunningSelectedThread,
@@ -1012,6 +1053,10 @@ private fun MainConversationPane(
                         onOpenReasoningPicker = onOpenReasoningPicker,
                         onOpenAccessPicker = onOpenAccessPicker,
                         onPromptChange = onPromptChange,
+                        onSelectFileAutocomplete = onSelectFileAutocomplete,
+                        onSelectSkillAutocomplete = onSelectSkillAutocomplete,
+                        onRemoveMentionedFile = onRemoveMentionedFile,
+                        onRemoveMentionedSkill = onRemoveMentionedSkill,
                         onSendPrompt = onSendPrompt,
                         onStopTurn = onStopTurn,
                         onRefreshGitBranches = onRefreshGitBranches,
@@ -1167,6 +1212,8 @@ private fun ConversationTimeline(
     isLoadingThread: Boolean,
     isThreadRunning: Boolean,
     activeTurnId: String?,
+    onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
+    submittingStructuredRequestKeys: Set<String>,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxWidth()) {
@@ -1257,7 +1304,11 @@ private fun ConversationTimeline(
                 }
             }
             items(visibleMessages, key = { it.id }) { message ->
-                TranscriptMessage(message = message)
+                TranscriptMessage(
+                    message = message,
+                    onSubmitStructuredUserInput = onSubmitStructuredUserInput,
+                    submittingStructuredRequestKeys = submittingStructuredRequestKeys,
+                )
             }
         }
         AnimatedVisibility(
@@ -2608,11 +2659,19 @@ private fun GroupedMenuSection(
 }
 
 @Composable
-private fun TranscriptMessage(message: CodexMessage) {
+private fun TranscriptMessage(
+    message: CodexMessage,
+    onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
+    submittingStructuredRequestKeys: Set<String>,
+) {
     when (message.role) {
         CodexMessageRole.User -> UserTranscriptBubble(message = message)
         CodexMessageRole.Assistant -> AssistantTranscriptBlock(message = message)
-        CodexMessageRole.System -> SystemTranscriptBlock(message = message)
+        CodexMessageRole.System -> SystemTranscriptBlock(
+            message = message,
+            onSubmitStructuredUserInput = onSubmitStructuredUserInput,
+            submittingStructuredRequestKeys = submittingStructuredRequestKeys,
+        )
     }
 }
 
@@ -2654,6 +2713,16 @@ private fun DeveloperPanel(
 @Composable
 private fun ComposerArea(
     prompt: String,
+    composerMentionedFiles: List<RemodexComposerMentionedFile>,
+    composerMentionedSkills: List<RemodexComposerMentionedSkill>,
+    fileAutocompleteItems: List<CodexFuzzyFileMatch>,
+    isFileAutocompleteVisible: Boolean,
+    isFileAutocompleteLoading: Boolean,
+    fileAutocompleteQuery: String,
+    skillAutocompleteItems: List<CodexSkillMetadata>,
+    isSkillAutocompleteVisible: Boolean,
+    isSkillAutocompleteLoading: Boolean,
+    skillAutocompleteQuery: String,
     isSending: Boolean,
     selectedThreadId: String?,
     isRunningSelectedThread: Boolean,
@@ -2672,6 +2741,10 @@ private fun ComposerArea(
     onOpenReasoningPicker: () -> Unit,
     onOpenAccessPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
+    onSelectFileAutocomplete: (CodexFuzzyFileMatch) -> Unit,
+    onSelectSkillAutocomplete: (CodexSkillMetadata) -> Unit,
+    onRemoveMentionedFile: (String) -> Unit,
+    onRemoveMentionedSkill: (String) -> Unit,
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
     onRefreshGitBranches: () -> Unit,
@@ -2689,6 +2762,24 @@ private fun ComposerArea(
             .padding(horizontal = 12.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        if (isFileAutocompleteVisible) {
+            ComposerFileAutocompletePanel(
+                items = fileAutocompleteItems,
+                isLoading = isFileAutocompleteLoading,
+                query = fileAutocompleteQuery,
+                onSelect = onSelectFileAutocomplete,
+            )
+        }
+
+        if (isSkillAutocompleteVisible) {
+            ComposerSkillAutocompletePanel(
+                items = skillAutocompleteItems,
+                isLoading = isSkillAutocompleteLoading,
+                query = skillAutocompleteQuery,
+                onSelect = onSelectSkillAutocomplete,
+            )
+        }
+
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = Color(0xFFF8F7F4),
@@ -2698,6 +2789,30 @@ private fun ComposerArea(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                if (composerMentionedFiles.isNotEmpty()) {
+                    ComposerMentionChipRow {
+                        composerMentionedFiles.forEach { file ->
+                            ComposerMentionChip(
+                                icon = Icons.Outlined.FolderOpen,
+                                label = file.fileName,
+                                onRemove = { onRemoveMentionedFile(file.id) },
+                            )
+                        }
+                    }
+                }
+
+                if (composerMentionedSkills.isNotEmpty()) {
+                    ComposerMentionChipRow {
+                        composerMentionedSkills.forEach { skill ->
+                            ComposerMentionChip(
+                                icon = Icons.Outlined.Tune,
+                                label = skill.name,
+                                onRemove = { onRemoveMentionedSkill(skill.id) },
+                            )
+                        }
+                    }
+                }
+
                 BasicTextField(
                     value = prompt,
                     onValueChange = onPromptChange,
@@ -2712,7 +2827,7 @@ private fun ComposerArea(
                         Box(modifier = Modifier.fillMaxWidth()) {
                             if (prompt.isBlank()) {
                                 Text(
-                                    text = "Ask Remodex anything, @ to add files, $ for skills",
+                                    text = "Ask Remodex anything, @ to add files, ${'$'} for skills",
                                     style = MaterialTheme.typography.bodyLarge,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
                                 )
@@ -2748,7 +2863,7 @@ private fun ComposerArea(
                         StopActionButton(onClick = onStopTurn)
                     } else {
                         SendActionButton(
-                            enabled = selectedThreadId != null && !isSending,
+                            enabled = selectedThreadId != null && !isSending && prompt.trim().isNotEmpty(),
                             onClick = onSendPrompt,
                         )
                     }
@@ -2786,6 +2901,204 @@ private fun ComposerArea(
                 onRefreshBranches = onRefreshGitBranches,
                 onSelectGitBaseBranch = onSelectGitBaseBranch,
                 onSelectBranch = onSelectBranch,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposerFileAutocompletePanel(
+    items: List<CodexFuzzyFileMatch>,
+    isLoading: Boolean,
+    query: String,
+    onSelect: (CodexFuzzyFileMatch) -> Unit,
+) {
+    ComposerAutocompletePanel(
+        title = "Files",
+        isEmpty = items.isEmpty(),
+        emptyMessage = "No files found for @$query",
+        isLoading = isLoading,
+    ) {
+        items.forEach { item ->
+            ComposerAutocompleteRow(
+                icon = Icons.Outlined.FolderOpen,
+                title = item.fileName,
+                subtitle = item.path,
+                onClick = { onSelect(item) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposerSkillAutocompletePanel(
+    items: List<CodexSkillMetadata>,
+    isLoading: Boolean,
+    query: String,
+    onSelect: (CodexSkillMetadata) -> Unit,
+) {
+    ComposerAutocompletePanel(
+        title = "Skills",
+        isEmpty = items.isEmpty(),
+        emptyMessage = "No skills found for ${'$'}$query",
+        isLoading = isLoading,
+    ) {
+        items.forEach { skill ->
+            ComposerAutocompleteRow(
+                icon = Icons.Outlined.Tune,
+                title = skill.name,
+                subtitle = skill.description?.trim().orEmpty().ifBlank {
+                    skill.path?.trim().orEmpty()
+                },
+                onClick = { onSelect(skill) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposerAutocompletePanel(
+    title: String,
+    isEmpty: Boolean,
+    emptyMessage: String,
+    isLoading: Boolean,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = Color(0xFFFFFEFC),
+        border = BorderStroke(1.dp, Color(0xFFE8E4DE)),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            when {
+                isLoading -> {
+                    Text(
+                        text = "Searching...",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                isEmpty -> {
+                    Text(
+                        text = emptyMessage,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                else -> content()
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerAutocompleteRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = Color(0xFFF3EFE8),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.padding(8.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerMentionChipRow(
+    content: @Composable RowScope.() -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        content = content,
+    )
+}
+
+@Composable
+private fun ComposerMentionChip(
+    icon: ImageVector,
+    label: String,
+    onRemove: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color(0xFFFFFEFC),
+        border = BorderStroke(1.dp, Color(0xFFE7E3DD)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "×",
+                modifier = Modifier.clickable(onClick = onRemove),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -3106,7 +3419,11 @@ private fun AssistantTranscriptBlock(message: CodexMessage) {
 }
 
 @Composable
-private fun SystemTranscriptBlock(message: CodexMessage) {
+private fun SystemTranscriptBlock(
+    message: CodexMessage,
+    onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
+    submittingStructuredRequestKeys: Set<String>,
+) {
     Column(
         modifier = Modifier.widthIn(max = 520.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -3116,7 +3433,13 @@ private fun SystemTranscriptBlock(message: CodexMessage) {
             CodexMessageKind.FileChange -> FileChangeSystemBlock(message = message)
             CodexMessageKind.CommandExecution -> CommandExecutionSystemBlock(message = message)
             CodexMessageKind.Plan -> PlanSystemBlock(message = message)
-            CodexMessageKind.UserInputPrompt -> StructuredUserInputPromptBlock(message = message)
+            CodexMessageKind.UserInputPrompt -> StructuredUserInputPromptBlock(
+                message = message,
+                isSubmitting = message.structuredUserInputRequest?.let { request ->
+                    submittingStructuredRequestKeys.contains(serverRequestKey(request.requestID))
+                } == true,
+                onSubmitStructuredUserInput = onSubmitStructuredUserInput,
+            )
             CodexMessageKind.Chat -> DefaultSystemBlock(message = message)
         }
     }
@@ -3349,8 +3672,14 @@ private fun PlanSystemBlock(message: CodexMessage) {
 }
 
 @Composable
-private fun StructuredUserInputPromptBlock(message: CodexMessage) {
+private fun StructuredUserInputPromptBlock(
+    message: CodexMessage,
+    isSubmitting: Boolean,
+    onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
+) {
     val request = message.structuredUserInputRequest
+    var selectedOptionsByQuestionId by remember(message.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var typedAnswersByQuestionId by remember(message.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
     SystemCardContainer(
         message = message,
         title = "Question",
@@ -3364,26 +3693,50 @@ private fun StructuredUserInputPromptBlock(message: CodexMessage) {
                 color = MaterialTheme.colorScheme.onSurface,
             )
         } else {
+            val isSubmitDisabled = isSubmitting || request.questions.any { question ->
+                structuredInputResolvedAnswer(
+                    question = question,
+                    selectedOptionsByQuestionId = selectedOptionsByQuestionId,
+                    typedAnswersByQuestionId = typedAnswersByQuestionId,
+                ) == null
+            }
             Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 request.questions.forEachIndexed { index, question ->
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (question.header.isNotBlank()) {
+                        val trimmedHeader = question.trimmedHeader()
+                        if (trimmedHeader != null) {
                             Text(
-                                text = question.header.uppercase(Locale.US),
+                                text = trimmedHeader.uppercase(Locale.US),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                         Text(
-                            text = question.question,
+                            text = question.trimmedPrompt(),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
                         question.options.forEach { option ->
                             Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = !isSubmitting) {
+                                        selectedOptionsByQuestionId = selectedOptionsByQuestionId + (question.id to option.label)
+                                    },
                                 shape = RoundedCornerShape(16.dp),
-                                color = Color(0xFFFFFEFC),
-                                border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+                                color = if (selectedOptionsByQuestionId[question.id] == option.label) {
+                                    Color(0xFFF3E8DC)
+                                } else {
+                                    Color(0xFFFFFEFC)
+                                },
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (selectedOptionsByQuestionId[question.id] == option.label) {
+                                        Color(0xFFCB8656)
+                                    } else {
+                                        Color(0xFFE7E2DB)
+                                    },
+                                ),
                             ) {
                                 Column(
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -3404,14 +3757,97 @@ private fun StructuredUserInputPromptBlock(message: CodexMessage) {
                                 }
                             }
                         }
+                        if (question.needsFreeformField()) {
+                            OutlinedTextField(
+                                value = typedAnswersByQuestionId[question.id].orEmpty(),
+                                onValueChange = { value ->
+                                    typedAnswersByQuestionId = typedAnswersByQuestionId + (question.id to value)
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = !isSubmitting,
+                                minLines = if (question.isSecret) 1 else 2,
+                                maxLines = if (question.isSecret) 1 else 4,
+                                singleLine = question.isSecret,
+                                visualTransformation = if (question.isSecret) {
+                                    PasswordVisualTransformation()
+                                } else {
+                                    androidx.compose.ui.text.input.VisualTransformation.None
+                                },
+                                placeholder = {
+                                    Text(question.answerFieldPlaceholder())
+                                },
+                                shape = RoundedCornerShape(16.dp),
+                            )
+                        }
                         if (index < request.questions.lastIndex) {
                             Divider(color = Color(0xFFE9E3DB))
                         }
                     }
                 }
+                Button(
+                    onClick = {
+                        val answersByQuestionId = request.questions.mapNotNull { question ->
+                            structuredInputResolvedAnswer(
+                                question = question,
+                                selectedOptionsByQuestionId = selectedOptionsByQuestionId,
+                                typedAnswersByQuestionId = typedAnswersByQuestionId,
+                            )?.let { answer ->
+                                question.id to listOf(answer)
+                            }
+                        }.toMap()
+                        onSubmitStructuredUserInput(request.requestID, answersByQuestionId)
+                    },
+                    enabled = !isSubmitDisabled,
+                    modifier = Modifier.align(Alignment.End),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFCB8656),
+                        contentColor = Color.White,
+                        disabledContainerColor = Color(0xFFE8E1D7),
+                        disabledContentColor = Color(0xFF9B948A),
+                    ),
+                ) {
+                    Text(if (isSubmitting) "Sending..." else "Send")
+                }
             }
         }
     }
+}
+
+@Composable
+private fun ApprovalRequestDialog(
+    request: CodexApprovalRequest,
+    isHandling: Boolean,
+    onApprove: () -> Unit,
+    onDecline: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = {},
+        title = {
+            Text("Approval request")
+        },
+        text = {
+            Text(
+                text = approvalRequestMessage(request),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onApprove,
+                enabled = !isHandling,
+            ) {
+                Text(if (isHandling) "Sending..." else "Approve")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDecline,
+                enabled = !isHandling,
+            ) {
+                Text("Decline")
+            }
+        },
+    )
 }
 
 @Composable
@@ -3421,6 +3857,68 @@ private fun DefaultSystemBlock(message: CodexMessage) {
         style = MaterialTheme.typography.bodySmall.copy(lineHeight = 20.sp),
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+}
+
+private fun approvalRequestMessage(request: CodexApprovalRequest): String {
+    val lines = buildList {
+        request.reason?.trim()?.takeIf(String::isNotEmpty)?.let(::add)
+        request.command?.trim()?.takeIf(String::isNotEmpty)?.let { command ->
+            add("Command: $command")
+        }
+    }
+    return if (lines.isEmpty()) {
+        "Codex is requesting permission to continue."
+    } else {
+        lines.joinToString(separator = "\n\n")
+    }
+}
+
+private fun structuredInputResolvedAnswer(
+    question: CodexStructuredUserInputQuestion,
+    selectedOptionsByQuestionId: Map<String, String>,
+    typedAnswersByQuestionId: Map<String, String>,
+): String? {
+    val typedAnswer = typedAnswersByQuestionId[question.id]?.trim()
+    if (!typedAnswer.isNullOrEmpty()) {
+        return typedAnswer
+    }
+
+    val selectedOption = selectedOptionsByQuestionId[question.id]?.trim()
+    if (!selectedOption.isNullOrEmpty()) {
+        return selectedOption
+    }
+
+    return null
+}
+
+private fun CodexStructuredUserInputQuestion.trimmedHeader(): String? {
+    return header.trim().takeIf(String::isNotEmpty)
+}
+
+private fun CodexStructuredUserInputQuestion.trimmedPrompt(): String {
+    return question.trim()
+}
+
+private fun CodexStructuredUserInputQuestion.needsFreeformField(): Boolean {
+    return isOther || options.isEmpty()
+}
+
+private fun CodexStructuredUserInputQuestion.answerFieldPlaceholder(): String {
+    return if (isSecret) {
+        "Enter answer"
+    } else if (isOther) {
+        "Type your answer"
+    } else {
+        "Add details"
+    }
+}
+
+private fun serverRequestKey(requestID: JsonValue): String {
+    return if (requestID is kotlinx.serialization.json.JsonPrimitive) {
+        requestID.content
+    } else {
+        requestID.toString()
+    }
 }
 
 @Composable
