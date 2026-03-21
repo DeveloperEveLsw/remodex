@@ -525,6 +525,16 @@ object RemodexConversationReducer {
                     contentType == "input_text" ||
                     contentType == "output_text" ||
                     contentType == "message"
+                if (contentType == "skill") {
+                    val resolvedSkill = firstNonBlank(
+                        contentObject["id"]?.stringValue,
+                        contentObject["name"]?.stringValue,
+                    )
+                    if (resolvedSkill != null) {
+                        add("\$$resolvedSkill")
+                    }
+                    continue
+                }
                 if (!isTextType) {
                     continue
                 }

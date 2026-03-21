@@ -84,9 +84,12 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -2988,6 +2991,10 @@ private fun InlineInfoBadge(
 
 @Composable
 private fun UserTranscriptBubble(message: CodexMessage) {
+    val formattedText = remember(message.text) {
+        RemodexMessageTextFormatter.userTokens(message.text)
+    }
+
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.End,
@@ -3020,7 +3027,7 @@ private fun UserTranscriptBubble(message: CodexMessage) {
             color = Color(0xFFF1F1F1),
         ) {
             Text(
-                text = message.text,
+                text = annotatedTranscriptText(formattedText),
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
@@ -3044,7 +3051,10 @@ private fun AssistantTranscriptBlock(message: CodexMessage) {
         if (message.text.isNotBlank()) {
             segments.forEach { segment ->
                 when (segment) {
-                    is MarkdownSegment.Prose -> MarkdownProseBlock(text = segment.text)
+                    is MarkdownSegment.Prose -> MarkdownProseBlock(
+                        text = segment.text,
+                        profile = MarkdownRenderProfile.AssistantProse,
+                    )
                     is MarkdownSegment.CodeBlock -> AssistantCodeBlock(
                         language = segment.language,
                         code = segment.code,
@@ -3169,7 +3179,10 @@ private fun FileChangeSystemBlock(message: CodexMessage) {
                 }
             }
         } else if (message.text.isNotBlank()) {
-            MarkdownProseBlock(text = message.text)
+            MarkdownProseBlock(
+                text = message.text,
+                profile = MarkdownRenderProfile.FileChangeSystem,
+            )
         }
 
         if (!message.isStreaming && allEntries.isNotEmpty()) {
@@ -3469,13 +3482,45 @@ private fun parseCommandExecutionStatus(text: String): CommandExecutionStatus? {
 }
 
 @Composable
-private fun MarkdownProseBlock(text: String) {
+private fun MarkdownProseBlock(
+    text: String,
+    profile: MarkdownRenderProfile = MarkdownRenderProfile.AssistantProse,
+) {
+    val formattedText = remember(text, profile) {
+        when (profile) {
+            MarkdownRenderProfile.AssistantProse,
+            MarkdownRenderProfile.FileChangeSystem -> RemodexMessageTextFormatter.assistantTokens(text)
+        }
+    }
+
     SelectionContainer {
         Text(
-            text = text,
+            text = annotatedTranscriptText(formattedText),
             style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp),
             color = MaterialTheme.colorScheme.onSurface,
         )
+    }
+}
+
+@Composable
+private fun annotatedTranscriptText(tokens: List<RemodexStyledTextToken>): AnnotatedString {
+    val fileReferenceColor = MaterialTheme.colorScheme.primary
+    val skillReferenceColor = Color(0xFF4F658F)
+
+    return remember(tokens, fileReferenceColor, skillReferenceColor) {
+        buildAnnotatedString {
+            tokens.forEach { token ->
+                when (token.kind) {
+                    RemodexStyledTextKind.Plain -> append(token.text)
+                    RemodexStyledTextKind.FileReference -> withStyle(SpanStyle(color = fileReferenceColor)) {
+                        append(token.text)
+                    }
+                    RemodexStyledTextKind.SkillReference -> withStyle(SpanStyle(color = skillReferenceColor)) {
+                        append(token.text)
+                    }
+                }
+            }
+        }
     }
 }
 

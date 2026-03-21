@@ -150,6 +150,42 @@ class RemodexConversationReducerTests {
     }
 
     @Test
+    fun reducerIncludesSkillContentItemsInCompletedAssistantMessages() {
+        val conversation = RemodexConversationReducer.reduce(
+            conversation = RemodexConversationState().withActiveThread("thread-1"),
+            message = RpcMessage.notification(
+                method = "item/completed",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("item-1"),
+                        "type" to JsonPrimitive("agentMessage"),
+                        "role" to JsonPrimitive("assistant"),
+                        "content" to jsonArray(
+                            jsonObject(
+                                "type" to JsonPrimitive("text"),
+                                "text" to JsonPrimitive("Use"),
+                            ),
+                            jsonObject(
+                                "type" to JsonPrimitive("skill"),
+                                "id" to JsonPrimitive("skill-builder"),
+                            ),
+                            jsonObject(
+                                "type" to JsonPrimitive("text"),
+                                "text" to JsonPrimitive("for this step"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            knownThreadIds = setOf("thread-1"),
+        )
+
+        assertEquals("Use\n\$skill-builder\nfor this step", conversation.messagesFor("thread-1").single().text)
+    }
+
+    @Test
     fun reducerKeepsPerThreadRunningFallbackWhenTurnIdIsMissing() {
         val conversation = RemodexConversationReducer.reduce(
             conversation = RemodexConversationState(),
@@ -225,5 +261,9 @@ class RemodexConversationReducerTests {
 
     private fun jsonObject(vararg entries: Pair<String, kotlinx.serialization.json.JsonElement>): JsonObject {
         return JsonObject(mapOf(*entries))
+    }
+
+    private fun jsonArray(vararg entries: kotlinx.serialization.json.JsonElement): kotlinx.serialization.json.JsonArray {
+        return kotlinx.serialization.json.JsonArray(entries.toList())
     }
 }
