@@ -97,18 +97,41 @@ data class RemodexDebugUiState(
             ?: currentGitBranch.trim()
 }
 
+data class RemodexRealtimeSyncPolicy(
+    val enabled: Boolean = true,
+    val threadListForegroundIntervalMillis: Long = 8_000L,
+    val threadListBackgroundIntervalMillis: Long = 75_000L,
+    val activeThreadForegroundIntervalMillis: Long = 8_000L,
+    val activeThreadBackgroundIdleIntervalMillis: Long = 90_000L,
+    val activeThreadBackgroundRunningIntervalMillis: Long = 12_000L,
+    val runningThreadWatchForegroundIntervalMillis: Long = 4_000L,
+    val runningThreadWatchBackgroundIntervalMillis: Long = 15_000L,
+    val runningThreadWatchTtlMillis: Long = 30_000L,
+    val inactiveRunningThreadSyncLimit: Int = 3,
+)
+
+private data class RemodexRunningThreadWatch(
+    val threadId: String,
+    val expiresAtMillis: Long,
+)
+
 class RemodexDebugViewModel(
     private val transport: RemodexTransportClient = RemodexTransportClient(appVersion = APP_VERSION),
     private val relaySessionStore: RemodexRelaySessionStore = InMemoryRemodexRelaySessionStore(),
+    private val realtimeSyncPolicy: RemodexRealtimeSyncPolicy = RemodexRealtimeSyncPolicy(),
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(RemodexDebugUiState())
     val uiState: StateFlow<RemodexDebugUiState> = _uiState.asStateFlow()
     private var gitStatusRefreshJob: Job? = null
+    private var threadListSyncJob: Job? = null
+    private var activeThreadSyncJob: Job? = null
+    private var runningThreadWatchSyncJob: Job? = null
     private var gitBranchRefreshThreadId: String? = null
     private var hasAttemptedInitialAutoConnect = false
     private var isAppInForeground = true
     private var isRunningAutoReconnect = false
     private var savedRelayPairing: RemodexPairingPayload? = null
+    private val runningThreadWatchById = linkedMapOf<String, RemodexRunningThreadWatch>()
 
     init {
         restoreSavedRelayPairing()
@@ -134,12 +157,8 @@ class RemodexDebugViewModel(
                     state.isInitialized &&
                     (previousState !is RemodexTransportState.Connected || !previousState.isInitialized)
                 if (isNewInitializedConnection) {
-                    val activeThreadId = _uiState.value.activeThreadId
                     refreshRuntimeOptions()
-                    refreshThreads()
-                    if (!activeThreadId.isNullOrBlank()) {
-                        prepareThreadForDisplay(activeThreadId, forceHydration = true)
-                    }
+                    recoverThreadStateAfterInitializedConnection()
                 }
             }
         }
@@ -190,6 +209,7 @@ class RemodexDebugViewModel(
                 if (scheduleGitStatusRefreshForActiveThread) {
                     scheduleGitStatusRefresh(activeThreadIdForRefresh)
                 }
+                sanitizeRunningThreadWatches()
             }
         }
 
@@ -228,8 +248,13 @@ class RemodexDebugViewModel(
         }
 
         isAppInForeground = isForeground
+        updateRealtimeSyncState()
         if (isForeground) {
-            attemptAutoReconnectOnForegroundIfNeeded()
+            if (isTransportConnectedAndInitialized()) {
+                recoverThreadStateAfterForegroundReturn()
+            } else {
+                attemptAutoReconnectOnForegroundIfNeeded()
+            }
         }
     }
 
@@ -370,6 +395,8 @@ class RemodexDebugViewModel(
             gitStatusRefreshJob?.cancel()
             gitStatusRefreshJob = null
             gitBranchRefreshThreadId = null
+            stopSyncLoop()
+            clearRunningThreadWatches()
             transport.disconnect()
             clearSavedRelayPairing()
             _uiState.update { current ->
@@ -475,6 +502,8 @@ class RemodexDebugViewModel(
     ) {
         when (state) {
             RemodexTransportState.Disconnected -> {
+                stopSyncLoop()
+                clearRunningThreadWatches()
                 _uiState.update { current ->
                     current.copy(
                         isBusy = false,
@@ -486,6 +515,7 @@ class RemodexDebugViewModel(
 
             is RemodexTransportState.Connected -> {
                 if (state.isInitialized) {
+                    startSyncLoop()
                     _uiState.update { current ->
                         current.copy(
                             isBusy = false,
@@ -494,10 +524,13 @@ class RemodexDebugViewModel(
                             errorMessage = null,
                         )
                     }
+                } else {
+                    stopSyncLoop()
                 }
             }
 
             is RemodexTransportState.Failed -> {
+                stopSyncLoop()
                 handleTransportFailure(state)
             }
 
@@ -508,8 +541,8 @@ class RemodexDebugViewModel(
         if (previousState is RemodexTransportState.Connected &&
             previousState.isInitialized &&
             state is RemodexTransportState.Failed &&
-            !state.isPermanent &&
-            isAppInForeground
+            isAppInForeground &&
+            shouldAttemptAutoRecovery(state)
         ) {
             attemptAutoReconnectOnForegroundIfNeeded()
         }
@@ -527,19 +560,45 @@ class RemodexDebugViewModel(
             return
         }
 
-        val hasSavedPairing = savedRelayPairing != null
+        val shouldSuppressMessage = shouldSuppressFailureMessage(state)
+        val shouldAttemptAutoRecovery = shouldAttemptAutoRecovery(state)
         _uiState.update { current ->
             current.copy(
                 isBusy = false,
-                shouldAutoReconnectOnForeground = hasSavedPairing,
+                shouldAutoReconnectOnForeground = shouldSuppressMessage || shouldAttemptAutoRecovery,
                 isAttemptingAutoReconnect = false,
-                errorMessage = if (hasSavedPairing) {
+                errorMessage = if (shouldSuppressMessage || shouldAttemptAutoRecovery) {
                     null
                 } else {
                     state.message
                 },
             )
         }
+    }
+
+    private fun shouldAttemptAutoRecovery(state: RemodexTransportState.Failed): Boolean {
+        if (state.isPermanent || savedRelayPairing == null) {
+            return false
+        }
+
+        return when (state.failureKind) {
+            RemodexTransportFailureKind.Timeout,
+            RemodexTransportFailureKind.Network,
+            RemodexTransportFailureKind.Disconnected -> true
+
+            RemodexTransportFailureKind.PermanentRelayClosure,
+            RemodexTransportFailureKind.Protocol,
+            RemodexTransportFailureKind.Rpc,
+            RemodexTransportFailureKind.Unknown -> false
+        }
+    }
+
+    private fun shouldSuppressFailureMessage(state: RemodexTransportState.Failed): Boolean {
+        return isBenignBackgroundDisconnect(state) && !isAppInForeground
+    }
+
+    private fun isBenignBackgroundDisconnect(state: RemodexTransportState.Failed): Boolean {
+        return !state.isPermanent && state.failureKind == RemodexTransportFailureKind.Disconnected
     }
 
     private fun attemptAutoReconnectOnForegroundIfNeeded() {
@@ -741,11 +800,19 @@ class RemodexDebugViewModel(
     }
 
     fun refreshThreads() {
+        refreshThreadsInternal(surfaceErrors = true)
+    }
+
+    private fun refreshThreadsInternal(surfaceErrors: Boolean) {
         viewModelScope.launch {
             _uiState.update { current ->
                 current.copy(
                     isLoadingThreads = true,
-                    errorMessage = null,
+                    errorMessage = if (surfaceErrors) {
+                        null
+                    } else {
+                        current.errorMessage
+                    },
                 )
             }
 
@@ -767,10 +834,105 @@ class RemodexDebugViewModel(
                 _uiState.update { current ->
                     current.copy(
                         isLoadingThreads = false,
-                        errorMessage = throwable.message,
+                        errorMessage = if (surfaceErrors) {
+                            throwable.message
+                        } else {
+                            current.errorMessage
+                        },
                     )
                 }
             }
+        }
+    }
+
+    private suspend fun syncThreadsListSilently() {
+        val threads = runCatching {
+            transport.listThreads()
+        }.getOrElse {
+            return
+        }
+
+        _uiState.update { current ->
+            val mergedThreads = mergeThreadsFromServer(
+                localThreads = current.threads,
+                serverThreads = threads,
+            )
+            current.copy(
+                threads = mergedThreads,
+                conversation = current.conversation.pruneToThreads(mergedThreads.mapTo(linkedSetOf(), CodexThread::id)),
+            )
+        }
+        sanitizeRunningThreadWatches()
+    }
+
+    private fun recoverThreadStateAfterInitializedConnection() {
+        if (savedRelayPairing == null && _uiState.value.activeThreadId.isNullOrBlank()) {
+            refreshThreadsInternal(surfaceErrors = false)
+            return
+        }
+        viewModelScope.launch {
+            recoverThreadState(forceHydration = true)
+        }
+    }
+
+    private fun recoverThreadStateAfterForegroundReturn() {
+        viewModelScope.launch {
+            recoverThreadState(forceHydration = true)
+        }
+    }
+
+    private suspend fun recoverThreadState(forceHydration: Boolean) {
+        val activeThreadId = _uiState.value.activeThreadId
+        if (!activeThreadId.isNullOrBlank()) {
+            refreshThreadsInternal(surfaceErrors = false)
+            prepareThreadForDisplay(
+                threadId = activeThreadId,
+                forceHydration = forceHydration,
+                surfaceErrors = false,
+            )
+            return
+        }
+
+        recoverSelectedThreadFromThreadList(forceHydration = forceHydration)
+    }
+
+    private suspend fun recoverSelectedThreadFromThreadList(forceHydration: Boolean) {
+        val threads = runCatching {
+            transport.listThreads()
+        }.getOrElse {
+            return
+        }
+        val currentState = _uiState.value
+        val mergedThreads = mergeThreadsFromServer(
+            localThreads = currentState.threads,
+            serverThreads = threads,
+        )
+        val recoveredThreadId = resolveRecoveryThreadId(
+            preferredThreadId = currentState.activeThreadId,
+            threads = mergedThreads,
+        )
+        handleDisplayedThreadChange(
+            previousThreadId = currentState.activeThreadId,
+            nextThreadId = recoveredThreadId,
+        )
+
+        _uiState.update { current ->
+            current.copy(
+                isLoadingThreads = false,
+                threads = mergedThreads,
+                conversation = current.conversation
+                    .pruneToThreads(mergedThreads.mapTo(linkedSetOf(), CodexThread::id))
+                    .withActiveThread(recoveredThreadId),
+            )
+        }
+        val selectedThreadId = _uiState.value.activeThreadId
+
+        if (!selectedThreadId.isNullOrBlank()) {
+            prepareThreadForDisplay(
+                threadId = selectedThreadId,
+                forceHydration = forceHydration,
+                surfaceErrors = false,
+            )
         }
     }
 
@@ -1007,6 +1169,10 @@ class RemodexDebugViewModel(
 
     fun selectThread(threadId: String) {
         viewModelScope.launch {
+            handleDisplayedThreadChange(
+                previousThreadId = _uiState.value.activeThreadId,
+                nextThreadId = threadId,
+            )
             prepareThreadForDisplay(threadId)
         }
     }
@@ -1167,6 +1333,10 @@ class RemodexDebugViewModel(
     }
 
     private fun applyThreadStarted(result: RemodexThreadStartResult) {
+        handleDisplayedThreadChange(
+            previousThreadId = _uiState.value.activeThreadId,
+            nextThreadId = result.thread.id,
+        )
         _uiState.update { current ->
             current.copy(
                 threads = upsertThread(current.threads, result.thread),
@@ -1188,6 +1358,10 @@ class RemodexDebugViewModel(
         pendingMessageText: String? = null,
         requestedThreadId: String = result.requestedThreadId,
     ) {
+        handleDisplayedThreadChange(
+            previousThreadId = _uiState.value.activeThreadId,
+            nextThreadId = result.threadId,
+        )
         result.archivedThreadId?.let(transport::clearResumedThread)
         _uiState.update { current ->
             var updatedThreads = current.threads
@@ -1249,12 +1423,18 @@ class RemodexDebugViewModel(
         }
     }
 
-    private fun applyThreadRead(threadResult: RemodexThreadReadResult) {
+    private fun applyThreadRead(
+        threadResult: RemodexThreadReadResult,
+        markViewed: Boolean,
+    ) {
         _uiState.update { current ->
+            val updatedConversation = if (markViewed) {
+                current.conversation.markThreadAsViewed(threadResult.thread.id)
+            } else {
+                current.conversation
+            }
             current.copy(
-                conversation = current.conversation
-                    .withActiveThread(threadResult.thread.id)
-                    .markThreadAsViewed(threadResult.thread.id)
+                conversation = updatedConversation
                     .withRefreshedInFlightTurnState(threadResult.thread.id, threadResult.turnStateSnapshot)
                     .mergeHydratedThreadMessages(threadResult.thread.id, threadResult.messages)
                     .withThreadLoading(threadResult.thread.id, isLoading = false),
@@ -1262,6 +1442,7 @@ class RemodexDebugViewModel(
                 errorMessage = null,
             )
         }
+        sanitizeRunningThreadWatches()
     }
 
     private suspend fun resolveInterruptibleTurnId(
@@ -1282,13 +1463,17 @@ class RemodexDebugViewModel(
             return null
         }
 
-        applyThreadRead(threadResult)
+        applyThreadRead(
+            threadResult = threadResult,
+            markViewed = _uiState.value.activeThreadId == threadId,
+        )
         return threadResult.turnStateSnapshot.interruptibleTurnId ?: threadResult.turnStateSnapshot.latestTurnId
     }
 
     private suspend fun prepareThreadForDisplay(
         threadId: String,
         forceHydration: Boolean = false,
+        surfaceErrors: Boolean = true,
     ) {
         _uiState.update { current ->
             current.copy(
@@ -1302,7 +1487,11 @@ class RemodexDebugViewModel(
                 availableGitBranchTargets = emptyList(),
                 gitRepoSync = null,
                 isLoadingGitBranchTargets = selectedThreadWorkingDirectory(threadId, current.threads) != null,
-                errorMessage = null,
+                errorMessage = if (surfaceErrors) {
+                    null
+                } else {
+                    current.errorMessage
+                },
             )
         }
 
@@ -1338,36 +1527,83 @@ class RemodexDebugViewModel(
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
                     isLoadingGitBranchTargets = false,
-                    errorMessage = throwable.message,
+                    errorMessage = if (surfaceErrors) {
+                        throwable.message
+                    } else {
+                        current.errorMessage
+                    },
                 )
             }
             return
         }
 
-        if (!shouldLoadThreadHistory(_uiState.value, threadId, forceHydration)) {
-            refreshGitBranchTargets(threadId)
-            _uiState.update { current ->
-                current.copy(
-                    conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
-                )
-            }
-            return
-        }
+        val shouldHydrateHistory = shouldLoadThreadHistory(_uiState.value, threadId, forceHydration)
 
-        runCatching {
+        val threadReadResult = runCatching {
             transport.readThread(threadId = threadId, includeTurns = true)
-        }.onSuccess { threadResult ->
-            applyThreadRead(threadResult)
-            refreshGitBranchTargets(threadId)
+        }.onSuccess { result ->
+            if (shouldHydrateHistory) {
+                applyThreadRead(
+                    threadResult = result,
+                    markViewed = true,
+                )
+            } else {
+                applyThreadTurnStateRefresh(
+                    threadResult = result,
+                    markViewed = true,
+                )
+            }
         }.onFailure { throwable ->
+            if (shouldTreatAsMissingThread(throwable)) {
+                handleMissingThreadLocally(threadId)
+                return
+            }
             _uiState.update { current ->
                 current.copy(
                     conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
                     isLoadingGitBranchTargets = false,
-                    errorMessage = throwable.message,
+                    errorMessage = if (surfaceErrors) {
+                        throwable.message
+                    } else {
+                        current.errorMessage
+                    },
                 )
             }
+            return
+        }.getOrNull()
+
+        if (threadReadResult != null &&
+            _uiState.value.conversation.threadHasActiveOrRunningTurn(threadId)
+        ) {
+            transport.clearResumedThread(threadId)
+            runCatching {
+                transport.resumeThread(
+                    threadId = threadId,
+                    accessMode = _uiState.value.selectedAccessMode,
+                    modelIdentifier = _uiState.value.selectedModelOption?.model,
+                )
+            }.onSuccess { resumeResult ->
+                resumeResult.thread?.let { resumedThread ->
+                    _uiState.update { current ->
+                        current.copy(threads = upsertThread(current.threads, resumedThread))
+                    }
+                }
+            }
         }
+
+        if (!shouldHydrateHistory) {
+            refreshGitBranchTargets(threadId)
+            _uiState.update { current ->
+                current.copy(
+                    conversation = current.conversation.withThreadLoading(threadId, isLoading = false),
+                )
+            }
+            requestImmediateSync(threadId)
+            return
+        }
+
+        refreshGitBranchTargets(threadId)
+        requestImmediateSync(threadId)
     }
 
     private fun shouldLoadThreadHistory(
@@ -1376,6 +1612,42 @@ class RemodexDebugViewModel(
         forceHydration: Boolean,
     ): Boolean {
         return forceHydration || !state.conversation.isHydratedThread(threadId)
+    }
+
+    private fun applyThreadTurnStateRefresh(
+        threadResult: RemodexThreadReadResult,
+        markViewed: Boolean,
+    ) {
+        _uiState.update { current ->
+            val updatedConversation = if (markViewed) {
+                current.conversation.markThreadAsViewed(threadResult.thread.id)
+            } else {
+                current.conversation
+            }
+            current.copy(
+                conversation = updatedConversation
+                    .withRefreshedInFlightTurnState(threadResult.thread.id, threadResult.turnStateSnapshot)
+                    .withThreadLoading(threadResult.thread.id, isLoading = false),
+                threads = upsertThread(current.threads, threadResult.thread),
+                errorMessage = null,
+            )
+        }
+        sanitizeRunningThreadWatches()
+    }
+
+    private fun resolveRecoveryThreadId(
+        preferredThreadId: String?,
+        threads: List<CodexThread>,
+    ): String? {
+        val normalizedPreferredThreadId = preferredThreadId?.trim()?.takeIf(String::isNotEmpty)
+        if (normalizedPreferredThreadId != null &&
+            threads.any { it.id == normalizedPreferredThreadId }
+        ) {
+            return normalizedPreferredThreadId
+        }
+
+        return threads.firstOrNull { it.syncState == CodexThreadSyncState.Live }?.id
+            ?: threads.firstOrNull()?.id
     }
 
     private fun selectedThreadWorkingDirectory(threadId: String?): String? {
@@ -1447,6 +1719,7 @@ class RemodexDebugViewModel(
 
     private fun handleMissingThreadLocally(threadId: String) {
         transport.clearResumedThread(threadId)
+        clearRunningThreadWatch(threadId)
         _uiState.update { current ->
             current.copy(
                 threads = markThreadArchived(current.threads, threadId),
@@ -1487,6 +1760,273 @@ class RemodexDebugViewModel(
         }
 
         return availableModels.firstOrNull(CodexModelOption::isDefault) ?: availableModels.first()
+    }
+
+    private fun canRunRealtimeSyncLoop(): Boolean {
+        return realtimeSyncPolicy.enabled && isTransportConnectedAndInitialized()
+    }
+
+    private fun updateRealtimeSyncState() {
+        if (canRunRealtimeSyncLoop()) {
+            startSyncLoop()
+        } else {
+            stopSyncLoop()
+        }
+    }
+
+    private fun startSyncLoop() {
+        if (!canRunRealtimeSyncLoop()) {
+            stopSyncLoop()
+            return
+        }
+
+        stopSyncLoop()
+        threadListSyncJob = viewModelScope.launch {
+            while (true) {
+                syncThreadsListSilently()
+                refreshInactiveRunningBadgeThreads(realtimeSyncPolicy.inactiveRunningThreadSyncLimit)
+                delay(
+                    if (isAppInForeground) {
+                        realtimeSyncPolicy.threadListForegroundIntervalMillis
+                    } else {
+                        realtimeSyncPolicy.threadListBackgroundIntervalMillis
+                    },
+                )
+            }
+        }
+        activeThreadSyncJob = viewModelScope.launch {
+            while (true) {
+                val activeThreadId = normalizeThreadId(_uiState.value.activeThreadId)
+                if (activeThreadId != null) {
+                    val hasActiveOrRunningTurn = _uiState.value.conversation.threadHasActiveOrRunningTurn(activeThreadId)
+                    syncActiveThreadState(activeThreadId)
+                    delay(
+                        when {
+                            isAppInForeground -> realtimeSyncPolicy.activeThreadForegroundIntervalMillis
+                            hasActiveOrRunningTurn -> realtimeSyncPolicy.activeThreadBackgroundRunningIntervalMillis
+                            else -> realtimeSyncPolicy.activeThreadBackgroundIdleIntervalMillis
+                        },
+                    )
+                    continue
+                }
+
+                delay(
+                    if (isAppInForeground) {
+                        realtimeSyncPolicy.activeThreadForegroundIntervalMillis
+                    } else {
+                        realtimeSyncPolicy.activeThreadBackgroundIdleIntervalMillis
+                    },
+                )
+            }
+        }
+        runningThreadWatchSyncJob = viewModelScope.launch {
+            while (true) {
+                refreshInactiveRunningBadgeThreads(realtimeSyncPolicy.inactiveRunningThreadSyncLimit)
+                delay(
+                    if (isAppInForeground) {
+                        realtimeSyncPolicy.runningThreadWatchForegroundIntervalMillis
+                    } else {
+                        realtimeSyncPolicy.runningThreadWatchBackgroundIntervalMillis
+                    },
+                )
+            }
+        }
+        requestImmediateSync()
+    }
+
+    private fun stopSyncLoop() {
+        threadListSyncJob?.cancel()
+        threadListSyncJob = null
+        activeThreadSyncJob?.cancel()
+        activeThreadSyncJob = null
+        runningThreadWatchSyncJob?.cancel()
+        runningThreadWatchSyncJob = null
+    }
+
+    private fun requestImmediateSync(threadId: String? = _uiState.value.activeThreadId) {
+        if (!canRunRealtimeSyncLoop()) {
+            return
+        }
+
+        viewModelScope.launch {
+            syncThreadsListSilently()
+            refreshInactiveRunningBadgeThreads(realtimeSyncPolicy.inactiveRunningThreadSyncLimit)
+            val targetThreadId = normalizeThreadId(threadId) ?: normalizeThreadId(_uiState.value.activeThreadId)
+            if (targetThreadId != null) {
+                syncActiveThreadState(targetThreadId)
+            }
+        }
+    }
+
+    private suspend fun syncActiveThreadState(threadId: String) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        val wasRunning = _uiState.value.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+        if (wasRunning) {
+            val didRefresh = refreshThreadState(
+                threadId = normalizedThreadId,
+                forceHydration = false,
+                markViewed = _uiState.value.activeThreadId == normalizedThreadId,
+            )
+            if (didRefresh && _uiState.value.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)) {
+                return
+            }
+        }
+
+        syncThreadHistory(
+            threadId = normalizedThreadId,
+            forceHydration = true,
+            markViewed = _uiState.value.activeThreadId == normalizedThreadId,
+            markReadyWhenComplete = false,
+        )
+    }
+
+    private suspend fun refreshInactiveRunningBadgeThreads(limit: Int) {
+        sanitizeRunningThreadWatches()
+
+        val candidateThreadIds = runningThreadWatchById.values
+            .sortedBy(RemodexRunningThreadWatch::expiresAtMillis)
+            .map(RemodexRunningThreadWatch::threadId)
+            .take(limit)
+
+        for (threadId in candidateThreadIds) {
+            val wasRunning = _uiState.value.conversation.threadHasActiveOrRunningTurn(threadId)
+            val didRefresh = refreshThreadState(
+                threadId = threadId,
+                forceHydration = false,
+                markViewed = false,
+            )
+            if (didRefresh && wasRunning && _uiState.value.conversation.threadHasActiveOrRunningTurn(threadId)) {
+                continue
+            }
+
+            syncThreadHistory(
+                threadId = threadId,
+                forceHydration = true,
+                markViewed = false,
+                markReadyWhenComplete = true,
+            )
+        }
+    }
+
+    private suspend fun refreshThreadState(
+        threadId: String,
+        forceHydration: Boolean,
+        markViewed: Boolean,
+    ): Boolean {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return false
+        val threadResult = runCatching {
+            transport.readThread(threadId = normalizedThreadId, includeTurns = true)
+        }.getOrElse { throwable ->
+            if (shouldTreatAsMissingThread(throwable)) {
+                handleMissingThreadLocally(normalizedThreadId)
+            }
+            return false
+        }
+
+        if (forceHydration || !_uiState.value.conversation.isHydratedThread(normalizedThreadId)) {
+            applyThreadRead(
+                threadResult = threadResult,
+                markViewed = markViewed,
+            )
+        } else {
+            applyThreadTurnStateRefresh(
+                threadResult = threadResult,
+                markViewed = markViewed,
+            )
+        }
+        return true
+    }
+
+    private suspend fun syncThreadHistory(
+        threadId: String,
+        forceHydration: Boolean,
+        markViewed: Boolean,
+        markReadyWhenComplete: Boolean,
+    ) {
+        val didRefresh = refreshThreadState(
+            threadId = threadId,
+            forceHydration = forceHydration,
+            markViewed = markViewed,
+        )
+        if (!didRefresh) {
+            return
+        }
+
+        if (!markReadyWhenComplete || _uiState.value.conversation.threadHasActiveOrRunningTurn(threadId)) {
+            return
+        }
+
+        clearRunningThreadWatch(threadId)
+        _uiState.update { current ->
+            val updatedConversation = if (current.conversation.failedThreadIds.contains(threadId)) {
+                current.conversation
+            } else {
+                current.conversation.markReadyIfUnread(threadId)
+            }
+            current.copy(conversation = updatedConversation)
+        }
+    }
+
+    private fun watchRunningThreadIfNeeded(
+        threadId: String?,
+        ttlMillis: Long = realtimeSyncPolicy.runningThreadWatchTtlMillis,
+    ) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        val currentState = _uiState.value
+        if (normalizedThreadId == currentState.activeThreadId ||
+            !currentState.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+        ) {
+            return
+        }
+
+        runningThreadWatchById[normalizedThreadId] = RemodexRunningThreadWatch(
+            threadId = normalizedThreadId,
+            expiresAtMillis = System.currentTimeMillis() + ttlMillis,
+        )
+    }
+
+    private fun clearRunningThreadWatch(threadId: String?) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        runningThreadWatchById.remove(normalizedThreadId)
+    }
+
+    private fun clearRunningThreadWatches() {
+        runningThreadWatchById.clear()
+    }
+
+    private fun handleDisplayedThreadChange(
+        previousThreadId: String?,
+        nextThreadId: String?,
+    ) {
+        val normalizedPreviousThreadId = normalizeThreadId(previousThreadId)
+        val normalizedNextThreadId = normalizeThreadId(nextThreadId)
+        if (normalizedPreviousThreadId == normalizedNextThreadId) {
+            return
+        }
+
+        watchRunningThreadIfNeeded(normalizedPreviousThreadId)
+        clearRunningThreadWatch(normalizedNextThreadId)
+    }
+
+    private fun sanitizeRunningThreadWatches(nowMillis: Long = System.currentTimeMillis()) {
+        val currentState = _uiState.value
+        val availableThreadIds = currentState.threads.mapTo(linkedSetOf(), CodexThread::id)
+        val activeThreadId = currentState.activeThreadId
+        val iterator = runningThreadWatchById.entries.iterator()
+        while (iterator.hasNext()) {
+            val (_, watch) = iterator.next()
+            if (watch.expiresAtMillis <= nowMillis ||
+                watch.threadId == activeThreadId ||
+                !availableThreadIds.contains(watch.threadId) ||
+                !currentState.conversation.threadHasActiveOrRunningTurn(watch.threadId)
+            ) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun normalizeThreadId(threadId: String?): String? {
+        return threadId?.trim()?.takeIf(String::isNotEmpty)
     }
 
     private fun buildTurnStartSummary(result: RemodexTurnStartResult): String {

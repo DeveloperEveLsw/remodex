@@ -3,6 +3,7 @@ package app.remodex.android.core.transport
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
 import app.remodex.android.core.protocol.RpcMessage
+import java.net.SocketException
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -37,6 +38,36 @@ class RemodexTransportClientLifecycleTests {
             "This device was replaced by a newer connection. Scan a new QR code to reconnect.",
             method.invoke(transport, 4003),
         )
+    }
+
+    @Test
+    fun benignSocketClosureClassifiesAsDisconnected() {
+        val transport = RemodexTransportClient(appVersion = "test")
+        val method = RemodexTransportClient::class.java.getDeclaredMethod(
+            "classifyThrowable",
+            Throwable::class.java,
+        )
+        method.isAccessible = true
+
+        val classified = method.invoke(transport, SocketException("Socket closed")) as RemodexTransportException
+
+        assertEquals(RemodexTransportFailureKind.Disconnected, classified.kind)
+        assertEquals("Socket closed", classified.message)
+    }
+
+    @Test
+    fun unknownSocketFailureStaysNetworkScoped() {
+        val transport = RemodexTransportClient(appVersion = "test")
+        val method = RemodexTransportClient::class.java.getDeclaredMethod(
+            "classifyThrowable",
+            Throwable::class.java,
+        )
+        method.isAccessible = true
+
+        val classified = method.invoke(transport, SocketException("Network is unreachable")) as RemodexTransportException
+
+        assertEquals(RemodexTransportFailureKind.Network, classified.kind)
+        assertEquals("Network is unreachable", classified.message)
     }
 
     @Test

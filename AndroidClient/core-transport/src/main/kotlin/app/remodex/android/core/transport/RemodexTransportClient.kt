@@ -19,6 +19,7 @@ import app.remodex.android.core.protocol.RpcMessage
 import java.io.EOFException
 import java.io.InterruptedIOException
 import java.net.ConnectException
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -818,6 +819,8 @@ open class RemodexTransportClient(
                     sessionUrl = sessionUrl,
                     message = classified.message ?: "Transport initialization failed.",
                     isPermanent = classified.isPermanent,
+                    failureKind = classified.kind,
+                    relayCloseCode = classified.relayCloseCode,
                 )
                 throw classified
             }
@@ -1619,6 +1622,8 @@ open class RemodexTransportClient(
             sessionUrl = currentSessionUrl,
             message = throwable.message ?: "Transport connection failed.",
             isPermanent = throwable.isPermanent,
+            failureKind = throwable.kind,
+            relayCloseCode = throwable.relayCloseCode,
         )
     }
 
@@ -1674,6 +1679,27 @@ open class RemodexTransportClient(
                 cause = throwable,
             )
 
+            is SocketException -> {
+                val normalizedMessage = throwable.message?.trim().orEmpty()
+                if (isLikelyBenignSocketClosure(normalizedMessage)) {
+                    RemodexTransportException(
+                        kind = RemodexTransportFailureKind.Disconnected,
+                        message = if (normalizedMessage.isNotEmpty()) {
+                            normalizedMessage
+                        } else {
+                            "Connection closed."
+                        },
+                        cause = throwable,
+                    )
+                } else {
+                    RemodexTransportException(
+                        kind = RemodexTransportFailureKind.Network,
+                        message = normalizedMessage.ifEmpty { "Network error." },
+                        cause = throwable,
+                    )
+                }
+            }
+
             is UnknownHostException,
             is ConnectException,
             is EOFException -> RemodexTransportException(
@@ -1688,6 +1714,30 @@ open class RemodexTransportClient(
                 cause = throwable,
             )
         }
+    }
+
+    private fun isLikelyBenignSocketClosure(message: String): Boolean {
+        val normalizedMessage = message.trim().lowercase()
+        if (normalizedMessage.isEmpty()) {
+            return false
+        }
+
+        val hints = listOf(
+            "socket closed",
+            "socket is closed",
+            "software caused connection abort",
+            "connection abort",
+            "broken pipe",
+            "closed channel",
+            "connection reset by peer",
+            "connection reset",
+            "operation canceled",
+            "operation cancelled",
+            "canceled",
+            "cancelled",
+            "not connected",
+        )
+        return hints.any(normalizedMessage::contains)
     }
 
     private fun shouldRetryWithLegacyRole(

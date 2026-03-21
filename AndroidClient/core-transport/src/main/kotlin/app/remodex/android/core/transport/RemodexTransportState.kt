@@ -32,6 +32,12 @@ sealed interface RemodexTransportState {
         val sessionUrl: String?,
         val message: String,
         val isPermanent: Boolean,
+        val failureKind: RemodexTransportFailureKind = if (isPermanent) {
+            RemodexTransportFailureKind.PermanentRelayClosure
+        } else {
+            RemodexTransportFailureKind.Unknown
+        },
+        val relayCloseCode: Int? = null,
     ) : RemodexTransportState
 }
 

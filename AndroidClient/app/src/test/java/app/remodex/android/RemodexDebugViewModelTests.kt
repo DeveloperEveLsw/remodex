@@ -7,6 +7,7 @@ import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexReasoningEffortOption
 import app.remodex.android.core.model.CodexThread
+import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.GitBranchesWithStatusResult
 import app.remodex.android.core.model.GitCheckoutResult
@@ -31,6 +32,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.JsonObject
@@ -47,6 +49,7 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class RemodexDebugViewModelTests {
     private val dispatcher = UnconfinedTestDispatcher()
+    private val disabledRealtimeSyncPolicy = RemodexRealtimeSyncPolicy(enabled = false)
 
     @Before
     fun setUp() {
@@ -58,6 +61,18 @@ class RemodexDebugViewModelTests {
         Dispatchers.resetMain()
     }
 
+    private fun createViewModel(
+        transport: RemodexTransportClient = FakeTransportClient(),
+        relaySessionStore: RemodexRelaySessionStore = InMemoryRemodexRelaySessionStore(),
+        realtimeSyncPolicy: RemodexRealtimeSyncPolicy = disabledRealtimeSyncPolicy,
+    ): RemodexDebugViewModel {
+        return RemodexDebugViewModel(
+            transport = transport,
+            relaySessionStore = relaySessionStore,
+            realtimeSyncPolicy = realtimeSyncPolicy,
+        )
+    }
+
     @Test
     fun attemptAutoConnectOnLaunchUsesSavedRelayPairing() = runTest {
         val pairing = RemodexPairingPayload(
@@ -66,7 +81,7 @@ class RemodexDebugViewModelTests {
         )
         val store = InMemoryRemodexRelaySessionStore(pairing)
         val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
-        val viewModel = RemodexDebugViewModel(
+        val viewModel = createViewModel(
             transport = transport,
             relaySessionStore = store,
         )
@@ -80,6 +95,47 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun attemptAutoConnectOnLaunchRecoversFirstLiveThreadWhenNoSelectionExists() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-recover",
+        )
+        val thread = CodexThread(
+            id = "thread-recover",
+            title = "Recovered",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                        interruptibleTurnId = "turn-live",
+                        latestTurnId = "turn-live",
+                    ),
+                ),
+            ),
+            threadListResult = listOf(thread),
+            initialConnectionState = RemodexTransportState.Disconnected,
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val viewModel = createViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        viewModel.attemptAutoConnectOnLaunchIfNeeded()
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals(thread.id, state.activeThreadId)
+        assertEquals("turn-live", state.conversation.activeTurnIdByThread[thread.id])
+        assertTrue(transport.recordedMethods.contains("thread/list"))
+        assertTrue(transport.recordedMethods.contains("thread/resume"))
+        assertTrue(transport.recordedMethods.contains("thread/read"))
+    }
+
+    @Test
     fun transientFailureKeepsSavedPairingAndReconnectsOnForeground() = runTest {
         val pairing = RemodexPairingPayload(
             relayUrl = "ws://localhost:9000/relay",
@@ -87,7 +143,7 @@ class RemodexDebugViewModelTests {
         )
         val store = InMemoryRemodexRelaySessionStore(pairing)
         val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
-        val viewModel = RemodexDebugViewModel(
+        val viewModel = createViewModel(
             transport = transport,
             relaySessionStore = store,
         )
@@ -98,6 +154,7 @@ class RemodexDebugViewModelTests {
                 sessionUrl = pairing.relaySessionUrl(),
                 message = "Connection dropped.",
                 isPermanent = false,
+                failureKind = RemodexTransportFailureKind.Disconnected,
             ),
         )
         advanceUntilIdle()
@@ -115,6 +172,66 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun foregroundTransientDisconnectAttemptsImmediateReconnect() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-foreground",
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Connected(
+            sessionUrl = pairing.relaySessionUrl(),
+            isInitialized = true,
+        ))
+        val viewModel = createViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+        advanceUntilIdle()
+
+        transport.emitState(
+            RemodexTransportState.Failed(
+                sessionUrl = pairing.relaySessionUrl(),
+                message = "Connection dropped.",
+                isPermanent = false,
+                failureKind = RemodexTransportFailureKind.Disconnected,
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(listOf(pairing.relaySessionUrl()), transport.connectedSessionUrls)
+        assertNull(viewModel.uiState.value.errorMessage)
+        assertFalse(viewModel.uiState.value.shouldAutoReconnectOnForeground)
+    }
+
+    @Test
+    fun unknownFailureWithSavedPairingSurfacesErrorAndDoesNotQueueReconnect() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-unknown",
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val viewModel = createViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        transport.emitState(
+            RemodexTransportState.Failed(
+                sessionUrl = pairing.relaySessionUrl(),
+                message = "Unexpected relay failure.",
+                isPermanent = false,
+                failureKind = RemodexTransportFailureKind.Unknown,
+            ),
+        )
+        advanceUntilIdle()
+
+        assertFalse(viewModel.uiState.value.shouldAutoReconnectOnForeground)
+        assertEquals("Unexpected relay failure.", viewModel.uiState.value.errorMessage)
+        assertTrue(viewModel.uiState.value.hasSavedRelaySession)
+    }
+
+    @Test
     fun permanentFailureClearsSavedPairing() = runTest {
         val pairing = RemodexPairingPayload(
             relayUrl = "ws://localhost:9000/relay",
@@ -122,7 +239,7 @@ class RemodexDebugViewModelTests {
         )
         val store = InMemoryRemodexRelaySessionStore(pairing)
         val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
-        val viewModel = RemodexDebugViewModel(
+        val viewModel = createViewModel(
             transport = transport,
             relaySessionStore = store,
         )
@@ -148,7 +265,7 @@ class RemodexDebugViewModelTests {
     fun connectWithQrPayloadUsesExistingConnectPipeline() = runTest {
         val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
         val store = InMemoryRemodexRelaySessionStore()
-        val viewModel = RemodexDebugViewModel(
+        val viewModel = createViewModel(
             transport = transport,
             relaySessionStore = store,
         )
@@ -167,7 +284,7 @@ class RemodexDebugViewModelTests {
     fun connectWithQrPayloadSurfacesParseErrorsWithoutPersistingPairing() = runTest {
         val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
         val store = InMemoryRemodexRelaySessionStore()
-        val viewModel = RemodexDebugViewModel(
+        val viewModel = createViewModel(
             transport = transport,
             relaySessionStore = store,
         )
@@ -193,7 +310,7 @@ class RemodexDebugViewModelTests {
                 response = RpcMessage.success(null, JsonObject(emptyMap())),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.startThread()
         advanceUntilIdle()
@@ -243,7 +360,7 @@ class RemodexDebugViewModelTests {
                 response = RpcMessage.success(null, JsonObject(emptyMap())),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(oldThread.id)
         advanceUntilIdle()
@@ -302,7 +419,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -316,7 +433,7 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
-    fun selectThreadHydratesOncePerThreadUntilRecoveryForcesRefresh() = runTest {
+    fun selectThreadRefreshesInFlightTurnStateOnEveryDisplayPreparation() = runTest {
         val thread = CodexThread(
             id = "thread-history",
             title = "History",
@@ -327,17 +444,15 @@ class RemodexDebugViewModelTests {
                 thread.id to RemodexThreadReadResult(thread = thread),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
 
-        assertEquals(
-            listOf("thread/resume", "thread/read", "thread/resume"),
-            transport.recordedMethods.takeLast(3),
-        )
+        assertEquals(2, transport.recordedMethods.count { it == "thread/resume" })
+        assertEquals(2, transport.recordedMethods.count { it == "thread/read" })
     }
 
     @Test
@@ -361,7 +476,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -391,7 +506,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -399,6 +514,208 @@ class RemodexDebugViewModelTests {
         val conversation = viewModel.uiState.value.conversation
         assertEquals("turn-live", conversation.activeTurnIdByThread[thread.id])
         assertTrue(conversation.runningThreadIds.contains(thread.id))
+    }
+
+    @Test
+    fun foregroundReturnRefreshesRunningTurnStateForSelectedThread() = runTest {
+        val thread = CodexThread(
+            id = "thread-running",
+            title = "Running",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                        interruptibleTurnId = "turn-live",
+                        latestTurnId = "turn-live",
+                    ),
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        val initialReadCount = transport.recordedMethods.count { it == "thread/read" }
+
+        viewModel.setForegroundState(false)
+        viewModel.setForegroundState(true)
+        advanceUntilIdle()
+
+        val conversation = viewModel.uiState.value.conversation
+        assertTrue(transport.recordedMethods.count { it == "thread/read" } > initialReadCount)
+        assertEquals("turn-live", conversation.activeTurnIdByThread[thread.id])
+        assertTrue(conversation.runningThreadIds.contains(thread.id))
+    }
+
+    @Test
+    fun immediateRealtimeSyncRecoversActiveThreadAfterMissedCompletion() = runTest {
+        val thread = CodexThread(
+            id = "thread-running",
+            title = "Running",
+            cwd = "/tmp/project",
+        )
+        val completedHistory = listOf(
+            CodexMessage(
+                id = "msg-complete",
+                threadId = thread.id,
+                role = CodexMessageRole.Assistant,
+                kind = CodexMessageKind.Chat,
+                text = "Recovered output",
+                orderIndex = 0,
+            ),
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    messages = completedHistory,
+                ),
+            ),
+            queuedReadThreadResults = mapOf(
+                thread.id to listOf(
+                    RemodexThreadReadResult(
+                        thread = thread,
+                        turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                            interruptibleTurnId = "turn-live",
+                            latestTurnId = "turn-live",
+                        ),
+                    ),
+                    RemodexThreadReadResult(
+                        thread = thread,
+                        messages = completedHistory,
+                    ),
+                    RemodexThreadReadResult(
+                        thread = thread,
+                        messages = completedHistory,
+                    ),
+                ),
+            ),
+            threadListResult = listOf(thread),
+        )
+        val realtimePolicy = RemodexRealtimeSyncPolicy(
+            enabled = true,
+            threadListForegroundIntervalMillis = 60_000L,
+            threadListBackgroundIntervalMillis = 60_000L,
+            activeThreadForegroundIntervalMillis = 60_000L,
+            activeThreadBackgroundIdleIntervalMillis = 60_000L,
+            activeThreadBackgroundRunningIntervalMillis = 60_000L,
+            runningThreadWatchForegroundIntervalMillis = 60_000L,
+            runningThreadWatchBackgroundIntervalMillis = 60_000L,
+        )
+        val viewModel = createViewModel(
+            transport = transport,
+            realtimeSyncPolicy = realtimePolicy,
+        )
+        runCurrent()
+
+        viewModel.selectThread(thread.id)
+        runCurrent()
+
+        val conversation = viewModel.uiState.value.conversation
+        assertEquals(thread.id, viewModel.uiState.value.activeThreadId)
+        assertFalse(conversation.threadHasActiveOrRunningTurn(thread.id))
+        assertEquals("Recovered output", conversation.messagesFor(thread.id).last().text)
+        assertTrue(transport.recordedMethods.count { it == "thread/read" } >= 3)
+
+        viewModel.disconnect()
+        runCurrent()
+    }
+
+    @Test
+    fun immediateRealtimeSyncMarksWatchedInactiveRunningThreadReadyWithoutChangingSelection() = runTest {
+        val runningThread = CodexThread(
+            id = "thread-running",
+            title = "Running",
+            cwd = "/tmp/project",
+        )
+        val nextThread = CodexThread(
+            id = "thread-next",
+            title = "Next",
+            cwd = "/tmp/project",
+        )
+        val completedHistory = listOf(
+            CodexMessage(
+                id = "msg-ready",
+                threadId = runningThread.id,
+                role = CodexMessageRole.Assistant,
+                kind = CodexMessageKind.Chat,
+                text = "Ready output",
+                orderIndex = 0,
+            ),
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                runningThread.id to RemodexThreadReadResult(
+                    thread = runningThread,
+                    messages = completedHistory,
+                ),
+                nextThread.id to RemodexThreadReadResult(
+                    thread = nextThread,
+                ),
+            ),
+            queuedReadThreadResults = mapOf(
+                runningThread.id to listOf(
+                    RemodexThreadReadResult(
+                        thread = runningThread,
+                        turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                            interruptibleTurnId = "turn-live",
+                            latestTurnId = "turn-live",
+                        ),
+                    ),
+                    RemodexThreadReadResult(
+                        thread = runningThread,
+                        turnStateSnapshot = RemodexThreadTurnStateSnapshot(
+                            interruptibleTurnId = "turn-live",
+                            latestTurnId = "turn-live",
+                        ),
+                    ),
+                    RemodexThreadReadResult(
+                        thread = runningThread,
+                        messages = completedHistory,
+                    ),
+                    RemodexThreadReadResult(
+                        thread = runningThread,
+                        messages = completedHistory,
+                    ),
+                ),
+            ),
+            threadListResult = listOf(runningThread, nextThread),
+        )
+        val realtimePolicy = RemodexRealtimeSyncPolicy(
+            enabled = true,
+            threadListForegroundIntervalMillis = 60_000L,
+            threadListBackgroundIntervalMillis = 60_000L,
+            activeThreadForegroundIntervalMillis = 60_000L,
+            activeThreadBackgroundIdleIntervalMillis = 60_000L,
+            activeThreadBackgroundRunningIntervalMillis = 60_000L,
+            runningThreadWatchForegroundIntervalMillis = 60_000L,
+            runningThreadWatchBackgroundIntervalMillis = 60_000L,
+        )
+        val viewModel = createViewModel(
+            transport = transport,
+            realtimeSyncPolicy = realtimePolicy,
+        )
+        runCurrent()
+
+        viewModel.selectThread(runningThread.id)
+        runCurrent()
+        viewModel.selectThread(nextThread.id)
+        runCurrent()
+
+        val state = viewModel.uiState.value
+        assertEquals(nextThread.id, state.activeThreadId)
+        assertEquals(
+            CodexThreadRunBadgeState.Ready,
+            state.conversation.threadRunBadgeState(runningThread.id),
+        )
+        assertFalse(state.conversation.threadHasActiveOrRunningTurn(runningThread.id))
+        assertTrue(transport.recordedMethods.count { it == "thread/read" } >= 5)
+
+        viewModel.disconnect()
+        runCurrent()
     }
 
     @Test
@@ -423,7 +740,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.startThread()
         advanceUntilIdle()
@@ -451,7 +768,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.refreshRuntimeOptions()
         advanceUntilIdle()
@@ -484,7 +801,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.refreshRuntimeOptions()
         advanceUntilIdle()
@@ -527,7 +844,7 @@ class RemodexDebugViewModelTests {
                 response = RpcMessage.success(null, JsonObject(emptyMap())),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.refreshRuntimeOptions()
         advanceUntilIdle()
@@ -560,7 +877,7 @@ class RemodexDebugViewModelTests {
                 response = RpcMessage.success(null, JsonObject(emptyMap())),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.updateDraftTurnInput("Create and send")
         viewModel.startTurn()
@@ -592,7 +909,7 @@ class RemodexDebugViewModelTests {
                 response = RpcMessage.success(null, JsonObject(emptyMap())),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -630,7 +947,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -670,7 +987,7 @@ class RemodexDebugViewModelTests {
                 ),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -703,7 +1020,7 @@ class RemodexDebugViewModelTests {
             ),
             gitStatusResult = GitRepoSyncResult(currentBranch = "main"),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -749,7 +1066,7 @@ class RemodexDebugViewModelTests {
             ),
             gitBranchesWithStatusThrowable = IllegalStateException("branch refresh failed"),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -771,7 +1088,7 @@ class RemodexDebugViewModelTests {
                 thread.id to RemodexThreadReadResult(thread = thread),
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -823,7 +1140,7 @@ class RemodexDebugViewModelTests {
                 aheadCount = 0,
             ),
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -850,7 +1167,7 @@ class RemodexDebugViewModelTests {
             ),
             gitBranchesWithStatusGate = branchGate,
         )
-        val viewModel = RemodexDebugViewModel(transport = transport)
+        val viewModel = createViewModel(transport = transport)
 
         viewModel.selectThread(thread.id)
         advanceUntilIdle()
@@ -865,7 +1182,7 @@ class RemodexDebugViewModelTests {
 
     @Test
     fun selectGitBaseBranchUpdatesPrTargetSelection() = runTest {
-        val viewModel = RemodexDebugViewModel(transport = FakeTransportClient())
+        val viewModel = createViewModel(transport = FakeTransportClient())
 
         viewModel.selectGitBaseBranch("release")
 
@@ -874,6 +1191,7 @@ class RemodexDebugViewModelTests {
 
     private class FakeTransportClient(
         private val readThreadResults: Map<String, RemodexThreadReadResult> = emptyMap(),
+        queuedReadThreadResults: Map<String, List<RemodexThreadReadResult>> = emptyMap(),
         private val threadListResult: List<CodexThread> = emptyList(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
@@ -905,6 +1223,9 @@ class RemodexDebugViewModelTests {
         val connectedSessionUrls = mutableListOf<String>()
         val recordedMethods = mutableListOf<String>()
         private val stateFlow: MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
+        private val queuedReadThreadResultsById = queuedReadThreadResults
+            .mapValues { (_, results) -> java.util.ArrayDeque(results) }
+            .toMutableMap()
 
         init {
             val stateField = RemodexTransportClient::class.java.getDeclaredField("_state")
@@ -960,6 +1281,10 @@ class RemodexDebugViewModelTests {
             includeTurns: Boolean,
         ): RemodexThreadReadResult {
             recordedMethods += "thread/read"
+            val queuedResult = queuedReadThreadResultsById[threadId]?.pollFirst()
+            if (queuedResult != null) {
+                return queuedResult
+            }
             return readThreadResults[threadId] ?: error("No thread/read stub for $threadId")
         }
 
