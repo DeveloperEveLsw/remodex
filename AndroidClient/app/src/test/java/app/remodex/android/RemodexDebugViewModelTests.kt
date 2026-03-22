@@ -577,6 +577,93 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun fileAutocompleteDoesNotStayActiveAfterWhitespaceExtendsMention() = runTest {
+        val thread = CodexThread(
+            id = "thread-file-autocomplete",
+            title = "Thread File Autocomplete",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            fuzzyFileSearchResult = listOf(
+                CodexFuzzyFileMatch(
+                    root = "/tmp/project",
+                    path = "AndroidClient/app/src/main/java/app/remodex/android/MainActivity.kt",
+                    fileName = "MainActivity.kt",
+                    score = 0.97,
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.refreshThreads()
+        advanceUntilIdle()
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("@Main")
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.isFileAutocompleteVisible)
+        assertEquals("Main", viewModel.uiState.value.fileAutocompleteQuery)
+        assertEquals(1, transport.recordedMethods.count { it == "fuzzyFileSearch" })
+
+        viewModel.updateDraftTurnInput("@MainActivity.kt is this expected?")
+        advanceUntilIdle()
+
+        assertFalse(viewModel.uiState.value.isFileAutocompleteVisible)
+        assertEquals("", viewModel.uiState.value.fileAutocompleteQuery)
+        assertEquals(1, transport.recordedMethods.count { it == "fuzzyFileSearch" })
+    }
+
+    @Test
+    fun fileAutocompleteDoesNotReopenAfterSelectedMentionFollowedByPlainText() = runTest {
+        val thread = CodexThread(
+            id = "thread-file-selection",
+            title = "Thread File Selection",
+            cwd = "/tmp/project",
+        )
+        val selectedFile = CodexFuzzyFileMatch(
+            root = "/tmp/project",
+            path = "AndroidClient/app/src/main/java/app/remodex/android/MainActivity.kt",
+            fileName = "MainActivity.kt",
+            score = 0.99,
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            fuzzyFileSearchResult = listOf(selectedFile),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.refreshThreads()
+        advanceUntilIdle()
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("@MainAct")
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.isFileAutocompleteVisible)
+
+        viewModel.selectFileAutocomplete(selectedFile)
+        advanceUntilIdle()
+        assertEquals("@MainActivity.kt ", viewModel.uiState.value.draftTurnInput)
+        assertFalse(viewModel.uiState.value.isFileAutocompleteVisible)
+
+        viewModel.updateDraftTurnInput("@MainActivity.kt is this expected?")
+        advanceUntilIdle()
+
+        assertFalse(viewModel.uiState.value.isFileAutocompleteVisible)
+        assertEquals("", viewModel.uiState.value.fileAutocompleteQuery)
+        assertEquals(1, transport.recordedMethods.count { it == "fuzzyFileSearch" })
+    }
+
+    @Test
     fun startTurnSendsSelectedSkillMentionsWithIosEnvelope() = runTest {
         val thread = CodexThread(
             id = "thread-2",
@@ -2264,6 +2351,7 @@ class RemodexDebugViewModelTests {
         private val gitResetThrowable: Throwable? = null,
         private val gitRemoteUrlResult: GitRemoteUrlResult = GitRemoteUrlResult(),
         private val gitRemoteUrlThrowable: Throwable? = null,
+        private val fuzzyFileSearchResult: List<CodexFuzzyFileMatch> = emptyList(),
         private val revertPreviewResult: RevertPreviewResult = RevertPreviewResult(),
         private val revertPreviewThrowable: Throwable? = null,
         private val revertApplyResult: RevertApplyResult = RevertApplyResult(),
@@ -2435,6 +2523,15 @@ class RemodexDebugViewModelTests {
         override suspend fun listCollaborationModes(): List<app.remodex.android.core.model.CodexCollaborationModeKind> {
             recordedMethods += "collaborationMode/list"
             return listOf(app.remodex.android.core.model.CodexCollaborationModeKind.Default)
+        }
+
+        override suspend fun fuzzyFileSearch(
+            query: String,
+            roots: List<String>,
+            cancellationToken: String?,
+        ): List<CodexFuzzyFileMatch> {
+            recordedMethods += "fuzzyFileSearch"
+            return fuzzyFileSearchResult
         }
 
         override suspend fun gitBranchesWithStatus(

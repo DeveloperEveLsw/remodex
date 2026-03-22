@@ -2768,10 +2768,7 @@ class RemodexDebugViewModel(
             return null
         }
         if (query.any(Char::isWhitespace)) {
-            val looksFileLike = query.contains('/') || query.contains('\\') || query.contains('.')
-            if (!looksFileLike) {
-                return null
-            }
+            return null
         }
 
         return RemodexTrailingFileAutocompleteToken(
