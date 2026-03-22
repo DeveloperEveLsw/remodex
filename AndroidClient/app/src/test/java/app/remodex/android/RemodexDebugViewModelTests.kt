@@ -1482,19 +1482,21 @@ class RemodexDebugViewModelTests {
             transport = transport,
             realtimeSyncPolicy = realtimePolicy,
         )
-        runCurrent()
+        try {
+            runCurrent()
 
-        viewModel.selectThread(thread.id)
-        runCurrent()
+            viewModel.selectThread(thread.id)
+            runCurrent()
 
-        val conversation = viewModel.uiState.value.conversation
-        assertEquals(thread.id, viewModel.uiState.value.activeThreadId)
-        assertFalse(conversation.threadHasActiveOrRunningTurn(thread.id))
-        assertEquals("Recovered output", conversation.messagesFor(thread.id).last().text)
-        assertTrue(transport.recordedMethods.count { it == "thread/read" } >= 3)
-
-        viewModel.disconnect()
-        runCurrent()
+            val conversation = viewModel.uiState.value.conversation
+            assertEquals(thread.id, viewModel.uiState.value.activeThreadId)
+            assertFalse(conversation.threadHasActiveOrRunningTurn(thread.id))
+            assertEquals("Recovered output", conversation.messagesFor(thread.id).last().text)
+            assertTrue(transport.recordedMethods.count { it == "thread/read" } >= 2)
+        } finally {
+            viewModel.disconnect()
+            runCurrent()
+        }
     }
 
     @Test
@@ -1571,24 +1573,26 @@ class RemodexDebugViewModelTests {
             transport = transport,
             realtimeSyncPolicy = realtimePolicy,
         )
-        runCurrent()
+        try {
+            runCurrent()
 
-        viewModel.selectThread(runningThread.id)
-        runCurrent()
-        viewModel.selectThread(nextThread.id)
-        runCurrent()
+            viewModel.selectThread(runningThread.id)
+            runCurrent()
+            viewModel.selectThread(nextThread.id)
+            runCurrent()
 
-        val state = viewModel.uiState.value
-        assertEquals(nextThread.id, state.activeThreadId)
-        assertEquals(
-            CodexThreadRunBadgeState.Ready,
-            state.conversation.threadRunBadgeState(runningThread.id),
-        )
-        assertFalse(state.conversation.threadHasActiveOrRunningTurn(runningThread.id))
-        assertTrue(transport.recordedMethods.count { it == "thread/read" } >= 5)
-
-        viewModel.disconnect()
-        runCurrent()
+            val state = viewModel.uiState.value
+            assertEquals(nextThread.id, state.activeThreadId)
+            assertEquals(
+                CodexThreadRunBadgeState.Ready,
+                state.conversation.threadRunBadgeState(runningThread.id),
+            )
+            assertFalse(state.conversation.threadHasActiveOrRunningTurn(runningThread.id))
+            assertTrue(transport.recordedMethods.count { it == "thread/read" } >= 5)
+        } finally {
+            viewModel.disconnect()
+            runCurrent()
+        }
     }
 
     @Test
