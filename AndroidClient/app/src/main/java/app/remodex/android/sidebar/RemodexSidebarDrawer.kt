@@ -88,7 +88,10 @@ internal fun RemodexSidebarDrawer(
             RemodexSidebarConnectionPanel(
                 uiState = uiState,
                 showDeveloperPanels = showDeveloperPanels,
-                connectionStateLabel = connectionStateLabel(uiState.connectionState),
+                connectionStateLabel = connectionStateLabel(
+                    uiState.connectionState,
+                    uiState.connectionRecoveryState,
+                ),
                 onOpenSettings = onOpenSettings,
                 onToggleDeveloperPanels = onToggleDeveloperPanels,
                 onRefreshThreads = onRefreshThreads,

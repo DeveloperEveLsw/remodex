@@ -2,7 +2,16 @@ package app.remodex.android
 
 import app.remodex.android.core.transport.RemodexTransportState
 
-internal fun connectionStateLabel(state: RemodexTransportState): String {
+internal fun connectionStateLabel(
+    state: RemodexTransportState,
+    recoveryState: RemodexConnectionRecoveryState = RemodexConnectionRecoveryState.Idle,
+): String {
+    if (state !is RemodexTransportState.Connected &&
+        recoveryState is RemodexConnectionRecoveryState.Retrying
+    ) {
+        return "Retrying ${maxOf(1, recoveryState.attempt)}"
+    }
+
     return when (state) {
         RemodexTransportState.Disconnected -> "Disconnected"
         is RemodexTransportState.Connecting -> "Connecting ${state.attempt}"

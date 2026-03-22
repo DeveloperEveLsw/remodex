@@ -217,6 +217,13 @@ class RemodexDebugViewModelTests {
         assertTrue(viewModel.uiState.value.shouldAutoReconnectOnForeground)
         assertTrue(viewModel.uiState.value.hasSavedRelaySession)
         assertNull(viewModel.uiState.value.errorMessage)
+        assertEquals(
+            RemodexConnectionRecoveryState.Retrying(
+                attempt = 0,
+                message = "Reconnecting...",
+            ),
+            viewModel.uiState.value.connectionRecoveryState,
+        )
 
         viewModel.setForegroundState(true)
         advanceUntilIdle()
@@ -224,6 +231,7 @@ class RemodexDebugViewModelTests {
         assertEquals(listOf(pairing.relaySessionUrl()), transport.connectedSessionUrls)
         assertFalse(viewModel.uiState.value.shouldAutoReconnectOnForeground)
         assertFalse(viewModel.uiState.value.isAttemptingAutoReconnect)
+        assertEquals(RemodexConnectionRecoveryState.Idle, viewModel.uiState.value.connectionRecoveryState)
     }
 
     @Test
@@ -256,6 +264,35 @@ class RemodexDebugViewModelTests {
         assertEquals(listOf(pairing.relaySessionUrl()), transport.connectedSessionUrls)
         assertNull(viewModel.uiState.value.errorMessage)
         assertFalse(viewModel.uiState.value.shouldAutoReconnectOnForeground)
+        assertEquals(RemodexConnectionRecoveryState.Idle, viewModel.uiState.value.connectionRecoveryState)
+    }
+
+    @Test
+    fun foregroundTransientFailureReconnectsImmediatelyWithoutInitializedConnectedPreviousState() = runTest {
+        val pairing = RemodexPairingPayload(
+            relayUrl = "ws://localhost:9000/relay",
+            sessionId = "session-active-recover",
+        )
+        val store = InMemoryRemodexRelaySessionStore(pairing)
+        val transport = FakeTransportClient(initialConnectionState = RemodexTransportState.Disconnected)
+        val viewModel = createViewModel(
+            transport = transport,
+            relaySessionStore = store,
+        )
+
+        transport.emitState(
+            RemodexTransportState.Failed(
+                sessionUrl = pairing.relaySessionUrl(),
+                message = "Connection dropped.",
+                isPermanent = false,
+                failureKind = RemodexTransportFailureKind.Disconnected,
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(listOf(pairing.relaySessionUrl()), transport.connectedSessionUrls)
+        assertFalse(viewModel.uiState.value.shouldAutoReconnectOnForeground)
+        assertEquals(RemodexConnectionRecoveryState.Idle, viewModel.uiState.value.connectionRecoveryState)
     }
 
     @Test
@@ -1331,6 +1368,59 @@ class RemodexDebugViewModelTests {
                 .last { it.role == CodexMessageRole.Assistant }
                 .text,
         )
+    }
+
+    @Test
+    fun foregroundReturnSkipsHydrationMergeWhileThreadStillRunning() = runTest {
+        val thread = CodexThread(
+            id = "thread-hydration-running",
+            title = "Hydration Running",
+            cwd = "/tmp/project",
+        )
+        val staleSnapshotMessage = CodexMessage(
+            id = "msg-stale",
+            threadId = thread.id,
+            role = CodexMessageRole.Assistant,
+            kind = CodexMessageKind.Chat,
+            text = "stale snapshot output",
+            turnId = "turn-live",
+            itemId = "item-live",
+            orderIndex = 0,
+        )
+        val runningSnapshot = RemodexThreadTurnStateSnapshot(
+            interruptibleTurnId = "turn-live",
+            latestTurnId = "turn-live",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    turnStateSnapshot = runningSnapshot,
+                ),
+            ),
+            queuedReadThreadResults = mapOf(
+                thread.id to listOf(
+                    RemodexThreadReadResult(
+                        thread = thread,
+                        messages = listOf(staleSnapshotMessage),
+                        turnStateSnapshot = runningSnapshot,
+                    ),
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.conversation.threadHasActiveOrRunningTurn(thread.id))
+        assertTrue(viewModel.uiState.value.conversation.messagesFor(thread.id).isEmpty())
+
+        viewModel.setForegroundState(false)
+        viewModel.setForegroundState(true)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.conversation.threadHasActiveOrRunningTurn(thread.id))
+        assertTrue(viewModel.uiState.value.conversation.messagesFor(thread.id).isEmpty())
     }
 
     @Test

@@ -75,6 +75,7 @@ data class RemodexDebugUiState(
     val hasSavedRelaySession: Boolean = false,
     val shouldAutoReconnectOnForeground: Boolean = false,
     val isAttemptingAutoReconnect: Boolean = false,
+    val connectionRecoveryState: RemodexConnectionRecoveryState = RemodexConnectionRecoveryState.Idle,
     val connectionState: RemodexTransportState = RemodexTransportState.Disconnected,
     val lastNotificationMethod: String? = null,
     val lastServerRequestMethod: String? = null,
@@ -1021,6 +1022,7 @@ class RemodexDebugViewModel(
                     isBusy = false,
                     shouldAutoReconnectOnForeground = false,
                     isAttemptingAutoReconnect = false,
+                    connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                     isStartingThread = false,
                     isStartingTurn = false,
                     currentGitBranch = "",
@@ -1084,6 +1086,7 @@ class RemodexDebugViewModel(
                 hasSavedRelaySession = false,
                 shouldAutoReconnectOnForeground = false,
                 isAttemptingAutoReconnect = false,
+                connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
             )
         }
     }
@@ -1106,6 +1109,7 @@ class RemodexDebugViewModel(
                 parsedPairing = pairing,
                 sessionUrl = pairing.relaySessionUrl(),
                 isBusy = true,
+                connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                 errorMessage = null,
             )
         }
@@ -1121,6 +1125,7 @@ class RemodexDebugViewModel(
             _uiState.update { current ->
                 current.copy(
                     isBusy = false,
+                    connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                     errorMessage = userFacingConnectFailureMessage(throwable),
                 )
             }
@@ -1140,6 +1145,7 @@ class RemodexDebugViewModel(
                         isBusy = false,
                         isAttemptingAutoReconnect = false,
                         shouldAutoReconnectOnForeground = false,
+                        connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                         pendingApproval = null,
                         isHandlingPendingApproval = false,
                         submittingStructuredRequestKeys = emptySet(),
@@ -1155,6 +1161,7 @@ class RemodexDebugViewModel(
                             isBusy = false,
                             shouldAutoReconnectOnForeground = false,
                             isAttemptingAutoReconnect = false,
+                            connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                             errorMessage = null,
                         )
                     }
@@ -1172,9 +1179,7 @@ class RemodexDebugViewModel(
             is RemodexTransportState.Retrying -> Unit
         }
 
-        if (previousState is RemodexTransportState.Connected &&
-            previousState.isInitialized &&
-            state is RemodexTransportState.Failed &&
+        if (state is RemodexTransportState.Failed &&
             isAppInForeground &&
             shouldAttemptAutoRecovery(state)
         ) {
@@ -1191,6 +1196,7 @@ class RemodexDebugViewModel(
                     pendingApproval = null,
                     isHandlingPendingApproval = false,
                     submittingStructuredRequestKeys = emptySet(),
+                    connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                     errorMessage = state.message,
                 )
             }
@@ -1204,6 +1210,14 @@ class RemodexDebugViewModel(
                 isBusy = false,
                 shouldAutoReconnectOnForeground = shouldSuppressMessage || shouldAttemptAutoRecovery,
                 isAttemptingAutoReconnect = false,
+                connectionRecoveryState = if (shouldAttemptAutoRecovery) {
+                    RemodexConnectionRecoveryState.Retrying(
+                        attempt = 0,
+                        message = recoveryStatusMessage(state),
+                    )
+                } else {
+                    RemodexConnectionRecoveryState.Idle
+                },
                 pendingApproval = null,
                 isHandlingPendingApproval = false,
                 submittingStructuredRequestKeys = emptySet(),
@@ -1241,8 +1255,8 @@ class RemodexDebugViewModel(
         return !state.isPermanent && state.failureKind == RemodexTransportFailureKind.Disconnected
     }
 
-    private fun attemptAutoReconnectOnForegroundIfNeeded() {
-        if (!_uiState.value.shouldAutoReconnectOnForeground || isRunningAutoReconnect) {
+    fun attemptAutoReconnectOnForegroundIfNeeded() {
+        if (!isAppInForeground || !_uiState.value.shouldAutoReconnectOnForeground || isRunningAutoReconnect) {
             return
         }
 
@@ -1253,6 +1267,7 @@ class RemodexDebugViewModel(
                     current.copy(
                         shouldAutoReconnectOnForeground = false,
                         isAttemptingAutoReconnect = false,
+                        connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                     )
                 }
                 return@launch
@@ -1262,6 +1277,7 @@ class RemodexDebugViewModel(
             _uiState.update { current ->
                 current.copy(
                     isAttemptingAutoReconnect = true,
+                    connectionRecoveryState = current.connectionRecoveryState.retryingWithFallback(),
                     errorMessage = null,
                 )
             }
@@ -1274,6 +1290,7 @@ class RemodexDebugViewModel(
                             current.copy(
                                 shouldAutoReconnectOnForeground = false,
                                 isAttemptingAutoReconnect = false,
+                                connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                                 errorMessage = null,
                             )
                         }
@@ -1292,6 +1309,7 @@ class RemodexDebugViewModel(
                             current.copy(
                                 shouldAutoReconnectOnForeground = false,
                                 isAttemptingAutoReconnect = false,
+                                connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                                 errorMessage = null,
                             )
                         }
@@ -1301,6 +1319,7 @@ class RemodexDebugViewModel(
                             clearSavedRelayPairing()
                             _uiState.update { current ->
                                 current.copy(
+                                    connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                                     errorMessage = userFacingConnectFailureMessage(throwable),
                                 )
                             }
@@ -1312,6 +1331,7 @@ class RemodexDebugViewModel(
                                 current.copy(
                                     shouldAutoReconnectOnForeground = false,
                                     isAttemptingAutoReconnect = false,
+                                    connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                                     errorMessage = userFacingConnectFailureMessage(throwable),
                                 )
                             }
@@ -1319,6 +1339,14 @@ class RemodexDebugViewModel(
                         }
 
                         attempt += 1
+                        _uiState.update { current ->
+                            current.copy(
+                                connectionRecoveryState = RemodexConnectionRecoveryState.Retrying(
+                                    attempt = attempt,
+                                    message = recoveryStatusMessage(throwable),
+                                ),
+                            )
+                        }
                         delay(
                             AUTO_RECONNECT_BACKOFF_MILLIS[
                                 minOf(attempt - 1, AUTO_RECONNECT_BACKOFF_MILLIS.lastIndex)
@@ -1331,6 +1359,7 @@ class RemodexDebugViewModel(
                     current.copy(
                         shouldAutoReconnectOnForeground = false,
                         isAttemptingAutoReconnect = false,
+                        connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
                         errorMessage = "Could not reconnect. Tap Reconnect to try again.",
                     )
                 }
@@ -1344,64 +1373,84 @@ class RemodexDebugViewModel(
         pairing: RemodexPairingPayload,
         performAutoRetry: Boolean,
     ): RemodexHandshakeResult {
-        val attemptLimit = if (performAutoRetry) {
-            AUTO_RECONNECT_BACKOFF_MILLIS.size
-        } else {
-            0
-        }
-
-        var attemptIndex = 0
-        var lastError: Throwable? = null
-        while (attemptIndex <= attemptLimit) {
-            if (attemptIndex > 0) {
-                _uiState.update { current ->
-                    current.copy(
-                        isAttemptingAutoReconnect = true,
-                        errorMessage = null,
-                    )
-                }
+        isRunningAutoReconnect = true
+        try {
+            val attemptLimit = if (performAutoRetry) {
+                AUTO_RECONNECT_BACKOFF_MILLIS.size
+            } else {
+                0
             }
 
-            runCatching {
-                transport.connect(pairing = pairing)
-            }.onSuccess { handshake ->
-                _uiState.update { current ->
-                    current.copy(
-                        isBusy = false,
-                        isAttemptingAutoReconnect = false,
-                        shouldAutoReconnectOnForeground = false,
-                        errorMessage = null,
-                    )
-                }
-                return handshake
-            }.onFailure { throwable ->
-                lastError = throwable
-                if (isPermanentFailure(throwable)) {
-                    clearSavedRelayPairing()
-                    throw throwable
+            var attemptIndex = 0
+            var lastError: Throwable? = null
+            while (attemptIndex <= attemptLimit) {
+                if (attemptIndex > 0) {
+                    val retryMessage = lastError?.let(::recoveryStatusMessage) ?: "Reconnecting..."
+                    _uiState.update { current ->
+                        current.copy(
+                            isAttemptingAutoReconnect = true,
+                            connectionRecoveryState = RemodexConnectionRecoveryState.Retrying(
+                                attempt = attemptIndex,
+                                message = retryMessage,
+                            ),
+                            errorMessage = null,
+                        )
+                    }
                 }
 
-                if (!performAutoRetry ||
-                    !transport.isRecoverableTransientFailure(throwable) ||
-                    attemptIndex >= AUTO_RECONNECT_BACKOFF_MILLIS.size
-                ) {
+                runCatching {
+                    transport.connect(pairing = pairing)
+                }.onSuccess { handshake ->
                     _uiState.update { current ->
                         current.copy(
                             isBusy = false,
                             isAttemptingAutoReconnect = false,
                             shouldAutoReconnectOnForeground = false,
+                            connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
+                            errorMessage = null,
                         )
                     }
-                    throw throwable
+                    return handshake
+                }.onFailure { throwable ->
+                    lastError = throwable
+                    if (isPermanentFailure(throwable)) {
+                        clearSavedRelayPairing()
+                        throw throwable
+                    }
+
+                    if (!performAutoRetry ||
+                        !transport.isRecoverableTransientFailure(throwable) ||
+                        attemptIndex >= AUTO_RECONNECT_BACKOFF_MILLIS.size
+                    ) {
+                        _uiState.update { current ->
+                            current.copy(
+                                isBusy = false,
+                                isAttemptingAutoReconnect = false,
+                                shouldAutoReconnectOnForeground = false,
+                                connectionRecoveryState = RemodexConnectionRecoveryState.Idle,
+                            )
+                        }
+                        throw throwable
+                    }
+
+                    _uiState.update { current ->
+                        current.copy(
+                            connectionRecoveryState = RemodexConnectionRecoveryState.Retrying(
+                                attempt = attemptIndex + 1,
+                                message = recoveryStatusMessage(throwable),
+                            ),
+                        )
+                    }
+                    delay(AUTO_RECONNECT_BACKOFF_MILLIS[attemptIndex])
                 }
 
-                delay(AUTO_RECONNECT_BACKOFF_MILLIS[attemptIndex])
+                attemptIndex += 1
             }
 
-            attemptIndex += 1
+            throw lastError ?: IllegalStateException("Connection failed.")
+        } finally {
+            isRunningAutoReconnect = false
         }
-
-        throw lastError ?: IllegalStateException("Connection failed.")
     }
 
     private fun isTransportConnectedOrConnecting(): Boolean {
@@ -1436,6 +1485,32 @@ class RemodexDebugViewModel(
             transportError.kind == RemodexTransportFailureKind.Timeout -> "Connection timed out. Check server/network."
             transportError.kind == RemodexTransportFailureKind.Disconnected -> "Connection was interrupted. Tap Reconnect to try again."
             else -> transportError.message
+        }
+    }
+
+    private fun recoveryStatusMessage(state: RemodexTransportState.Failed): String {
+        return when (state.failureKind) {
+            RemodexTransportFailureKind.Timeout -> "Connection timed out. Retrying..."
+            RemodexTransportFailureKind.Network,
+            RemodexTransportFailureKind.Disconnected -> "Reconnecting..."
+            RemodexTransportFailureKind.PermanentRelayClosure,
+            RemodexTransportFailureKind.Protocol,
+            RemodexTransportFailureKind.Rpc,
+            RemodexTransportFailureKind.Unknown -> state.message
+        }
+    }
+
+    private fun recoveryStatusMessage(throwable: Throwable): String {
+        val transportError = throwable as? RemodexTransportException
+        return when (transportError?.kind) {
+            RemodexTransportFailureKind.Timeout -> "Connection timed out. Retrying..."
+            RemodexTransportFailureKind.Network,
+            RemodexTransportFailureKind.Disconnected -> "Reconnecting..."
+            RemodexTransportFailureKind.PermanentRelayClosure,
+            RemodexTransportFailureKind.Protocol,
+            RemodexTransportFailureKind.Rpc,
+            RemodexTransportFailureKind.Unknown,
+            null -> "Reconnecting..."
         }
     }
 
@@ -3446,10 +3521,15 @@ class RemodexDebugViewModel(
             } else {
                 current.conversation
             }
+            val refreshedConversation = updatedConversation
+                .withRefreshedInFlightTurnState(threadResult.thread.id, threadResult.turnStateSnapshot)
+            val mergedConversation = if (refreshedConversation.threadHasActiveOrRunningTurn(threadResult.thread.id)) {
+                refreshedConversation
+            } else {
+                refreshedConversation.mergeHydratedThreadMessages(threadResult.thread.id, threadResult.messages)
+            }
             current.copy(
-                conversation = updatedConversation
-                    .withRefreshedInFlightTurnState(threadResult.thread.id, threadResult.turnStateSnapshot)
-                    .mergeHydratedThreadMessages(threadResult.thread.id, threadResult.messages)
+                conversation = mergedConversation
                     .withThreadLoading(threadResult.thread.id, isLoading = false),
                 threads = upsertThread(current.threads, threadResult.thread),
                 errorMessage = null,
@@ -5021,5 +5101,16 @@ fun reasoningTitle(effort: String): String {
                 token.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
             }
             .ifBlank { effort }
+    }
+}
+
+private fun RemodexConnectionRecoveryState.retryingWithFallback(): RemodexConnectionRecoveryState {
+    return if (this is RemodexConnectionRecoveryState.Retrying) {
+        this
+    } else {
+        RemodexConnectionRecoveryState.Retrying(
+            attempt = 0,
+            message = "Reconnecting...",
+        )
     }
 }

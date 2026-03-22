@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.remodex.android.RemodexConnectionRecoveryState
 import app.remodex.android.RemodexDebugUiState
 import app.remodex.android.core.transport.RemodexTransportState
 
@@ -145,6 +146,17 @@ internal fun RemodexSidebarConnectionPanel(
                     connectionStateLabel = connectionStateLabel,
                     planSupported = uiState.supportsPlanCollaborationMode,
                 )
+
+                val recoveryMessage = (uiState.connectionRecoveryState as? RemodexConnectionRecoveryState.Retrying)
+                    ?.message
+                    ?.takeIf(String::isNotBlank)
+                if (!isConnected && recoveryMessage != null) {
+                    Text(
+                        text = recoveryMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
 
                 uiState.sessionUrl?.let { sessionUrl ->
                     Text(

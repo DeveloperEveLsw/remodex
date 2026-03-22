@@ -292,6 +292,12 @@ fun RemodexAndroidRoot() {
         viewModel.attemptAutoConnectOnLaunchIfNeeded()
     }
 
+    LaunchedEffect(uiState.shouldAutoReconnectOnForeground) {
+        if (uiState.shouldAutoReconnectOnForeground) {
+            viewModel.attemptAutoReconnectOnForegroundIfNeeded()
+        }
+    }
+
     DisposableEffect(lifecycleOwner, viewModel) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -1507,7 +1513,12 @@ private fun SettingsSheet(
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Text(
-                            text = "Status: ${connectionStateLabel(uiState.connectionState).lowercase()}",
+                            text = "Status: ${
+                                connectionStateLabel(
+                                    uiState.connectionState,
+                                    uiState.connectionRecoveryState,
+                                ).lowercase()
+                            }",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
