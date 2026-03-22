@@ -1,6 +1,8 @@
 package app.remodex.android.core.transport
 
+import app.remodex.android.core.model.CodexCommandExecutionPhase
 import app.remodex.android.core.model.CodexImageAttachment
+import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
@@ -892,6 +894,65 @@ class RemodexTransportClientLifecycleTests {
         assertEquals(2, result.messages.size)
         assertEquals("2026-03-22T00:00:11Z", result.messages[0].createdAt?.toString())
         assertEquals("2026-03-22T00:00:10.001Z", result.messages[1].createdAt?.toString())
+    }
+
+    @Test
+    fun readThreadDecodesCommandExecutionDetailsFromHistory() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("thread/read") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "thread" to JsonObject(
+                                    mapOf(
+                                        "id" to JsonPrimitive("thread-live"),
+                                        "title" to JsonPrimitive("Conversation"),
+                                        "turns" to JsonArray(
+                                            listOf(
+                                                JsonObject(
+                                                    mapOf(
+                                                        "id" to JsonPrimitive("turn-1"),
+                                                        "items" to JsonArray(
+                                                            listOf(
+                                                                JsonObject(
+                                                                    mapOf(
+                                                                        "id" to JsonPrimitive("command-1"),
+                                                                        "type" to JsonPrimitive("commandExecution"),
+                                                                        "status" to JsonPrimitive("completed"),
+                                                                        "command" to JsonArray(
+                                                                            listOf(
+                                                                                JsonPrimitive("/bin/zsh"),
+                                                                                JsonPrimitive("-lc"),
+                                                                                JsonPrimitive("git status --short"),
+                                                                            ),
+                                                                        ),
+                                                                    ),
+                                                                ),
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        val result = transport.readThread(threadId = "thread-live")
+
+        assertEquals(1, result.messages.size)
+        val commandMessage = result.messages.single()
+        assertEquals(CodexMessageKind.CommandExecution, commandMessage.kind)
+        assertEquals("completed git status --short", commandMessage.text)
+        assertEquals("/bin/zsh -lc git status --short", commandMessage.commandExecutionDetails?.rawCommand)
+        assertEquals(CodexCommandExecutionPhase.Completed, commandMessage.commandExecutionDetails?.phase)
     }
 
     private data class ScriptedStep(

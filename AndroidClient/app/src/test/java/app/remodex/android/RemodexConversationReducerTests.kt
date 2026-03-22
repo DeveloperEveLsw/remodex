@@ -2,6 +2,7 @@ package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
+import app.remodex.android.core.model.CodexCommandExecutionPhase
 import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.protocol.RpcMessage
 import kotlinx.serialization.json.JsonObject
@@ -615,6 +616,7 @@ class RemodexConversationReducerTests {
         assertEquals(1, commandRows.size)
         assertEquals("running Read MainActivity.kt", commandRows.single().text)
         assertEquals("Read MainActivity.kt", commandRows.single().commandExecutionDetails?.summary)
+        assertEquals(CodexCommandExecutionPhase.Running, commandRows.single().commandExecutionDetails?.phase)
         assertTrue(
             commandRows.single().commandExecutionDetails?.rawCommand?.contains("nl -ba AndroidClient/app/src/main/java/app/remodex/android/MainActivity.kt") == true,
         )
@@ -648,6 +650,8 @@ class RemodexConversationReducerTests {
         assertTrue(commandRow.text.startsWith("running "))
         assertTrue(commandRow.text.contains("mkdir tmp && touch"))
         assertEquals("mkdir tmp && touch tmp/smoke.txt", commandRow.commandExecutionDetails?.rawCommand)
+        assertEquals(CodexCommandExecutionPhase.Running, commandRow.commandExecutionDetails?.phase)
+        assertEquals(null, commandRow.commandExecutionDetails?.summary)
     }
 
     @Test

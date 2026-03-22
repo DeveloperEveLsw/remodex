@@ -121,6 +121,7 @@ import app.remodex.android.core.model.AssistantRevertPresentation
 import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexCommandExecutionPhase
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
@@ -3836,79 +3837,108 @@ private fun FileChangeSystemBlock(message: CodexMessage) {
 
 @Composable
 private fun CommandExecutionSystemBlock(message: CodexMessage) {
-    val status = parseCommandExecutionStatus(message)
+    val presentation = remember(message.text, message.commandExecutionDetails, message.isStreaming) {
+        RemodexCommandExecutionPresenter.present(message)
+    }
+    if (presentation == null) {
+        DefaultSystemBlock(message = message)
+        return
+    }
     var isExpanded by rememberSaveable(message.id) { mutableStateOf(false) }
-    val rawCommand = status?.rawCommand
-    val canExpand = rawCommand != null && rawCommand != status.summary
-    SystemCardContainer(
-        message = message,
-        title = "Command",
-        tone = assistantKindTone(CodexMessageKind.CommandExecution),
-        isStreaming = message.isStreaming,
-    ) {
-        if (status != null) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    val canExpand = presentation.rawCommand != null || presentation.detailStatusLabel.isNotBlank()
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = canExpand) { isExpanded = !isExpanded },
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.KeyboardArrowDown,
+                contentDescription = null,
+                tint = if (canExpand) {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+                },
+                modifier = Modifier
+                    .width(14.dp)
+                    .graphicsLayer {
+                        rotationZ = if (isExpanded) 0f else -90f
+                    },
+            )
+            Text(
+                text = presentation.collapsedSummary,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        AnimatedVisibility(visible = isExpanded && canExpand) {
+            Surface(
+                modifier = Modifier
+                    .padding(start = 22.dp)
+                    .fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                color = assistantKindTone(CodexMessageKind.CommandExecution).copy(alpha = 0.78f),
+                border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+            ) {
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable(enabled = canExpand) { isExpanded = !isExpanded },
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.Top,
                 ) {
                     Box(
                         modifier = Modifier
                             .width(3.dp)
-                            .height(34.dp)
-                            .background(status.accent, RoundedCornerShape(99.dp)),
+                            .height(40.dp)
+                            .background(commandExecutionAccent(presentation.phase), RoundedCornerShape(99.dp)),
                     )
                     Column(
                         modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Text(
-                            text = status.summary,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(
-                                text = status.statusLabel,
+                                text = "Status",
                                 style = MaterialTheme.typography.labelMedium,
-                                color = status.accent,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            if (canExpand) {
+                            Text(
+                                text = presentation.detailStatusLabel,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = commandExecutionAccent(presentation.phase),
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+
+                        presentation.rawCommand?.let { rawCommand ->
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Text(
-                                    text = if (isExpanded) "Hide details" else "Show details",
-                                    style = MaterialTheme.typography.labelSmall,
+                                    text = "Command",
+                                    style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                                SelectionContainer {
+                                    Text(
+                                        text = rawCommand,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            lineHeight = 20.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                        ),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
                         }
                     }
                 }
-                if (isExpanded && canExpand) {
-                    SelectionContainer {
-                        Text(
-                            text = rawCommand.orEmpty(),
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                lineHeight = 20.sp,
-                                fontFamily = FontFamily.Monospace,
-                            ),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
             }
-        } else if (message.text.isNotBlank()) {
-            Text(
-                text = message.text,
-                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
-                color = MaterialTheme.colorScheme.onSurface,
-            )
         }
+        MessageMetaRow(message = message, leadingIcon = null)
     }
 }
 
@@ -4484,29 +4514,12 @@ private fun SystemCardContainer(
     MessageMetaRow(message = message, leadingIcon = null)
 }
 
-private data class CommandExecutionStatus(
-    val summary: String,
-    val statusLabel: String,
-    val accent: Color,
-    val rawCommand: String?,
-)
-
-private fun parseCommandExecutionStatus(message: CodexMessage): CommandExecutionStatus? {
-    val text = message.text
-    val words = text.trim().split(Regex("\\s+")).filter(String::isNotBlank)
-    val first = words.firstOrNull()?.lowercase() ?: return null
-    val summary = message.commandExecutionDetails?.summary
-        ?.trim()
-        ?.takeIf(String::isNotEmpty)
-        ?: words.drop(1).joinToString(" ").trim().ifEmpty { "command" }
-    val rawCommand = message.commandExecutionDetails?.rawCommand
-        ?.trim()
-        ?.takeIf(String::isNotEmpty)
-    return when (first) {
-        "running" -> CommandExecutionStatus(summary, "running", Color(0xFFC98935), rawCommand)
-        "completed" -> CommandExecutionStatus(summary, "completed", Color(0xFF4DA468), rawCommand)
-        "failed", "stopped" -> CommandExecutionStatus(summary, first, Color(0xFFD35D5D), rawCommand)
-        else -> null
+private fun commandExecutionAccent(phase: CodexCommandExecutionPhase): Color {
+    return when (phase) {
+        CodexCommandExecutionPhase.Running -> Color(0xFFC98935)
+        CodexCommandExecutionPhase.Completed -> Color(0xFF4DA468)
+        CodexCommandExecutionPhase.Failed,
+        CodexCommandExecutionPhase.Stopped -> Color(0xFFD35D5D)
     }
 }
 

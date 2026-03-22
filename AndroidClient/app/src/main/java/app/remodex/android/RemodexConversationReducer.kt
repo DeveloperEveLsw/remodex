@@ -1,6 +1,7 @@
 package app.remodex.android
 
 import app.remodex.android.core.model.CodexCommandExecutionDetails
+import app.remodex.android.core.model.CodexCommandExecutionPhase
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexPlanStep
 import app.remodex.android.core.model.CodexPlanStepStatus
@@ -13,18 +14,12 @@ import app.remodex.android.core.protocol.stringValue
 import kotlinx.serialization.json.JsonObject
 
 object RemodexConversationReducer {
-    private enum class CommandRunPhase {
-        Running,
-        Completed,
-        Failed,
-        Stopped,
-    }
-
     private data class CommandRunViewState(
         val itemId: String?,
-        val phase: CommandRunPhase,
+        val phase: CodexCommandExecutionPhase,
         val shortCommand: String,
         val fullCommand: String,
+        val structuredSummary: String?,
         val summaryLabel: String,
         val dedupeKey: String,
     )
@@ -739,10 +734,10 @@ object RemodexConversationReducer {
         }
 
         if (existingRunRow != null) {
-            if (!existingRunRow.isStreaming && state.phase == CommandRunPhase.Running) {
+            if (!existingRunRow.isStreaming && state.phase == CodexCommandExecutionPhase.Running) {
                 return conversation
             }
-            if (state.shortCommand.lowercase() != "command" || state.phase != CommandRunPhase.Running) {
+            if (state.shortCommand.lowercase() != "command" || state.phase != CodexCommandExecutionPhase.Running) {
                 return publishCommandExecutionStatus(
                     conversation = conversation,
                     context = context,
@@ -766,7 +761,7 @@ object RemodexConversationReducer {
     ): RemodexConversationState {
         val statusText = commandExecutionStatusText(state)
         val details = commandExecutionDetails(state)
-        val isStreaming = state.phase == CommandRunPhase.Running
+        val isStreaming = state.phase == CodexCommandExecutionPhase.Running
         if (!context.itemId.isNullOrBlank()) {
             return if (isStreaming) {
                 conversation.upsertSystemMessage(
@@ -857,10 +852,10 @@ object RemodexConversationReducer {
 
     private fun commandExecutionStatusText(state: CommandRunViewState): String {
         val phase = when (state.phase) {
-            CommandRunPhase.Running -> "running"
-            CommandRunPhase.Completed -> "completed"
-            CommandRunPhase.Failed -> "failed"
-            CommandRunPhase.Stopped -> "stopped"
+            CodexCommandExecutionPhase.Running -> "running"
+            CodexCommandExecutionPhase.Completed -> "completed"
+            CodexCommandExecutionPhase.Failed -> "failed"
+            CodexCommandExecutionPhase.Stopped -> "stopped"
         }
         return "$phase ${state.summaryLabel}"
     }
@@ -868,8 +863,9 @@ object RemodexConversationReducer {
     private fun commandExecutionDetails(state: CommandRunViewState): CodexCommandExecutionDetails {
         return CodexCommandExecutionDetails(
             rawCommand = state.fullCommand,
-            summary = state.summaryLabel,
+            summary = state.structuredSummary,
             dedupeKey = state.dedupeKey,
+            phase = state.phase,
         )
     }
 
@@ -901,6 +897,7 @@ object RemodexConversationReducer {
             phase = phase,
             shortCommand = shortCommand,
             fullCommand = rawCommand,
+            structuredSummary = structuredSummary?.summary,
             summaryLabel = structuredSummary?.summary ?: shortCommand,
             dedupeKey = structuredSummary?.dedupeKey
                 ?: rawCommand.trim().replace(Regex("\\s+"), " ").lowercase(),
@@ -1000,19 +997,19 @@ object RemodexConversationReducer {
         }
     }
 
-    private fun commandRunPhase(rawStatus: String?, eventType: String?): CommandRunPhase {
+    private fun commandRunPhase(rawStatus: String?, eventType: String?): CodexCommandExecutionPhase {
         val normalizedStatus = rawStatus?.trim()?.lowercase().orEmpty()
         val normalizedEventType = eventType?.trim()?.lowercase().orEmpty()
         return when {
-            normalizedStatus.contains("fail") || normalizedStatus.contains("error") -> CommandRunPhase.Failed
+            normalizedStatus.contains("fail") || normalizedStatus.contains("error") -> CodexCommandExecutionPhase.Failed
             normalizedStatus.contains("cancel") ||
                 normalizedStatus.contains("abort") ||
-                normalizedStatus.contains("interrupt") -> CommandRunPhase.Stopped
+                normalizedStatus.contains("interrupt") -> CodexCommandExecutionPhase.Stopped
             normalizedStatus.contains("complete") ||
                 normalizedStatus.contains("success") ||
-                normalizedStatus.contains("done") -> CommandRunPhase.Completed
-            normalizedEventType == "exec_command_end" -> CommandRunPhase.Completed
-            else -> CommandRunPhase.Running
+                normalizedStatus.contains("done") -> CodexCommandExecutionPhase.Completed
+            normalizedEventType == "exec_command_end" -> CodexCommandExecutionPhase.Completed
+            else -> CodexCommandExecutionPhase.Running
         }
     }
 

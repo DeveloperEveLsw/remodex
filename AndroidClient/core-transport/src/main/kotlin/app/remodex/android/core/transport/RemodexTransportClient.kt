@@ -2,6 +2,8 @@ package app.remodex.android.core.transport
 
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexCollaborationModeKind
+import app.remodex.android.core.model.CodexCommandExecutionDetails
+import app.remodex.android.core.model.CodexCommandExecutionPhase
 import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
 import app.remodex.android.core.model.CodexImageAttachment
@@ -2597,14 +2599,6 @@ open class RemodexTransportClient(
                 val itemObject = itemValue as? JsonObject ?: continue
                 val itemType = normalizeItemType(itemObject["type"].stringValueOrNull()) ?: continue
                 val itemId = itemObject["id"].stringValueOrNull()
-                val decodedText = decodeItemDisplayText(itemObject)
-                if (decodedText.isBlank()) {
-                    continue
-                }
-                val syntheticTimestamp = (turnTimestamp ?: baseInstant).plusMillis(offsetMillis)
-                val timestamp = decodeHistoryInstant(itemObject) ?: syntheticTimestamp
-                offsetMillis += 1
-
                 val messageRole = when (itemType) {
                     "usermessage" -> CodexMessageRole.User
                     "agentmessage", "assistantmessage" -> CodexMessageRole.Assistant
@@ -2622,6 +2616,22 @@ open class RemodexTransportClient(
                     "plan" -> CodexMessageKind.Plan
                     else -> CodexMessageKind.Chat
                 }
+                val commandExecutionDetails = if (messageKind == CodexMessageKind.CommandExecution) {
+                    decodeThreadReadCommandExecutionDetails(itemObject)
+                } else {
+                    null
+                }
+                val decodedText = decodeThreadReadItemDisplayText(
+                    itemObject = itemObject,
+                    messageKind = messageKind,
+                    commandExecutionDetails = commandExecutionDetails,
+                )
+                if (decodedText.isBlank()) {
+                    continue
+                }
+                val syntheticTimestamp = (turnTimestamp ?: baseInstant).plusMillis(offsetMillis)
+                val timestamp = decodeHistoryInstant(itemObject) ?: syntheticTimestamp
+                offsetMillis += 1
 
                 messages += CodexMessage(
                     id = itemId ?: "${threadId}_$orderIndex",
@@ -2632,6 +2642,7 @@ open class RemodexTransportClient(
                     createdAt = timestamp,
                     turnId = turnId,
                     itemId = itemId,
+                    commandExecutionDetails = commandExecutionDetails,
                     orderIndex = orderIndex,
                 )
                 orderIndex += 1
@@ -2639,6 +2650,158 @@ open class RemodexTransportClient(
         }
 
         return messages
+    }
+
+    private fun decodeThreadReadItemDisplayText(
+        itemObject: JsonObject,
+        messageKind: CodexMessageKind,
+        commandExecutionDetails: CodexCommandExecutionDetails?,
+    ): String {
+        val explicitText = decodeItemDisplayText(itemObject)
+        if (explicitText.isNotBlank()) {
+            return explicitText
+        }
+        if (messageKind != CodexMessageKind.CommandExecution || commandExecutionDetails == null) {
+            return explicitText
+        }
+
+        val phase = commandExecutionDetails.phase ?: CodexCommandExecutionPhase.Completed
+        val prefix = when (phase) {
+            CodexCommandExecutionPhase.Running -> "running"
+            CodexCommandExecutionPhase.Completed -> "completed"
+            CodexCommandExecutionPhase.Failed -> "failed"
+            CodexCommandExecutionPhase.Stopped -> "stopped"
+        }
+        return "$prefix ${shortCommandPreview(commandExecutionDetails.rawCommand)}"
+    }
+
+    private fun decodeThreadReadCommandExecutionDetails(
+        itemObject: JsonObject,
+    ): CodexCommandExecutionDetails? {
+        val rawCommand = extractThreadReadCommandExecutionCommand(itemObject)?.trim()?.takeIf(String::isNotEmpty)
+            ?: return null
+        val normalized = rawCommand.replace(Regex("\\s+"), " ")
+        return CodexCommandExecutionDetails(
+            rawCommand = normalized,
+            dedupeKey = normalized.lowercase(),
+            phase = decodeThreadReadCommandExecutionPhase(itemObject),
+        )
+    }
+
+    private fun decodeThreadReadCommandExecutionPhase(
+        itemObject: JsonObject,
+    ): CodexCommandExecutionPhase? {
+        val rawStatus = listOf(
+            itemObject["status"].stringValueOrNull(),
+            (itemObject["result"] as? JsonObject)?.get("status").stringValueOrNull(),
+            (itemObject["output"] as? JsonObject)?.get("status").stringValueOrNull(),
+        ).firstOrNull { !it.isNullOrBlank() }?.trim()?.lowercase().orEmpty()
+
+        return when {
+            rawStatus.contains("fail") || rawStatus.contains("error") -> CodexCommandExecutionPhase.Failed
+            rawStatus.contains("cancel") ||
+                rawStatus.contains("abort") ||
+                rawStatus.contains("interrupt") ||
+                rawStatus.contains("stop") -> CodexCommandExecutionPhase.Stopped
+            rawStatus.contains("running") || rawStatus.contains("progress") -> CodexCommandExecutionPhase.Running
+            rawStatus.contains("complete") ||
+                rawStatus.contains("success") ||
+                rawStatus.contains("done") -> CodexCommandExecutionPhase.Completed
+            else -> null
+        }
+    }
+
+    private fun extractThreadReadCommandExecutionCommand(itemObject: JsonObject): String? {
+        extractThreadReadCommandArray(itemObject["command"])?.let { return it }
+
+        val candidates = listOf("command", "cmd", "raw_command", "rawCommand", "input", "invocation")
+        for (key in candidates) {
+            firstStringDeep(key, itemObject)?.let { return it }
+        }
+        return null
+    }
+
+    private fun extractThreadReadCommandArray(value: JsonValue?): String? {
+        val array = value as? JsonArray ?: return value.stringValueOrNull()?.trim()?.takeIf(String::isNotEmpty)
+        val parts = array.mapNotNull { item ->
+            item.stringValueOrNull()?.trim()?.takeIf(String::isNotEmpty)
+        }
+        return parts.takeIf { it.isNotEmpty() }?.joinToString(separator = " ")
+    }
+
+    private fun shortCommandPreview(rawCommand: String, maxLength: Int = 92): String {
+        val trimmed = rawCommand.trim()
+        if (trimmed.isEmpty()) {
+            return "command"
+        }
+        val compact = trimmed.replace(Regex("\\s+"), " ")
+        val unwrapped = unwrapShellCommandIfPresent(compact)
+        var preview = unwrapped.replace(Regex("\\s+"), " ").trim()
+        if (preview.isEmpty()) {
+            preview = "command"
+        }
+        if (preview.length > maxLength) {
+            preview = preview.take(maxLength - 1) + "..."
+        }
+        return preview
+    }
+
+    private fun unwrapShellCommandIfPresent(command: String): String {
+        val tokens = command.split(Regex("\\s+")).filter(String::isNotBlank)
+        if (tokens.isEmpty()) {
+            return command
+        }
+
+        val shellNames = listOf("bash", "zsh", "sh", "fish")
+        var shellIndex = 0
+        if (tokens.size >= 2) {
+            val first = tokens[0].lowercase()
+            val second = tokens[1].lowercase()
+            if ((first == "env" || first.endsWith("/env")) &&
+                shellNames.any { second == it || second.endsWith("/$it") }
+            ) {
+                shellIndex = 1
+            }
+        }
+
+        val shell = tokens[shellIndex].lowercase()
+        if (shellNames.none { shell == it || shell.endsWith("/$it") }) {
+            return command
+        }
+
+        var index = shellIndex + 1
+        while (index < tokens.size) {
+            val token = tokens[index]
+            if (token == "-c" || token == "-lc" || token == "-cl" || token == "-ic" || token == "-ci") {
+                index += 1
+                return if (index < tokens.size) {
+                    stripWrappingQuotes(tokens.drop(index).joinToString(separator = " "))
+                } else {
+                    command
+                }
+            }
+            if (token.startsWith("-")) {
+                index += 1
+                continue
+            }
+            return stripWrappingQuotes(tokens.drop(index).joinToString(separator = " "))
+        }
+
+        return command
+    }
+
+    private fun stripWrappingQuotes(input: String): String {
+        val trimmed = input.trim()
+        if (trimmed.length < 2) {
+            return trimmed
+        }
+        return if ((trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+            (trimmed.startsWith("\"") && trimmed.endsWith("\""))
+        ) {
+            trimmed.drop(1).dropLast(1)
+        } else {
+            trimmed
+        }
     }
 
     private fun decodeHistoryBaseInstant(threadObject: JsonObject): Instant {
@@ -2791,6 +2954,29 @@ open class RemodexTransportClient(
             ?.replace(" ", "")
             .orEmpty()
         return normalized.ifEmpty { null }
+    }
+
+    private fun firstStringDeep(key: String, root: JsonValue?, maxDepth: Int = 8): String? {
+        if (root == null || maxDepth < 0) {
+            return null
+        }
+
+        val objectValue = root as? JsonObject
+        if (objectValue != null) {
+            objectValue[key].stringValueOrNull()?.let { return it }
+            for (value in objectValue.values) {
+                firstStringDeep(key, value, maxDepth - 1)?.let { return it }
+            }
+            return null
+        }
+
+        val arrayValue = root as? JsonArray
+        if (arrayValue != null) {
+            for (value in arrayValue) {
+                firstStringDeep(key, value, maxDepth - 1)?.let { return it }
+            }
+        }
+        return null
     }
 
     private fun JsonValue?.stringValueOrNull(): String? {
