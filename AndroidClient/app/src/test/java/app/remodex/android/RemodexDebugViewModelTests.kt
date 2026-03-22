@@ -7,6 +7,7 @@ import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexModelOption
 import app.remodex.android.core.model.CodexReasoningEffortOption
 import app.remodex.android.core.model.CodexFuzzyFileMatch
+import app.remodex.android.core.model.CodexImageAttachment
 import app.remodex.android.core.model.CodexSkillMetadata
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadRunBadgeState
@@ -14,8 +15,17 @@ import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.model.GitBranchesWithStatusResult
 import app.remodex.android.core.model.GitCheckoutResult
+import app.remodex.android.core.model.GitCommitResult
 import app.remodex.android.core.model.GitDiffTotals
+import app.remodex.android.core.model.GitPullResult
 import app.remodex.android.core.model.GitRepoSyncResult
+import app.remodex.android.core.model.GitPushResult
+import app.remodex.android.core.model.GitRemoteUrlResult
+import app.remodex.android.core.model.GitResetResult
+import app.remodex.android.core.model.RevertApplyResult
+import app.remodex.android.core.model.RevertPreviewResult
+import app.remodex.android.core.model.TurnGitActionKind
+import app.remodex.android.core.model.TurnGitSyncAlertAction
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
 import app.remodex.android.core.transport.RemodexThreadResumeResult
@@ -27,6 +37,7 @@ import app.remodex.android.core.transport.RemodexTransportException
 import app.remodex.android.core.transport.RemodexTransportFailureKind
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
+import app.remodex.android.core.transport.RemodexTurnSteerResult
 import app.remodex.android.core.protocol.RpcMessage
 import app.remodex.android.core.protocol.RpcError
 import app.remodex.android.core.protocol.JsonValue
@@ -46,6 +57,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -90,12 +102,30 @@ class RemodexDebugViewModelTests {
         transport: RemodexTransportClient = FakeTransportClient(),
         relaySessionStore: RemodexRelaySessionStore = InMemoryRemodexRelaySessionStore(),
         realtimeSyncPolicy: RemodexRealtimeSyncPolicy = disabledRealtimeSyncPolicy,
+        attachmentProcessor: RemodexComposerAttachmentProcessor = FakeAttachmentProcessor(),
     ): RemodexDebugViewModel {
         return RemodexDebugViewModel(
             transport = transport,
             relaySessionStore = relaySessionStore,
             realtimeSyncPolicy = realtimeSyncPolicy,
+            attachmentProcessor = attachmentProcessor,
+            attachmentProcessingDispatcher = dispatcher,
         )
+    }
+
+    private class FakeAttachmentProcessor : RemodexComposerAttachmentProcessor {
+        override fun makeAttachment(sourceData: ByteArray): CodexImageAttachment? {
+            if (sourceData.isEmpty()) {
+                return null
+            }
+
+            return CodexImageAttachment(
+                id = "attachment-${sourceData.size}",
+                thumbnailBase64JPEG = "thumbnail-${sourceData.size}",
+                payloadDataURL = "data:image/jpeg;base64,encoded-${sourceData.size}",
+                sourceURL = null,
+            )
+        }
     }
 
     @Test
@@ -598,6 +628,266 @@ class RemodexDebugViewModelTests {
             ),
             transport.lastStartTurnSkillMentions,
         )
+    }
+
+    @Test
+    fun startTurnAllowsImageOnlyPayloadWhenAttachmentIsReady() = runTest {
+        val thread = CodexThread(
+            id = "thread-image",
+            title = "Thread Image",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-image",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.refreshThreads()
+        advanceUntilIdle()
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+
+        viewModel.enqueueCapturedImageData(byteArrayOf(1, 2, 3, 4))
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.hasReadyImages)
+        assertTrue(viewModel.uiState.value.draftTurnInput.isBlank())
+
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        assertEquals("", transport.lastStartTurnUserInput)
+        assertEquals(1, transport.lastStartTurnAttachments.size)
+        assertEquals(
+            "data:image/jpeg;base64,encoded-4",
+            transport.lastStartTurnAttachments.single().payloadDataURL,
+        )
+    }
+
+    @Test
+    fun startTurnQueuesDraftWhenSelectedThreadIsRunning() = runTest {
+        val thread = CodexThread(
+            id = "thread-queue",
+            title = "Thread Queue",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-new",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/started",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-live"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("queue this next")
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        val queuedDrafts = viewModel.uiState.value.queuedTurnDraftsByThread[thread.id].orEmpty()
+        assertEquals(1, queuedDrafts.size)
+        assertEquals("queue this next", queuedDrafts.single().text)
+        assertEquals(0, transport.startTurnCalls)
+        assertEquals("", viewModel.uiState.value.draftTurnInput)
+    }
+
+    @Test
+    fun turnCompletedFlushesQueuedDraftAutomatically() = runTest {
+        val thread = CodexThread(
+            id = "thread-flush",
+            title = "Thread Flush",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            startTurnResult = RemodexTurnStartResult(
+                requestedThreadId = thread.id,
+                threadId = thread.id,
+                turnId = "turn-queued",
+                activeThread = thread,
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/started",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-live"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("send after completion")
+        viewModel.startTurn()
+        advanceUntilIdle()
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/completed",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-live"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(1, transport.startTurnCalls)
+        assertTrue(viewModel.uiState.value.queuedTurnDraftsByThread[thread.id].isNullOrEmpty())
+        val messages = viewModel.uiState.value.conversation.messagesFor(thread.id)
+        assertEquals("send after completion", messages.last().text)
+    }
+
+    @Test
+    fun queuedFlushFailurePausesQueueAndPreservesDraft() = runTest {
+        val thread = CodexThread(
+            id = "thread-queue-fail",
+            title = "Thread Queue Fail",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            startTurnThrowable = RemodexTransportException(
+                kind = RemodexTransportFailureKind.Rpc,
+                message = "RPC error -32000: host rejected queued send",
+                rpcError = RpcError(code = -32000, message = "host rejected queued send"),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/started",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-live"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("queue failure")
+        viewModel.startTurn()
+        advanceUntilIdle()
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/completed",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-live"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(1, transport.startTurnCalls)
+        assertEquals(1, viewModel.queuedCount(thread.id))
+        assertTrue(viewModel.isQueuePaused(thread.id))
+        assertEquals("Queue paused: host rejected queued send", viewModel.uiState.value.errorMessage)
+    }
+
+    @Test
+    fun steerQueuedDraftUsesTurnSteerForRunningThread() = runTest {
+        val thread = CodexThread(
+            id = "thread-steer",
+            title = "Thread Steer",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            threadListResult = listOf(thread),
+            steerTurnResult = RemodexTurnSteerResult(
+                threadId = thread.id,
+                turnId = "turn-live",
+                response = RpcMessage.success(null, JsonObject(emptyMap())),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/started",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(thread.id),
+                        "turnId" to JsonPrimitive("turn-live"),
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.updateDraftTurnInput("steer this in")
+        viewModel.startTurn()
+        advanceUntilIdle()
+
+        val queuedDraftId = viewModel.queuedDraftsList(thread.id).single().id
+        viewModel.steerQueuedDraft(queuedDraftId, thread.id)
+        advanceUntilIdle()
+
+        assertEquals(1, transport.steerTurnCalls)
+        assertEquals("steer this in", transport.lastSteerTurnUserInput)
+        assertTrue(viewModel.uiState.value.queuedTurnDraftsByThread[thread.id].isNullOrEmpty())
+        val userMessages = viewModel.uiState.value.conversation.messagesFor(thread.id)
+            .filter { it.role == CodexMessageRole.User }
+        assertEquals("steer this in", userMessages.last().text)
+        assertEquals(CodexMessageDeliveryState.Confirmed, userMessages.last().deliveryState)
     }
 
     @Test
@@ -1595,6 +1885,358 @@ class RemodexDebugViewModelTests {
         assertEquals("release", viewModel.uiState.value.selectedGitBaseBranch)
     }
 
+    @Test
+    fun triggerGitActionCommitRefreshesStatusAfterSuccess() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitCommitResult = GitCommitResult(
+                commitHash = "abc123",
+                branch = "feature/android",
+                summary = "Commit created",
+            ),
+            gitStatusResult = GitRepoSyncResult(
+                currentBranch = "feature/android",
+                state = "ahead_only",
+                aheadCount = 1,
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.triggerGitAction(TurnGitActionKind.Commit)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals(1, transport.recordedMethods.count { it == "git/commit" })
+        assertEquals(1, transport.recordedMethods.count { it == "git/status" })
+        assertEquals("feature/android", state.gitRepoSync?.currentBranch)
+        assertEquals("feature/android", state.currentGitBranch)
+        assertFalse(state.isShowingNothingToCommitAlert)
+    }
+
+    @Test
+    fun triggerGitActionSyncNowShowsPullRebaseAlertWhenBehind() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitStatusResult = GitRepoSyncResult(
+                currentBranch = "feature/android",
+                state = "behind_only",
+                behindCount = 2,
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.triggerGitAction(TurnGitActionKind.SyncNow)
+        advanceUntilIdle()
+
+        val alert = viewModel.uiState.value.gitSyncAlert
+        assertNotNull(alert)
+        assertEquals("Branch is behind remote", alert?.title)
+        assertEquals(TurnGitSyncAlertAction.PullRebase, alert?.action)
+        assertEquals("behind_only", viewModel.uiState.value.gitRepoSync?.state)
+        assertEquals(1, transport.recordedMethods.count { it == "git/status" })
+    }
+
+    @Test
+    fun confirmGitSyncAlertActionPullRebaseRunsPull() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitStatusResult = GitRepoSyncResult(
+                currentBranch = "feature/android",
+                state = "behind_only",
+                behindCount = 2,
+            ),
+            gitPullResult = GitPullResult(
+                success = true,
+                status = GitRepoSyncResult(
+                    currentBranch = "feature/android",
+                    state = "up_to_date",
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.triggerGitAction(TurnGitActionKind.SyncNow)
+        advanceUntilIdle()
+        viewModel.confirmGitSyncAlertAction(TurnGitSyncAlertAction.PullRebase)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals(1, transport.recordedMethods.count { it == "git/pull" })
+        assertNull(state.gitSyncAlert)
+        assertEquals("up_to_date", state.gitRepoSync?.state)
+    }
+
+    @Test
+    fun triggerGitActionCommitHandlesNothingToCommit() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitCommitThrowable = RemodexTransportException(
+                kind = RemodexTransportFailureKind.Rpc,
+                message = "RPC error -32000: nothing to commit",
+                rpcError = RpcError(
+                    code = -32000,
+                    message = "nothing to commit",
+                    data = JsonObject(
+                        mapOf(
+                            "errorCode" to JsonPrimitive("nothing_to_commit"),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.triggerGitAction(TurnGitActionKind.Commit)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertTrue(state.isShowingNothingToCommitAlert)
+        assertNull(state.gitSyncAlert)
+    }
+
+    @Test
+    fun triggerGitActionCreatePRBuildsIosCompareUrl() = runTest {
+        val thread = CodexThread(
+            id = "thread-git",
+            title = "Git Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            gitBranchesWithStatusResult = GitBranchesWithStatusResult(
+                branches = listOf("main", "feature/android"),
+                currentBranch = "feature/android",
+                defaultBranch = "main",
+                status = GitRepoSyncResult(
+                    currentBranch = "feature/android",
+                    state = "ahead_only",
+                ),
+            ),
+            gitRemoteUrlResult = GitRemoteUrlResult(
+                url = "git@github.com:openai/remodex.git",
+                ownerRepo = "openai/remodex",
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        viewModel.selectGitBaseBranch("main")
+        viewModel.triggerGitAction(TurnGitActionKind.CreatePR)
+        advanceUntilIdle()
+
+        assertEquals(
+            "https://github.com/openai/remodex/compare/main...feature/android?expand=1",
+            viewModel.uiState.value.pendingExternalUrl,
+        )
+    }
+
+    @Test
+    fun assistantRevertPresentationBecomesReadyAfterTurnDiffAndCompletion() = runTest {
+        val thread = CodexThread(
+            id = "thread-revert",
+            title = "Revert Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        emitAssistantRevertSignals(transport, thread.id, "turn-revert", "assistant-revert")
+        advanceUntilIdle()
+
+        val assistantMessage = viewModel.uiState.value.conversation.messagesFor(thread.id)
+            .last { it.role == CodexMessageRole.Assistant && it.itemId == "assistant-revert" }
+        val presentation = viewModel.uiState.value.assistantRevertPresentationsByMessageId[assistantMessage.id]
+        assertNotNull(presentation)
+        assertTrue(presentation?.isEnabled == true)
+        assertEquals("Revert changes", presentation?.title)
+    }
+
+    @Test
+    fun startAssistantRevertPreviewUsesWorkspacePreviewAndPopulatesSheet() = runTest {
+        val thread = CodexThread(
+            id = "thread-revert",
+            title = "Revert Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            revertPreviewResult = RevertPreviewResult(
+                canRevert = true,
+                affectedFiles = listOf("app.txt"),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        emitAssistantRevertSignals(transport, thread.id, "turn-revert", "assistant-revert")
+        advanceUntilIdle()
+
+        val assistantMessage = viewModel.uiState.value.conversation.messagesFor(thread.id)
+            .last { it.role == CodexMessageRole.Assistant && it.itemId == "assistant-revert" }
+        viewModel.startAssistantRevertPreview(
+            message = assistantMessage,
+            workingDirectory = thread.cwd,
+        )
+        advanceUntilIdle()
+
+        assertEquals(1, transport.recordedMethods.count { it == "workspace/revertPatchPreview" })
+        assertEquals(true, viewModel.uiState.value.assistantRevertSheet?.preview?.canRevert)
+    }
+
+    @Test
+    fun confirmAssistantRevertAppliesPatchAndAppendsSystemMessage() = runTest {
+        val thread = CodexThread(
+            id = "thread-revert",
+            title = "Revert Thread",
+            cwd = "/tmp/project",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(thread = thread),
+            ),
+            revertPreviewResult = RevertPreviewResult(
+                canRevert = true,
+                affectedFiles = listOf("app.txt"),
+            ),
+            revertApplyResult = RevertApplyResult(
+                success = true,
+                revertedFiles = listOf("app.txt"),
+                status = GitRepoSyncResult(
+                    repoRoot = "/tmp/project",
+                    currentBranch = "feature/android",
+                    state = "up_to_date",
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        emitAssistantRevertSignals(transport, thread.id, "turn-revert", "assistant-revert")
+        advanceUntilIdle()
+
+        val assistantMessage = viewModel.uiState.value.conversation.messagesFor(thread.id)
+            .last { it.role == CodexMessageRole.Assistant && it.itemId == "assistant-revert" }
+        viewModel.startAssistantRevertPreview(
+            message = assistantMessage,
+            workingDirectory = thread.cwd,
+        )
+        advanceUntilIdle()
+        viewModel.confirmAssistantRevert(thread.cwd)
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value
+        assertEquals(1, transport.recordedMethods.count { it == "workspace/revertPatchApply" })
+        assertNull(state.assistantRevertSheet)
+        assertEquals(
+            "Reverted",
+            state.assistantRevertPresentationsByMessageId[assistantMessage.id]?.title,
+        )
+        assertTrue(
+            state.conversation.messagesFor(thread.id)
+                .any { it.role == CodexMessageRole.System && it.text == "Reverted changes from this response." },
+        )
+    }
+
+    private fun emitAssistantRevertSignals(
+        transport: FakeTransportClient,
+        threadId: String,
+        turnId: String,
+        assistantMessageId: String,
+    ) {
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/diff/updated",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(threadId),
+                        "turnId" to JsonPrimitive(turnId),
+                        "diff" to JsonPrimitive(
+                            "diff --git a/app.txt b/app.txt\n--- a/app.txt\n+++ b/app.txt\n@@ -1 +1 @@\n-old\n+new\n",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "item/completed",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(threadId),
+                        "turnId" to JsonPrimitive(turnId),
+                        "item" to JsonObject(
+                            mapOf(
+                                "id" to JsonPrimitive(assistantMessageId),
+                                "type" to JsonPrimitive("agentMessage"),
+                                "text" to JsonPrimitive("Updated app.txt"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        transport.emitNotification(
+            RpcMessage.notification(
+                method = "turn/completed",
+                params = JsonObject(
+                    mapOf(
+                        "threadId" to JsonPrimitive(threadId),
+                        "turnId" to JsonPrimitive(turnId),
+                    ),
+                ),
+            ),
+        )
+    }
+
     private class FakeTransportClient(
         private val readThreadResults: Map<String, RemodexThreadReadResult> = emptyMap(),
         queuedReadThreadResults: Map<String, List<RemodexThreadReadResult>> = emptyMap(),
@@ -1602,6 +2244,9 @@ class RemodexDebugViewModelTests {
         private val threadListResult: List<CodexThread> = emptyList(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
+        private val startTurnThrowable: Throwable? = null,
+        private val steerTurnResult: RemodexTurnSteerResult? = null,
+        private val steerTurnThrowable: Throwable? = null,
         private val resumeThreadThrowable: Throwable? = null,
         private val modelOptions: List<CodexModelOption> = emptyList(),
         private val gitBranchesWithStatusResult: GitBranchesWithStatusResult = GitBranchesWithStatusResult(),
@@ -1609,6 +2254,20 @@ class RemodexDebugViewModelTests {
         private val gitBranchesWithStatusGate: CompletableDeferred<Unit>? = null,
         private val gitStatusResult: GitRepoSyncResult = GitRepoSyncResult(),
         private val gitCheckoutResult: GitCheckoutResult? = null,
+        private val gitCommitResult: GitCommitResult = GitCommitResult(),
+        private val gitCommitThrowable: Throwable? = null,
+        private val gitPushResult: GitPushResult = GitPushResult(),
+        private val gitPushThrowable: Throwable? = null,
+        private val gitPullResult: GitPullResult = GitPullResult(),
+        private val gitPullThrowable: Throwable? = null,
+        private val gitResetResult: GitResetResult = GitResetResult(),
+        private val gitResetThrowable: Throwable? = null,
+        private val gitRemoteUrlResult: GitRemoteUrlResult = GitRemoteUrlResult(),
+        private val gitRemoteUrlThrowable: Throwable? = null,
+        private val revertPreviewResult: RevertPreviewResult = RevertPreviewResult(),
+        private val revertPreviewThrowable: Throwable? = null,
+        private val revertApplyResult: RevertApplyResult = RevertApplyResult(),
+        private val revertApplyThrowable: Throwable? = null,
         private val connectResult: RemodexHandshakeResult = RemodexHandshakeResult(
             sessionUrl = "ws://test",
             initializeResponse = RpcMessage.success(null, JsonObject(emptyMap())),
@@ -1626,9 +2285,17 @@ class RemodexDebugViewModelTests {
         var lastStartTurnModelIdentifier: String? = null
         var lastStartTurnReasoningEffort: String? = null
         var lastStartTurnUserInput: String? = null
+        var lastStartTurnAttachments: List<CodexImageAttachment> = emptyList()
         var lastStartTurnSkillMentions: List<CodexTurnSkillMention> = emptyList()
+        var startTurnCalls: Int = 0
+        var lastSteerTurnUserInput: String? = null
+        var lastSteerTurnExpectedTurnId: String? = null
+        var lastSteerTurnAttachments: List<CodexImageAttachment> = emptyList()
+        var lastSteerTurnSkillMentions: List<CodexTurnSkillMention> = emptyList()
+        var steerTurnCalls: Int = 0
         var lastGitWorkingDirectory: String? = null
         var lastCheckedOutBranch: String? = null
+        var lastGitCommitMessage: String? = null
         val connectedSessionUrls = mutableListOf<String>()
         val recordedMethods = mutableListOf<String>()
         val sentResponses = mutableListOf<SentRpcResponse>()
@@ -1801,6 +2468,73 @@ class RemodexDebugViewModelTests {
             )
         }
 
+        override suspend fun gitCommit(
+            workingDirectory: String,
+            message: String?,
+        ): GitCommitResult {
+            recordedMethods += "git/commit"
+            lastGitWorkingDirectory = workingDirectory
+            lastGitCommitMessage = message
+            gitCommitThrowable?.let { throw it }
+            return gitCommitResult
+        }
+
+        override suspend fun gitPush(
+            workingDirectory: String,
+        ): GitPushResult {
+            recordedMethods += "git/push"
+            lastGitWorkingDirectory = workingDirectory
+            gitPushThrowable?.let { throw it }
+            return gitPushResult
+        }
+
+        override suspend fun gitPull(
+            workingDirectory: String,
+        ): GitPullResult {
+            recordedMethods += "git/pull"
+            lastGitWorkingDirectory = workingDirectory
+            gitPullThrowable?.let { throw it }
+            return gitPullResult
+        }
+
+        override suspend fun gitResetToRemote(
+            workingDirectory: String,
+        ): GitResetResult {
+            recordedMethods += "git/resetToRemote"
+            lastGitWorkingDirectory = workingDirectory
+            gitResetThrowable?.let { throw it }
+            return gitResetResult
+        }
+
+        override suspend fun gitRemoteUrl(
+            workingDirectory: String,
+        ): GitRemoteUrlResult {
+            recordedMethods += "git/remoteUrl"
+            lastGitWorkingDirectory = workingDirectory
+            gitRemoteUrlThrowable?.let { throw it }
+            return gitRemoteUrlResult
+        }
+
+        override suspend fun workspaceRevertPatchPreview(
+            workingDirectory: String,
+            forwardPatch: String,
+        ): RevertPreviewResult {
+            recordedMethods += "workspace/revertPatchPreview"
+            lastGitWorkingDirectory = workingDirectory
+            revertPreviewThrowable?.let { throw it }
+            return revertPreviewResult
+        }
+
+        override suspend fun workspaceRevertPatchApply(
+            workingDirectory: String,
+            forwardPatch: String,
+        ): RevertApplyResult {
+            recordedMethods += "workspace/revertPatchApply"
+            lastGitWorkingDirectory = workingDirectory
+            revertApplyThrowable?.let { throw it }
+            return revertApplyResult
+        }
+
         override suspend fun startTurn(
             threadId: String?,
             userInput: String,
@@ -1809,7 +2543,7 @@ class RemodexDebugViewModelTests {
             preferredProjectPath: String?,
             modelIdentifier: String?,
             reasoningEffort: String?,
-            attachments: List<app.remodex.android.core.model.CodexImageAttachment>,
+            attachments: List<CodexImageAttachment>,
             skillMentions: List<CodexTurnSkillMention>,
         ): RemodexTurnStartResult {
             lastPreferredProjectPath = preferredProjectPath
@@ -1817,8 +2551,27 @@ class RemodexDebugViewModelTests {
             lastStartTurnAccessMode = accessMode
             lastStartTurnModelIdentifier = modelIdentifier
             lastStartTurnReasoningEffort = reasoningEffort
+            lastStartTurnAttachments = attachments
             lastStartTurnSkillMentions = skillMentions
+            startTurnCalls += 1
+            startTurnThrowable?.let { throw it }
             return startTurnResult ?: error("startTurn was not stubbed")
+        }
+
+        override suspend fun steerTurn(
+            threadId: String,
+            userInput: String,
+            expectedTurnId: String?,
+            attachments: List<CodexImageAttachment>,
+            skillMentions: List<CodexTurnSkillMention>,
+        ): RemodexTurnSteerResult {
+            lastSteerTurnUserInput = userInput
+            lastSteerTurnExpectedTurnId = expectedTurnId
+            lastSteerTurnAttachments = attachments
+            lastSteerTurnSkillMentions = skillMentions
+            steerTurnCalls += 1
+            steerTurnThrowable?.let { throw it }
+            return steerTurnResult ?: error("steerTurn was not stubbed")
         }
 
         fun emitNotification(message: RpcMessage) {

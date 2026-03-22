@@ -2,6 +2,7 @@ package app.remodex.android
 
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageDeliveryState
+import app.remodex.android.core.model.CodexImageAttachment
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexPlanState
@@ -347,10 +348,11 @@ data class RemodexConversationState(
         messageId: String = UUID.randomUUID().toString(),
         turnId: String? = null,
         deliveryState: CodexMessageDeliveryState = CodexMessageDeliveryState.Pending,
+        attachments: List<CodexImageAttachment> = emptyList(),
     ): RemodexConversationState {
         val normalizedThreadId = normalizeThreadId(threadId) ?: return this
         val trimmedText = text.trim()
-        if (trimmedText.isEmpty()) {
+        if (trimmedText.isEmpty() && attachments.isEmpty()) {
             return this
         }
 
@@ -363,6 +365,7 @@ data class RemodexConversationState(
             createdAt = Instant.now(),
             turnId = normalizeThreadId(turnId),
             deliveryState = deliveryState,
+            attachments = attachments,
             orderIndex = nextOrderIndex(existingMessages),
         )
         return replaceThreadMessages(normalizedThreadId, nextMessages)
@@ -393,6 +396,27 @@ data class RemodexConversationState(
         )
         return replaceThreadMessages(normalizedThreadId, updatedMessages)
             .withThreadTurnMapping(normalizedThreadId, normalizeThreadId(turnId))
+    }
+
+    fun removeMessage(
+        threadId: String,
+        messageId: String,
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        if (messageId.isBlank()) {
+            return this
+        }
+
+        val existingMessages = messagesFor(normalizedThreadId)
+        val filteredMessages = existingMessages.filterNot { it.id == messageId }
+        if (filteredMessages.size == existingMessages.size) {
+            return this
+        }
+
+        return replaceThreadMessages(
+            normalizedThreadId,
+            filteredMessages.withSequentialOrderIndices(),
+        )
     }
 
     fun moveMessageToThread(

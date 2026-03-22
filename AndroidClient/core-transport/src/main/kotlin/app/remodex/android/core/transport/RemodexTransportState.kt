@@ -89,6 +89,12 @@ data class RemodexTurnStartResult(
     val response: RpcMessage,
 )
 
+data class RemodexTurnSteerResult(
+    val threadId: String,
+    val turnId: String? = null,
+    val response: RpcMessage,
+)
+
 data class RemodexTransportDiagnostics(
     val lastOutboundMethod: String? = null,
     val lastOutboundPayload: String? = null,

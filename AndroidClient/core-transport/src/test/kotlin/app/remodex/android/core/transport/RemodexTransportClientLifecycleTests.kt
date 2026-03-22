@@ -495,6 +495,115 @@ class RemodexTransportClientLifecycleTests {
     }
 
     @Test
+    fun steerTurnBuildsIosOrderedMixedInputPayload() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("turn/steer") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-live"))),
+                    )
+                },
+            ),
+        )
+
+        transport.steerTurn(
+            threadId = "thread-live",
+            userInput = "inspect this",
+            expectedTurnId = "turn-live",
+            attachments = listOf(
+                CodexImageAttachment(
+                    id = "image-1",
+                    thumbnailBase64JPEG = "thumb",
+                    payloadDataURL = "data:image/jpeg;base64,abc123",
+                ),
+            ),
+            skillMentions = listOf(
+                CodexTurnSkillMention(
+                    id = "planner",
+                    name = "planner",
+                    path = "/skills/planner",
+                ),
+            ),
+        )
+
+        val steerParams = transport.recordedParams.single().second as JsonObject
+        assertEquals("thread-live", (steerParams["threadId"] as JsonPrimitive).content)
+        assertEquals("turn-live", (steerParams["expectedTurnId"] as JsonPrimitive).content)
+
+        val input = steerParams["input"] as JsonArray
+        val imageItem = input[0] as JsonObject
+        val textItem = input[1] as JsonObject
+        val skillItem = input[2] as JsonObject
+
+        assertEquals("image", (imageItem["type"] as JsonPrimitive).content)
+        assertEquals("data:image/jpeg;base64,abc123", (imageItem["url"] as JsonPrimitive).content)
+        assertEquals("text", (textItem["type"] as JsonPrimitive).content)
+        assertEquals("inspect this", (textItem["text"] as JsonPrimitive).content)
+        assertEquals("skill", (skillItem["type"] as JsonPrimitive).content)
+        assertEquals("planner", (skillItem["id"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun steerTurnRefreshesExpectedTurnIdAfterPreconditionFailure() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("turn/steer") {
+                    throw RemodexTransportException(
+                        kind = RemodexTransportFailureKind.Rpc,
+                        message = "RPC error -32000: turn not found",
+                        rpcError = RpcError(code = -32000, message = "turn not found"),
+                    )
+                },
+                ScriptedStep("thread/read") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "thread" to JsonObject(
+                                    mapOf(
+                                        "id" to JsonPrimitive("thread-live"),
+                                        "title" to JsonPrimitive("Conversation"),
+                                        "turns" to JsonArray(
+                                            listOf(
+                                                JsonObject(
+                                                    mapOf(
+                                                        "id" to JsonPrimitive("turn-refreshed"),
+                                                        "status" to JsonPrimitive("running"),
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                },
+                ScriptedStep("turn/steer") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(mapOf("turnId" to JsonPrimitive("turn-refreshed"))),
+                    )
+                },
+            ),
+        )
+
+        val result = transport.steerTurn(
+            threadId = "thread-live",
+            userInput = "retry this",
+            expectedTurnId = "turn-stale",
+        )
+
+        assertEquals(listOf("turn/steer", "thread/read", "turn/steer"), transport.recordedMethods)
+        val firstParams = transport.recordedParams[0].second as JsonObject
+        val secondParams = transport.recordedParams[2].second as JsonObject
+        assertEquals("turn-stale", (firstParams["expectedTurnId"] as JsonPrimitive).content)
+        assertEquals("turn-refreshed", (secondParams["expectedTurnId"] as JsonPrimitive).content)
+        assertEquals("turn-refreshed", result.turnId)
+    }
+
+    @Test
     fun listSkillsFallsBackToLegacyCwdParameter() = runTest {
         val transport = ScriptedTransportClient(
             steps = listOf(
@@ -545,6 +654,185 @@ class RemodexTransportClientLifecycleTests {
         assertEquals("/tmp/project", ((firstParams["cwds"] as JsonArray)[0] as JsonPrimitive).content)
         assertEquals("/tmp/project", (secondParams["cwd"] as JsonPrimitive).content)
         assertEquals(listOf("planner"), skills.map { it.name })
+    }
+
+    @Test
+    fun gitCommitIncludesOptionalMessageAndCwd() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("git/commit") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "commitHash" to JsonPrimitive("abc123"),
+                                "branch" to JsonPrimitive("feature/android"),
+                                "summary" to JsonPrimitive("Commit created"),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.gitCommit(
+            workingDirectory = "/tmp/project",
+            message = "Ship it",
+        )
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+        assertEquals("Ship it", (params["message"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun gitPushIncludesCwd() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("git/push") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "branch" to JsonPrimitive("feature/android"),
+                                "remote" to JsonPrimitive("origin"),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.gitPush(workingDirectory = "/tmp/project")
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun gitPullIncludesCwd() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("git/pull") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "success" to JsonPrimitive(true),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.gitPull(workingDirectory = "/tmp/project")
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun gitResetToRemoteIncludesDiscardConfirmation() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("git/resetToRemote") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "success" to JsonPrimitive(true),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.gitResetToRemote(workingDirectory = "/tmp/project")
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+        assertEquals("discard_runtime_changes", (params["confirm"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun gitRemoteUrlIncludesCwd() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("git/remoteUrl") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "url" to JsonPrimitive("git@github.com:openai/remodex.git"),
+                                "ownerRepo" to JsonPrimitive("openai/remodex"),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.gitRemoteUrl(workingDirectory = "/tmp/project")
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun workspaceRevertPatchPreviewIncludesForwardPatchAndCwd() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("workspace/revertPatchPreview") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "canRevert" to JsonPrimitive(true),
+                                "affectedFiles" to JsonArray(listOf(JsonPrimitive("app.txt"))),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.workspaceRevertPatchPreview(
+            workingDirectory = "/tmp/project",
+            forwardPatch = "diff --git a/app.txt b/app.txt\n",
+        )
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+        assertEquals("diff --git a/app.txt b/app.txt\n", (params["forwardPatch"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun workspaceRevertPatchApplyIncludesForwardPatchAndCwd() = runTest {
+        val transport = ScriptedTransportClient(
+            steps = listOf(
+                ScriptedStep("workspace/revertPatchApply") {
+                    RpcMessage.success(
+                        id = null,
+                        result = JsonObject(
+                            mapOf(
+                                "success" to JsonPrimitive(true),
+                            ),
+                        ),
+                    )
+                },
+            ),
+        )
+
+        transport.workspaceRevertPatchApply(
+            workingDirectory = "/tmp/project",
+            forwardPatch = "diff --git a/app.txt b/app.txt\n",
+        )
+
+        val params = transport.recordedParams.single().second as JsonObject
+        assertEquals("/tmp/project", (params["cwd"] as JsonPrimitive).content)
+        assertEquals("diff --git a/app.txt b/app.txt\n", (params["forwardPatch"] as JsonPrimitive).content)
     }
 
     @Test

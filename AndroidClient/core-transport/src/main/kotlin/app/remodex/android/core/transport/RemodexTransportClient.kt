@@ -14,8 +14,16 @@ import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.CodexTurnSkillMention
 import app.remodex.android.core.model.GitBranchesWithStatusResult
+import app.remodex.android.core.model.GitBranchesResult
 import app.remodex.android.core.model.GitCheckoutResult
+import app.remodex.android.core.model.GitCommitResult
+import app.remodex.android.core.model.GitPullResult
 import app.remodex.android.core.model.GitRepoSyncResult
+import app.remodex.android.core.model.GitPushResult
+import app.remodex.android.core.model.GitRemoteUrlResult
+import app.remodex.android.core.model.GitResetResult
+import app.remodex.android.core.model.RevertApplyResult
+import app.remodex.android.core.model.RevertPreviewResult
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.protocol.JsonValue
 import app.remodex.android.core.protocol.RpcError
@@ -433,6 +441,283 @@ open class RemodexTransportClient(
             )
     }
 
+    open suspend fun gitCommit(
+        workingDirectory: String,
+        message: String? = null,
+    ): GitCommitResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/commit requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/commit",
+            params = JsonObject(
+                buildMap {
+                    put("cwd", JsonPrimitive(normalizedWorkingDirectory))
+                    message?.trim()?.takeIf(String::isNotEmpty)?.let { put("message", JsonPrimitive(it)) }
+                },
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/commit response missing payload",
+            )
+
+        return decodeGitCommitResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/commit returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitPush(
+        workingDirectory: String,
+    ): GitPushResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/push requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/push",
+            params = JsonObject(
+                mapOf("cwd" to JsonPrimitive(normalizedWorkingDirectory)),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/push response missing payload",
+            )
+
+        return decodeGitPushResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/push returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitPull(
+        workingDirectory: String,
+    ): GitPullResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/pull requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/pull",
+            params = JsonObject(
+                mapOf("cwd" to JsonPrimitive(normalizedWorkingDirectory)),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/pull response missing payload",
+            )
+
+        return decodeGitPullResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/pull returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitBranches(
+        workingDirectory: String,
+    ): GitBranchesResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/branches requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/branches",
+            params = JsonObject(
+                mapOf("cwd" to JsonPrimitive(normalizedWorkingDirectory)),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/branches response missing payload",
+            )
+
+        return decodeGitBranchesResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/branches returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitResetToRemote(
+        workingDirectory: String,
+    ): GitResetResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/resetToRemote requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/resetToRemote",
+            params = JsonObject(
+                mapOf(
+                    "cwd" to JsonPrimitive(normalizedWorkingDirectory),
+                    "confirm" to JsonPrimitive("discard_runtime_changes"),
+                ),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/resetToRemote response missing payload",
+            )
+
+        return decodeGitResetResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/resetToRemote returned an undecodable payload",
+            )
+    }
+
+    open suspend fun gitRemoteUrl(
+        workingDirectory: String,
+    ): GitRemoteUrlResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/remoteUrl requires a non-empty cwd",
+            )
+        }
+
+        val response = sendRequest(
+            method = "git/remoteUrl",
+            params = JsonObject(
+                mapOf("cwd" to JsonPrimitive(normalizedWorkingDirectory)),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/remoteUrl response missing payload",
+            )
+
+        return decodeGitRemoteUrlResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "git/remoteUrl returned an undecodable payload",
+            )
+    }
+
+    open suspend fun workspaceRevertPatchPreview(
+        workingDirectory: String,
+        forwardPatch: String,
+    ): RevertPreviewResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        val normalizedForwardPatch = forwardPatch.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchPreview requires a non-empty cwd",
+            )
+        }
+        if (normalizedForwardPatch.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchPreview requires a non-empty forwardPatch",
+            )
+        }
+
+        val response = sendRequest(
+            method = "workspace/revertPatchPreview",
+            params = JsonObject(
+                mapOf(
+                    "cwd" to JsonPrimitive(normalizedWorkingDirectory),
+                    "forwardPatch" to JsonPrimitive(forwardPatch),
+                ),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchPreview response missing payload",
+            )
+
+        return decodeRevertPreviewResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchPreview returned an undecodable payload",
+            )
+    }
+
+    open suspend fun workspaceRevertPatchApply(
+        workingDirectory: String,
+        forwardPatch: String,
+    ): RevertApplyResult {
+        val normalizedWorkingDirectory = workingDirectory.trim()
+        val normalizedForwardPatch = forwardPatch.trim()
+        if (normalizedWorkingDirectory.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchApply requires a non-empty cwd",
+            )
+        }
+        if (normalizedForwardPatch.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchApply requires a non-empty forwardPatch",
+            )
+        }
+
+        val response = sendRequest(
+            method = "workspace/revertPatchApply",
+            params = JsonObject(
+                mapOf(
+                    "cwd" to JsonPrimitive(normalizedWorkingDirectory),
+                    "forwardPatch" to JsonPrimitive(forwardPatch),
+                ),
+            ),
+        )
+
+        val result = response.result
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchApply response missing payload",
+            )
+
+        return decodeRevertApplyResult(result)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "workspace/revertPatchApply returned an undecodable payload",
+            )
+    }
+
     private suspend fun sendThreadListRequest(
         strategy: String,
         params: Map<String, JsonValue>?,
@@ -839,6 +1124,92 @@ open class RemodexTransportClient(
                 attachments = attachments,
                 skillMentions = skillMentions,
             )
+        }
+    }
+
+    open suspend fun steerTurn(
+        threadId: String,
+        userInput: String,
+        expectedTurnId: String?,
+        attachments: List<CodexImageAttachment> = emptyList(),
+        skillMentions: List<CodexTurnSkillMention> = emptyList(),
+    ): RemodexTurnSteerResult {
+        val normalizedThreadId = threadId.trim()
+        if (normalizedThreadId.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "turn/steer requires a non-empty threadId",
+            )
+        }
+
+        val trimmedInput = userInput.trim()
+        if (trimmedInput.isEmpty() && attachments.isEmpty()) {
+            throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "turn/steer requires non-empty user input or attachments",
+            )
+        }
+
+        var currentExpectedTurnId = expectedTurnId?.trim()?.takeIf(String::isNotEmpty)
+            ?: resolveInFlightTurnId(normalizedThreadId)
+            ?: throw RemodexTransportException(
+                kind = RemodexTransportFailureKind.Protocol,
+                message = "No active turn available to steer",
+            )
+
+        var includeStructuredSkillItems = supportsStructuredSkillInput && skillMentions.isNotEmpty()
+        var imageUrlKey = "url"
+        var didRetryWithRefreshedTurnId = false
+
+        while (true) {
+            val requestParams = buildTurnSteerRequestParams(
+                threadId = normalizedThreadId,
+                expectedTurnId = currentExpectedTurnId,
+                userInput = trimmedInput,
+                attachments = attachments,
+                skillMentions = skillMentions,
+                imageUrlKey = imageUrlKey,
+                includeStructuredSkillItems = includeStructuredSkillItems,
+            )
+
+            try {
+                val response = sendRequest(
+                    method = "turn/steer",
+                    params = JsonObject(requestParams),
+                )
+                return RemodexTurnSteerResult(
+                    threadId = normalizedThreadId,
+                    turnId = extractTurnId(response.result) ?: currentExpectedTurnId,
+                    response = response,
+                )
+            } catch (throwable: Throwable) {
+                val classified = throwable as? RemodexTransportException ?: classifyThrowable(throwable)
+                if (includeStructuredSkillItems &&
+                    shouldRetryTurnStartWithoutSkillItems(classified)
+                ) {
+                    supportsStructuredSkillInput = false
+                    includeStructuredSkillItems = false
+                    continue
+                }
+                if (imageUrlKey == "url" &&
+                    attachments.isNotEmpty() &&
+                    shouldRetryTurnStartWithImageUrlField(classified)
+                ) {
+                    imageUrlKey = "image_url"
+                    continue
+                }
+                if (!didRetryWithRefreshedTurnId &&
+                    shouldRetrySteerWithRefreshedTurnId(classified)
+                ) {
+                    val refreshedTurnId = resolveInFlightTurnId(normalizedThreadId)
+                    if (!refreshedTurnId.isNullOrBlank() && refreshedTurnId != currentExpectedTurnId) {
+                        didRetryWithRefreshedTurnId = true
+                        currentExpectedTurnId = refreshedTurnId
+                        continue
+                    }
+                }
+                throw classified
+            }
         }
     }
 
@@ -1453,6 +1824,30 @@ open class RemodexTransportClient(
         return params
     }
 
+    private fun buildTurnSteerRequestParams(
+        threadId: String,
+        expectedTurnId: String,
+        userInput: String,
+        attachments: List<CodexImageAttachment>,
+        skillMentions: List<CodexTurnSkillMention>,
+        imageUrlKey: String,
+        includeStructuredSkillItems: Boolean,
+    ): Map<String, JsonValue> {
+        return mutableMapOf<String, JsonValue>(
+            "threadId" to JsonPrimitive(threadId),
+            "expectedTurnId" to JsonPrimitive(expectedTurnId),
+            "input" to JsonArray(
+                makeTurnInputPayload(
+                    userInput = userInput,
+                    attachments = attachments,
+                    imageUrlKey = imageUrlKey,
+                    skillMentions = skillMentions,
+                    includeStructuredSkillItems = includeStructuredSkillItems,
+                ),
+            ),
+        )
+    }
+
     private fun makeTurnInputPayload(
         userInput: String,
         attachments: List<CodexImageAttachment>,
@@ -1505,6 +1900,14 @@ open class RemodexTransportClient(
         }
 
         return inputItems
+    }
+
+    private suspend fun resolveInFlightTurnId(threadId: String): String? {
+        val snapshot = readThread(
+            threadId = threadId,
+            includeTurns = true,
+        ).turnStateSnapshot
+        return snapshot.interruptibleTurnId ?: snapshot.latestTurnId
     }
 
     private fun decodeThreadFromThreadEnvelope(
@@ -1630,6 +2033,24 @@ open class RemodexTransportClient(
             || message.contains("expected")
             || message.contains("unrecognized")
             || message.contains("type")
+    }
+
+    private fun shouldRetrySteerWithRefreshedTurnId(error: RemodexTransportException): Boolean {
+        val message = (error.rpcError?.message ?: error.message).lowercase()
+        val hints = listOf(
+            "turn not found",
+            "no active turn",
+            "not in progress",
+            "not running",
+            "already completed",
+            "already finished",
+            "invalid turn",
+            "no such turn",
+            "not active",
+            "does not exist",
+            "cannot steer",
+        )
+        return hints.any(message::contains)
     }
 
     private fun shouldRetrySkillsListWithCwdFallback(error: RemodexTransportException): Boolean {
@@ -1841,9 +2262,57 @@ open class RemodexTransportClient(
         }.getOrNull()
     }
 
+    private fun decodeGitBranchesResult(value: JsonValue): GitBranchesResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitBranchesResult.serializer(), value)
+        }.getOrNull()
+    }
+
     private fun decodeGitCheckoutResult(value: JsonValue): GitCheckoutResult? {
         return runCatching {
             json.decodeFromJsonElement(GitCheckoutResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitCommitResult(value: JsonValue): GitCommitResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitCommitResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitPushResult(value: JsonValue): GitPushResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitPushResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitPullResult(value: JsonValue): GitPullResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitPullResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitResetResult(value: JsonValue): GitResetResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitResetResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeGitRemoteUrlResult(value: JsonValue): GitRemoteUrlResult? {
+        return runCatching {
+            json.decodeFromJsonElement(GitRemoteUrlResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeRevertPreviewResult(value: JsonValue): RevertPreviewResult? {
+        return runCatching {
+            json.decodeFromJsonElement(RevertPreviewResult.serializer(), value)
+        }.getOrNull()
+    }
+
+    private fun decodeRevertApplyResult(value: JsonValue): RevertApplyResult? {
+        return runCatching {
+            json.decodeFromJsonElement(RevertApplyResult.serializer(), value)
         }.getOrNull()
     }
 

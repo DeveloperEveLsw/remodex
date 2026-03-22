@@ -2,11 +2,17 @@ package app.remodex.android
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import app.remodex.android.core.model.AIChangeSet
+import app.remodex.android.core.model.AIChangeSetSource
+import app.remodex.android.core.model.AIChangeSetStatus
+import app.remodex.android.core.model.AIUnifiedPatchParser
+import app.remodex.android.core.model.AssistantRevertPresentation
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexApprovalRequest
 import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
+import app.remodex.android.core.model.CodexImageAttachment
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexMessageRole
@@ -20,7 +26,15 @@ import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.CodexSkillMetadata
 import app.remodex.android.core.model.CodexTurnSkillMention
+import app.remodex.android.core.model.GitPullResult
 import app.remodex.android.core.model.GitRepoSyncResult
+import app.remodex.android.core.model.GitPushResult
+import app.remodex.android.core.model.GitRemoteUrlResult
+import app.remodex.android.core.model.TurnGitActionKind
+import app.remodex.android.core.model.TurnGitSyncAlert
+import app.remodex.android.core.model.TurnGitSyncAlertAction
+import app.remodex.android.core.model.RevertApplyResult
+import app.remodex.android.core.model.RevertPreviewResult
 import app.remodex.android.core.pairing.RemodexPairingParser
 import app.remodex.android.core.pairing.RemodexPairingPayload
 import app.remodex.android.core.transport.RemodexHandshakeResult
@@ -39,16 +53,21 @@ import app.remodex.android.core.protocol.boolValue
 import app.remodex.android.core.protocol.objectValue
 import app.remodex.android.core.protocol.stringValue
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import java.net.URLEncoder
+import java.time.Instant
 
 data class RemodexDebugUiState(
     val qrPayload: String = "",
@@ -72,8 +91,14 @@ data class RemodexDebugUiState(
     val pendingApproval: CodexApprovalRequest? = null,
     val isHandlingPendingApproval: Boolean = false,
     val submittingStructuredRequestKeys: Set<String> = emptySet(),
+    val composerAttachments: List<RemodexComposerImageAttachment> = emptyList(),
     val composerMentionedFiles: List<RemodexComposerMentionedFile> = emptyList(),
     val composerMentionedSkills: List<RemodexComposerMentionedSkill> = emptyList(),
+    val queuedTurnDraftsByThread: Map<String, List<RemodexQueuedTurnDraft>> = emptyMap(),
+    val queuePauseStateByThread: Map<String, RemodexQueuePauseState> = emptyMap(),
+    val steeringDraftId: String? = null,
+    val assistantRevertPresentationsByMessageId: Map<String, AssistantRevertPresentation> = emptyMap(),
+    val assistantRevertSheet: RemodexAssistantRevertSheetState? = null,
     val fileAutocompleteItems: List<CodexFuzzyFileMatch> = emptyList(),
     val isFileAutocompleteVisible: Boolean = false,
     val isFileAutocompleteLoading: Boolean = false,
@@ -88,6 +113,10 @@ data class RemodexDebugUiState(
     val availableGitBranchTargets: List<String> = emptyList(),
     val isLoadingGitBranchTargets: Boolean = false,
     val isSwitchingGitBranch: Boolean = false,
+    val runningGitAction: TurnGitActionKind? = null,
+    val isShowingNothingToCommitAlert: Boolean = false,
+    val gitSyncAlert: TurnGitSyncAlert? = null,
+    val pendingExternalUrl: String? = null,
     val gitRepoSync: GitRepoSyncResult? = null,
     val threads: List<CodexThread> = emptyList(),
     val conversation: RemodexConversationState = RemodexConversationState(),
@@ -126,6 +155,50 @@ data class RemodexDebugUiState(
         get() = selectedGitBaseBranch.trim().takeIf(String::isNotEmpty)
             ?: gitDefaultBranch.trim().takeIf(String::isNotEmpty)
             ?: currentGitBranch.trim()
+
+    val isRunningGitAction: Boolean
+        get() = runningGitAction != null
+
+    val shouldShowDiscardRuntimeChangesAndSync: Boolean
+        get() {
+            val sync = gitRepoSync ?: return false
+            val dangerousStates = setOf("dirty", "dirty_and_behind", "diverged")
+            return dangerousStates.contains(sync.state) || (sync.isDirty && sync.state == "no_upstream")
+        }
+
+    val hasBlockingAttachmentState: Boolean
+        get() = composerAttachments.any { attachment ->
+            when (attachment.state) {
+                RemodexComposerImageAttachmentState.Loading,
+                RemodexComposerImageAttachmentState.Failed -> true
+
+                is RemodexComposerImageAttachmentState.Ready -> false
+            }
+        }
+
+    val readyComposerAttachments: List<CodexImageAttachment>
+        get() = composerAttachments.mapNotNull { attachment ->
+            when (val state = attachment.state) {
+                is RemodexComposerImageAttachmentState.Ready -> state.attachment
+                RemodexComposerImageAttachmentState.Loading,
+                RemodexComposerImageAttachmentState.Failed -> null
+            }
+        }
+
+    val hasReadyImages: Boolean
+        get() = readyComposerAttachments.isNotEmpty()
+
+    val remainingAttachmentSlots: Int
+        get() = maxOf(0, RemodexAttachmentPipeline.MaxComposerImages - composerAttachments.size)
+
+    val isSendDisabled: Boolean
+        get() = RemodexComposerSendAvailability(
+            isSending = isStartingTurn || isStartingThread,
+            isConnected = connectionState is RemodexTransportState.Connected,
+            trimmedInput = draftTurnInput.trim(),
+            hasReadyImages = hasReadyImages,
+            hasBlockingAttachmentState = hasBlockingAttachmentState,
+        ).isSendDisabled
 }
 
 data class RemodexRealtimeSyncPolicy(
@@ -159,6 +232,33 @@ data class RemodexComposerMentionedSkill(
     val description: String? = null,
 )
 
+data class RemodexQueuedTurnDraft(
+    val id: String,
+    val text: String,
+    val attachments: List<CodexImageAttachment>,
+    val skillMentions: List<CodexTurnSkillMention>,
+    val createdAt: Instant,
+)
+
+data class RemodexAssistantRevertSheetState(
+    val changeSet: AIChangeSet,
+    val preview: RevertPreviewResult? = null,
+    val isLoadingPreview: Boolean = false,
+    val isApplying: Boolean = false,
+    val errorMessage: String? = null,
+) {
+    val id: String
+        get() = changeSet.id
+}
+
+sealed interface RemodexQueuePauseState {
+    data object Active : RemodexQueuePauseState
+
+    data class Paused(
+        val errorMessage: String,
+    ) : RemodexQueuePauseState
+}
+
 private data class RemodexTrailingFileAutocompleteToken(
     val query: String,
     val tokenRange: IntRange,
@@ -183,7 +283,24 @@ class RemodexDebugViewModel(
     private val transport: RemodexTransportClient = RemodexTransportClient(appVersion = APP_VERSION),
     private val relaySessionStore: RemodexRelaySessionStore = InMemoryRemodexRelaySessionStore(),
     private val realtimeSyncPolicy: RemodexRealtimeSyncPolicy = RemodexRealtimeSyncPolicy(),
+    private val attachmentProcessor: RemodexComposerAttachmentProcessor = RemodexAttachmentPipeline,
+    private val attachmentProcessingDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) : ViewModel() {
+    private data class PendingTurnSend(
+        val payload: String,
+        val attachments: List<CodexImageAttachment>,
+        val skillMentions: List<CodexTurnSkillMention>,
+        val accessMode: CodexAccessMode,
+        val collaborationMode: CodexCollaborationModeKind?,
+        val preferredProjectPath: String?,
+        val modelIdentifier: String?,
+        val reasoningEffort: String?,
+        val rawInput: String,
+        val rawAttachments: List<RemodexComposerImageAttachment>,
+        val rawFileMentions: List<RemodexComposerMentionedFile>,
+        val rawSkillMentions: List<RemodexComposerMentionedSkill>,
+    )
+
     private val _uiState = MutableStateFlow(RemodexDebugUiState())
     val uiState: StateFlow<RemodexDebugUiState> = _uiState.asStateFlow()
     private var gitStatusRefreshJob: Job? = null
@@ -200,6 +317,12 @@ class RemodexDebugViewModel(
     private val runningThreadWatchById = linkedMapOf<String, RemodexRunningThreadWatch>()
     private val cachedSkillSearchIndexByRoot = mutableMapOf<String, List<RemodexSkillSearchIndexEntry>>()
     private val unsupportedSkillsAutocompleteRoots = mutableSetOf<String>()
+    private val aiChangeSetsById = linkedMapOf<String, AIChangeSet>()
+    private val aiChangeSetIdByTurnId = mutableMapOf<String, String>()
+    private val aiChangeSetIdByAssistantMessageId = mutableMapOf<String, String>()
+    private val knownRepoRoots = linkedSetOf<String>()
+    private val repoRootByWorkingDirectory = mutableMapOf<String, String>()
+    private val completedTurnIds = mutableSetOf<String>()
 
     init {
         restoreSavedRelayPairing()
@@ -244,9 +367,12 @@ class RemodexDebugViewModel(
                 var refreshGitBranchesForActiveThread = false
                 var scheduleGitStatusRefreshForActiveThread = false
                 var activeThreadIdForRefresh: String? = null
+                var updatedConversationSnapshot: RemodexConversationState? = null
+                var knownThreadIdsSnapshot: Set<String> = emptySet()
                 val resolvedStructuredRequestKey = resolvedStructuredRequestKey(message)
                 _uiState.update { current ->
                     val activeThreadId = current.activeThreadId
+                    knownThreadIdsSnapshot = current.threads.mapTo(linkedSetOf(), CodexThread::id)
                     val previousRepoRefreshSignal = repoRefreshSignal(
                         conversation = current.conversation,
                         threadId = activeThreadId,
@@ -255,8 +381,9 @@ class RemodexDebugViewModel(
                     val updatedConversation = RemodexConversationReducer.reduce(
                         conversation = current.conversation,
                         message = message,
-                        knownThreadIds = current.threads.mapTo(linkedSetOf(), CodexThread::id),
+                        knownThreadIds = knownThreadIdsSnapshot,
                     )
+                    updatedConversationSnapshot = updatedConversation
                     val updatedRepoRefreshSignal = repoRefreshSignal(
                         conversation = updatedConversation,
                         threadId = activeThreadId,
@@ -288,7 +415,17 @@ class RemodexDebugViewModel(
                         } ?: current.submittingStructuredRequestKeys,
                     )
                 }
+                updatedConversationSnapshot?.let { updatedConversation ->
+                    ingestAiChangeSetSignals(
+                        message = message,
+                        conversation = updatedConversation,
+                        knownThreadIds = knownThreadIdsSnapshot,
+                    )
+                    noteAssistantMessagesFromConversation(updatedConversation)
+                    refreshAssistantRevertPresentations()
+                }
                 if (refreshGitBranchesForActiveThread) {
+                    flushQueueIfPossible(activeThreadIdForRefresh)
                     refreshGitBranchTargets(activeThreadIdForRefresh)
                 }
                 if (scheduleGitStatusRefreshForActiveThread) {
@@ -367,6 +504,243 @@ class RemodexDebugViewModel(
             )
         }
         refreshComposerAutocomplete(value)
+    }
+
+    fun openPhotoLibraryPicker(): Boolean {
+        if (_uiState.value.remainingAttachmentSlots > 0) {
+            return true
+        }
+
+        reportComposerError(
+            "You can attach up to ${RemodexAttachmentPipeline.MaxComposerImages} images per message.",
+        )
+        return false
+    }
+
+    fun openCamera(cameraAvailable: Boolean): Boolean {
+        if (_uiState.value.remainingAttachmentSlots <= 0) {
+            reportComposerError(
+                "You can attach up to ${RemodexAttachmentPipeline.MaxComposerImages} images per message.",
+            )
+            return false
+        }
+        if (!cameraAvailable) {
+            reportComposerError("Camera is not available on this device.")
+            return false
+        }
+
+        return true
+    }
+
+    fun enqueueCapturedImageData(imageData: ByteArray) {
+        enqueueComposerImageData(listOf(imageData))
+    }
+
+    fun enqueueComposerImageData(imageDataItems: List<ByteArray>) {
+        if (imageDataItems.isEmpty()) {
+            return
+        }
+
+        val intakePlan = RemodexComposerAttachmentIntakePlan.make(
+            requestedCount = imageDataItems.size,
+            remainingSlots = _uiState.value.remainingAttachmentSlots,
+        )
+        if (intakePlan.acceptedCount <= 0) {
+            reportComposerError(
+                "You can attach up to ${RemodexAttachmentPipeline.MaxComposerImages} images per message.",
+            )
+            return
+        }
+
+        val acceptedItems = imageDataItems
+            .filter { it.isNotEmpty() }
+            .take(intakePlan.acceptedCount)
+        if (acceptedItems.isEmpty()) {
+            return
+        }
+        if (intakePlan.hasOverflow) {
+            reportComposerError(
+                "Only ${RemodexAttachmentPipeline.MaxComposerImages} images are allowed per message.",
+            )
+        }
+
+        val pendingAttachments = acceptedItems.map {
+            RemodexComposerImageAttachment(
+                state = RemodexComposerImageAttachmentState.Loading,
+            )
+        }
+        _uiState.update { current ->
+            current.copy(
+                composerAttachments = current.composerAttachments + pendingAttachments,
+                errorMessage = current.errorMessage,
+            )
+        }
+
+        pendingAttachments.zip(acceptedItems).forEach { (placeholder, sourceData) ->
+            viewModelScope.launch {
+                val nextState = withContext(attachmentProcessingDispatcher) {
+                    attachmentProcessor.makeAttachment(sourceData)?.let { attachment ->
+                        RemodexComposerImageAttachmentState.Ready(attachment)
+                    } ?: RemodexComposerImageAttachmentState.Failed
+                }
+                updateComposerAttachmentState(placeholder.id, nextState)
+            }
+        }
+    }
+
+    fun removeComposerAttachment(id: String) {
+        if (id.isBlank()) {
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                composerAttachments = current.composerAttachments.filterNot { it.id == id },
+            )
+        }
+    }
+
+    fun reportCameraPermissionDenied() {
+        reportComposerError("Camera access is required to take a photo.")
+    }
+
+    fun reportComposerMediaError(message: String) {
+        reportComposerError(message)
+    }
+
+    fun queuedDraftsList(threadId: String? = _uiState.value.activeThreadId): List<RemodexQueuedTurnDraft> {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return emptyList()
+        return _uiState.value.queuedTurnDraftsByThread[normalizedThreadId].orEmpty()
+    }
+
+    fun queuedCount(threadId: String? = _uiState.value.activeThreadId): Int {
+        return queuedDraftsList(threadId).size
+    }
+
+    fun isQueuePaused(threadId: String? = _uiState.value.activeThreadId): Boolean {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return false
+        return _uiState.value.queuePauseStateByThread[normalizedThreadId] is RemodexQueuePauseState.Paused
+    }
+
+    fun queuePauseMessage(threadId: String? = _uiState.value.activeThreadId): String? {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return null
+        return (_uiState.value.queuePauseStateByThread[normalizedThreadId] as? RemodexQueuePauseState.Paused)
+            ?.errorMessage
+    }
+
+    fun removeQueuedDraft(
+        id: String,
+        threadId: String? = _uiState.value.activeThreadId,
+    ) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        if (id.isBlank()) {
+            return
+        }
+
+        val updatedDrafts = queuedDraftsList(normalizedThreadId).filterNot { it.id == id }
+        setQueuedDrafts(updatedDrafts, normalizedThreadId)
+    }
+
+    fun resumeQueueAndFlushIfPossible(threadId: String? = _uiState.value.activeThreadId) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        setQueuePauseState(RemodexQueuePauseState.Active, normalizedThreadId)
+        flushQueueIfPossible(normalizedThreadId)
+    }
+
+    fun steerQueuedDraft(
+        id: String,
+        threadId: String? = _uiState.value.activeThreadId,
+    ) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        val currentState = _uiState.value
+        val draft = currentState.queuedTurnDraftsByThread[normalizedThreadId]
+            ?.firstOrNull { it.id == id }
+            ?: return
+
+        if (currentState.connectionState !is RemodexTransportState.Connected ||
+            currentState.steeringDraftId != null ||
+            !currentState.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+        ) {
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                steeringDraftId = id,
+                errorMessage = null,
+            )
+        }
+
+        viewModelScope.launch {
+            var pendingMessageId: String? = null
+
+            try {
+                val stillBusy = refreshBusyStateIfNeeded(
+                    threadId = normalizedThreadId,
+                    wasBusy = true,
+                )
+                if (!stillBusy) {
+                    performQueuedDraftStart(
+                        draft = draft,
+                        threadId = normalizedThreadId,
+                    )
+                    removeQueuedDraft(id = id, threadId = normalizedThreadId)
+                    return@launch
+                }
+
+                val expectedTurnId = resolveSteerExpectedTurnId(normalizedThreadId)
+                pendingMessageId = UUID.randomUUID().toString()
+                _uiState.update { current ->
+                    current.copy(
+                        conversation = current.conversation
+                            .withActiveThread(normalizedThreadId)
+                            .appendUserMessage(
+                                threadId = normalizedThreadId,
+                                text = draft.text,
+                                messageId = pendingMessageId,
+                                attachments = draft.attachments,
+                            ),
+                    )
+                }
+
+                val result = transport.steerTurn(
+                    threadId = normalizedThreadId,
+                    userInput = draft.text,
+                    expectedTurnId = expectedTurnId,
+                    attachments = draft.attachments,
+                    skillMentions = draft.skillMentions,
+                )
+                val resolvedPendingMessageId = pendingMessageId ?: return@launch
+                _uiState.update { current ->
+                    current.copy(
+                        conversation = current.conversation.markMessageDeliveryState(
+                            threadId = normalizedThreadId,
+                            messageId = resolvedPendingMessageId,
+                            deliveryState = CodexMessageDeliveryState.Confirmed,
+                            turnId = result.turnId,
+                        ),
+                        errorMessage = null,
+                    )
+                }
+                removeQueuedDraft(id = id, threadId = normalizedThreadId)
+            } catch (throwable: Throwable) {
+                _uiState.update { current ->
+                    current.copy(
+                        conversation = pendingMessageId?.let { messageId ->
+                            current.conversation.removeMessage(
+                                threadId = normalizedThreadId,
+                                messageId = messageId,
+                            )
+                        } ?: current.conversation,
+                        errorMessage = userFacingTurnErrorMessage(throwable),
+                    )
+                }
+            } finally {
+                _uiState.update { current ->
+                    current.copy(steeringDraftId = null)
+                }
+            }
+        }
     }
 
     fun selectRuntimeModel(modelId: String?) {
@@ -659,6 +1033,7 @@ class RemodexDebugViewModel(
                     threads = emptyList(),
                     conversation = RemodexConversationState(),
                     draftTurnInput = "",
+                    composerAttachments = emptyList(),
                     composerMentionedFiles = emptyList(),
                     composerMentionedSkills = emptyList(),
                     fileAutocompleteItems = emptyList(),
@@ -1222,6 +1597,287 @@ class RemodexDebugViewModel(
         }
     }
 
+    fun triggerGitAction(action: TurnGitActionKind) {
+        viewModelScope.launch {
+            val currentState = _uiState.value
+            val activeThreadId = normalizeThreadId(currentState.activeThreadId)
+            val workingDirectory = selectedThreadWorkingDirectory(activeThreadId)
+            if (!canRunGitAction(currentState, activeThreadId, workingDirectory)) {
+                return@launch
+            }
+
+            _uiState.update { current ->
+                current.copy(
+                    runningGitAction = action,
+                    gitSyncAlert = null,
+                    errorMessage = null,
+                )
+            }
+
+            try {
+                when (action) {
+                    TurnGitActionKind.SyncNow -> {
+                        val result = transport.gitStatus(workingDirectory = workingDirectory!!)
+                        applyGitRepoSync(result, workingDirectory)
+                        if (result.state == "behind_only" ||
+                            result.state == "diverged" ||
+                            result.state == "dirty_and_behind"
+                        ) {
+                            _uiState.update { current ->
+                                current.copy(
+                                    gitSyncAlert = TurnGitSyncAlert(
+                                        id = "pull-rebase",
+                                        title = "Branch is behind remote",
+                                        message = "Pull with rebase to update?",
+                                        action = TurnGitSyncAlertAction.PullRebase,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+
+                    TurnGitActionKind.Commit -> {
+                        transport.gitCommit(
+                            workingDirectory = workingDirectory!!,
+                            message = null,
+                        )
+                        val statusAfter = runCatching {
+                            transport.gitStatus(workingDirectory = workingDirectory)
+                        }.getOrNull()
+                        if (statusAfter != null) {
+                            applyGitRepoSync(statusAfter, workingDirectory)
+                        }
+                    }
+
+                    TurnGitActionKind.Push -> {
+                        val result = transport.gitPush(workingDirectory = workingDirectory!!)
+                        handleSuccessfulPush(
+                            result = result,
+                            threadId = activeThreadId!!,
+                            workingDirectory = workingDirectory,
+                        )
+                    }
+
+                    TurnGitActionKind.CommitAndPush -> {
+                        transport.gitCommit(
+                            workingDirectory = workingDirectory!!,
+                            message = null,
+                        )
+                        val pushResult = transport.gitPush(workingDirectory = workingDirectory)
+                        handleSuccessfulPush(
+                            result = pushResult,
+                            threadId = activeThreadId!!,
+                            workingDirectory = workingDirectory,
+                        )
+                    }
+
+                    TurnGitActionKind.CreatePR -> {
+                        val remoteResult = transport.gitRemoteUrl(workingDirectory = workingDirectory!!)
+                        val ownerRepo = remoteResult.ownerRepo?.trim().takeIf { !it.isNullOrEmpty() }
+                            ?: throw IllegalStateException("Could not determine repository from remote URL.")
+                        val branch = (_uiState.value.gitRepoSync?.currentBranch ?: _uiState.value.currentGitBranch)
+                            .trim()
+                        if (branch.isEmpty()) {
+                            throw IllegalStateException("No current branch found.")
+                        }
+                        val base = _uiState.value.selectedGitBaseBranch.trim().takeIf(String::isNotEmpty)
+                            ?: _uiState.value.gitDefaultBranch.trim()
+                        _uiState.update { current ->
+                            current.copy(
+                                pendingExternalUrl = buildPullRequestUrl(
+                                    ownerRepo = ownerRepo,
+                                    branch = branch,
+                                    base = base,
+                                ),
+                            )
+                        }
+                    }
+
+                    TurnGitActionKind.DiscardRuntimeChangesAndSync -> {
+                        val result = transport.gitResetToRemote(workingDirectory = workingDirectory!!)
+                        result.status?.let { applyGitRepoSync(it, workingDirectory) }
+                    }
+                }
+            } catch (throwable: Throwable) {
+                handleGitActionFailure(throwable)
+            } finally {
+                _uiState.update { current ->
+                    current.copy(runningGitAction = null)
+                }
+            }
+        }
+    }
+
+    fun dismissGitSyncAlert() {
+        _uiState.update { current ->
+            current.copy(gitSyncAlert = null)
+        }
+    }
+
+    fun dismissNothingToCommitAlert() {
+        _uiState.update { current ->
+            current.copy(isShowingNothingToCommitAlert = false)
+        }
+    }
+
+    fun confirmGitSyncAlertAction(alertAction: TurnGitSyncAlertAction) {
+        val currentState = _uiState.value
+        val activeThreadId = normalizeThreadId(currentState.activeThreadId)
+        val workingDirectory = selectedThreadWorkingDirectory(activeThreadId)
+        dismissGitSyncAlert()
+        if (alertAction != TurnGitSyncAlertAction.PullRebase ||
+            !canRunGitAction(currentState, activeThreadId, workingDirectory)
+        ) {
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update { current ->
+                current.copy(
+                    runningGitAction = TurnGitActionKind.SyncNow,
+                    errorMessage = null,
+                )
+            }
+
+            try {
+                val result = transport.gitPull(workingDirectory = workingDirectory!!)
+                result.status?.let { applyGitRepoSync(it, workingDirectory) }
+            } catch (throwable: Throwable) {
+                _uiState.update { current ->
+                    current.copy(
+                        gitSyncAlert = TurnGitSyncAlert(
+                            id = "pull-failed",
+                            title = "Pull Failed",
+                            message = userFacingGitActionErrorMessage(throwable),
+                            action = TurnGitSyncAlertAction.DismissOnly,
+                        ),
+                    )
+                }
+            } finally {
+                _uiState.update { current ->
+                    current.copy(runningGitAction = null)
+                }
+            }
+        }
+    }
+
+    fun consumePendingExternalUrl() {
+        _uiState.update { current ->
+            current.copy(pendingExternalUrl = null)
+        }
+    }
+
+    fun startAssistantRevertPreview(
+        message: app.remodex.android.core.model.CodexMessage,
+        workingDirectory: String?,
+    ) {
+        val normalizedWorkingDirectory = normalizeWorkingDirectory(workingDirectory) ?: return
+        val changeSet = readyChangeSet(message) ?: return
+
+        _uiState.update { current ->
+            current.copy(
+                assistantRevertSheet = RemodexAssistantRevertSheetState(
+                    changeSet = changeSet,
+                    preview = null,
+                    isLoadingPreview = true,
+                    isApplying = false,
+                    errorMessage = null,
+                ),
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                val preview = transport.workspaceRevertPatchPreview(
+                    workingDirectory = normalizedWorkingDirectory,
+                    forwardPatch = changeSet.forwardUnifiedPatch,
+                )
+                _uiState.update { current ->
+                    val sheet = current.assistantRevertSheet
+                    if (sheet?.id != changeSet.id) {
+                        return@update current
+                    }
+                    current.copy(
+                        assistantRevertSheet = sheet.copy(
+                            preview = preview,
+                            isLoadingPreview = false,
+                        ),
+                    )
+                }
+            } catch (throwable: Throwable) {
+                _uiState.update { current ->
+                    val sheet = current.assistantRevertSheet
+                    if (sheet?.id != changeSet.id) {
+                        return@update current
+                    }
+                    current.copy(
+                        assistantRevertSheet = sheet.copy(
+                            isLoadingPreview = false,
+                            errorMessage = userFacingRevertErrorMessage(throwable),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissAssistantRevertSheet() {
+        _uiState.update { current ->
+            current.copy(assistantRevertSheet = null)
+        }
+    }
+
+    fun confirmAssistantRevert(workingDirectory: String?) {
+        val normalizedWorkingDirectory = normalizeWorkingDirectory(workingDirectory) ?: return
+        val currentSheet = _uiState.value.assistantRevertSheet ?: return
+        val preview = currentSheet.preview ?: return
+        if (!preview.canRevert) {
+            return
+        }
+
+        _uiState.update { current ->
+            val sheet = current.assistantRevertSheet ?: return@update current
+            current.copy(
+                assistantRevertSheet = sheet.copy(
+                    isApplying = true,
+                    errorMessage = null,
+                ),
+            )
+        }
+
+        val changeSet = currentSheet.changeSet
+        markRevertAttempt(changeSet.id)
+        refreshAssistantRevertPresentations()
+        viewModelScope.launch {
+            try {
+                val applyResult = transport.workspaceRevertPatchApply(
+                    workingDirectory = normalizedWorkingDirectory,
+                    forwardPatch = changeSet.forwardUnifiedPatch,
+                )
+                handleAssistantRevertApplyResult(
+                    changeSet = changeSet,
+                    workingDirectory = normalizedWorkingDirectory,
+                    applyResult = applyResult,
+                )
+            } catch (throwable: Throwable) {
+                recordChangeSetError(changeSet.id, userFacingRevertErrorMessage(throwable))
+                refreshAssistantRevertPresentations()
+                _uiState.update { current ->
+                    val sheet = current.assistantRevertSheet
+                    if (sheet?.id != changeSet.id) {
+                        return@update current
+                    }
+                    current.copy(
+                        assistantRevertSheet = sheet.copy(
+                            isApplying = false,
+                            errorMessage = userFacingRevertErrorMessage(throwable),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
     fun refreshGitBranchTargets(threadId: String? = _uiState.value.activeThreadId) {
         viewModelScope.launch {
             val targetThreadId = threadId?.trim()?.takeIf(String::isNotEmpty)
@@ -1358,6 +2014,9 @@ class RemodexDebugViewModel(
                 }
                 return@launch
             }
+            if (currentState.runningGitAction != null) {
+                return@launch
+            }
 
             val workingDirectory = selectedThreadWorkingDirectory(activeThreadId)
             if (workingDirectory == null) {
@@ -1451,6 +2110,7 @@ class RemodexDebugViewModel(
                 mentions = currentState.composerMentionedFiles,
             )
             val trimmedPayload = payload.trim()
+            val attachments = currentState.readyComposerAttachments
             val skillMentions = currentState.composerMentionedSkills.map {
                 CodexTurnSkillMention(
                     id = it.name,
@@ -1458,95 +2118,139 @@ class RemodexDebugViewModel(
                     path = it.path,
                 )
             }
-            if (trimmedPayload.isEmpty()) {
+            if (trimmedPayload.isEmpty() && attachments.isEmpty()) {
                 _uiState.update { current ->
                     current.copy(errorMessage = "Enter a prompt before sending a turn.")
                 }
                 return@launch
             }
+            if (currentState.hasBlockingAttachmentState) {
+                _uiState.update { current ->
+                    current.copy(errorMessage = "Wait for images to finish processing before sending.")
+                }
+                return@launch
+            }
 
-            val pendingMessageId = selectedThreadId?.takeIf(String::isNotBlank)?.let { UUID.randomUUID().toString() }
-            val rawInput = currentState.draftTurnInput
-            val rawFileMentions = currentState.composerMentionedFiles
-            val rawSkillMentions = currentState.composerMentionedSkills
+            val pendingSend = PendingTurnSend(
+                payload = trimmedPayload,
+                attachments = attachments,
+                skillMentions = skillMentions,
+                accessMode = currentState.selectedAccessMode,
+                collaborationMode = currentState.selectedCollaborationMode.takeUnless {
+                    it == CodexCollaborationModeKind.Default
+                },
+                preferredProjectPath = currentState.threads
+                    .firstOrNull { it.id == selectedThreadId }
+                    ?.cwd,
+                modelIdentifier = currentState.selectedModelOption?.model,
+                reasoningEffort = currentState.selectedReasoningEffort,
+                rawInput = currentState.draftTurnInput,
+                rawAttachments = currentState.composerAttachments,
+                rawFileMentions = currentState.composerMentionedFiles,
+                rawSkillMentions = currentState.composerMentionedSkills,
+            )
+            val queuedDraft = RemodexQueuedTurnDraft(
+                id = UUID.randomUUID().toString(),
+                text = trimmedPayload,
+                attachments = attachments,
+                skillMentions = skillMentions,
+                createdAt = Instant.now(),
+            )
+            val normalizedThreadId = normalizeThreadId(selectedThreadId)
+            val threadBusy = currentState.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+            val queuePaused = isQueuePaused(normalizedThreadId)
 
             _uiState.update { current ->
-                val updatedConversation = if (pendingMessageId != null && !selectedThreadId.isNullOrBlank()) {
-                    current.conversation
-                        .withActiveThread(selectedThreadId)
-                        .appendUserMessage(
-                            threadId = selectedThreadId,
-                            text = trimmedPayload,
-                            messageId = pendingMessageId,
-                        )
-                } else {
-                    current.conversation
-                }
-
                 current.copy(
-                    conversation = updatedConversation,
-                    draftTurnInput = "",
-                    composerMentionedFiles = emptyList(),
-                    composerMentionedSkills = emptyList(),
-                    fileAutocompleteItems = emptyList(),
-                    isFileAutocompleteVisible = false,
-                    isFileAutocompleteLoading = false,
-                    fileAutocompleteQuery = "",
-                    skillAutocompleteItems = emptyList(),
-                    isSkillAutocompleteVisible = false,
-                    isSkillAutocompleteLoading = false,
-                    skillAutocompleteQuery = "",
                     isStartingTurn = true,
                     errorMessage = null,
                 )
             }
-            resetFileAutocompleteState()
-            resetSkillAutocompleteState()
 
+            val stillBusy = refreshBusyStateIfNeeded(
+                threadId = normalizedThreadId,
+                wasBusy = threadBusy,
+            )
+            if (normalizedThreadId != null && (stillBusy || queuePaused)) {
+                appendQueuedDraft(
+                    draft = queuedDraft,
+                    threadId = normalizedThreadId,
+                )
+                clearComposerInputs()
+                _uiState.update { current ->
+                    current.copy(isStartingTurn = false)
+                }
+
+                if (queuePaused && !stillBusy) {
+                    resumeQueueAndFlushIfPossible(normalizedThreadId)
+                }
+                return@launch
+            }
+
+            performTurnSend(
+                pendingSend = pendingSend,
+                requestedThreadId = selectedThreadId,
+            )
+        }
+    }
+
+    fun flushQueueIfPossible(threadId: String? = _uiState.value.activeThreadId) {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return
+        val currentState = _uiState.value
+        if (currentState.queuedTurnDraftsByThread[normalizedThreadId].isNullOrEmpty() ||
+            currentState.isStartingTurn ||
+            currentState.steeringDraftId != null ||
+            currentState.connectionState !is RemodexTransportState.Connected ||
+            isQueuePaused(normalizedThreadId) ||
+            currentState.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+        ) {
+            return
+        }
+
+        val nextDraft = queuedDraftsList(normalizedThreadId).firstOrNull() ?: return
+        removeQueuedDraft(id = nextDraft.id, threadId = normalizedThreadId)
+        _uiState.update { current ->
+            current.copy(
+                isStartingTurn = true,
+                errorMessage = null,
+            )
+        }
+
+        viewModelScope.launch {
             runCatching {
                 transport.startTurn(
-                    threadId = selectedThreadId,
-                    userInput = trimmedPayload,
-                    accessMode = currentState.selectedAccessMode,
-                    collaborationMode = currentState.selectedCollaborationMode.takeUnless {
-                        it == CodexCollaborationModeKind.Default
-                    },
-                    preferredProjectPath = currentState.threads
-                        .firstOrNull { it.id == selectedThreadId }
-                        ?.cwd,
-                    modelIdentifier = currentState.selectedModelOption?.model,
-                    reasoningEffort = currentState.selectedReasoningEffort,
-                    skillMentions = skillMentions,
+                    threadId = normalizedThreadId,
+                    userInput = nextDraft.text,
+                    accessMode = _uiState.value.selectedAccessMode,
+                    preferredProjectPath = selectedThreadWorkingDirectory(normalizedThreadId),
+                    modelIdentifier = _uiState.value.selectedModelOption?.model,
+                    reasoningEffort = _uiState.value.selectedReasoningEffort,
+                    attachments = nextDraft.attachments,
+                    skillMentions = nextDraft.skillMentions,
                 )
             }.onSuccess { result ->
                 applyTurnStarted(
                     result = result,
-                    pendingMessageId = pendingMessageId,
-                    pendingMessageText = trimmedPayload,
-                    requestedThreadId = selectedThreadId ?: result.requestedThreadId,
+                    pendingMessageText = nextDraft.text,
+                    pendingAttachments = nextDraft.attachments,
+                    requestedThreadId = normalizedThreadId,
                 )
             }.onFailure { throwable ->
+                prependQueuedDraft(
+                    draft = nextDraft,
+                    threadId = normalizedThreadId,
+                )
+                val queueErrorMessage = userFacingTurnErrorMessage(throwable)
+                setQueuePauseState(
+                    state = RemodexQueuePauseState.Paused(queueErrorMessage),
+                    threadId = normalizedThreadId,
+                )
                 _uiState.update { current ->
-                    val updatedConversation = if (pendingMessageId != null && !selectedThreadId.isNullOrBlank()) {
-                        current.conversation.markMessageDeliveryState(
-                            threadId = selectedThreadId,
-                            messageId = pendingMessageId,
-                            deliveryState = CodexMessageDeliveryState.Failed,
-                        )
-                    } else {
-                        current.conversation
-                    }
-
                     current.copy(
-                        conversation = updatedConversation,
-                        draftTurnInput = rawInput,
-                        composerMentionedFiles = rawFileMentions,
-                        composerMentionedSkills = rawSkillMentions,
                         isStartingTurn = false,
-                        errorMessage = throwable.message,
+                        errorMessage = "Queue paused: $queueErrorMessage",
                     )
                 }
-                refreshComposerAutocomplete(rawInput)
             }
         }
     }
@@ -1605,6 +2309,148 @@ class RemodexDebugViewModel(
                 }
             }
         }
+    }
+
+    private suspend fun refreshBusyStateIfNeeded(
+        threadId: String?,
+        wasBusy: Boolean,
+    ): Boolean {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return wasBusy
+        val conversation = _uiState.value.conversation
+        if (!wasBusy ||
+            conversation.activeTurnIdByThread[normalizedThreadId] != null ||
+            !conversation.runningThreadIds.contains(normalizedThreadId)
+        ) {
+            return wasBusy
+        }
+
+        refreshThreadState(
+            threadId = normalizedThreadId,
+            forceHydration = false,
+            markViewed = _uiState.value.activeThreadId == normalizedThreadId,
+        )
+        return _uiState.value.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+    }
+
+    private suspend fun performTurnSend(
+        pendingSend: PendingTurnSend,
+        requestedThreadId: String?,
+    ) {
+        val pendingMessageId = normalizeThreadId(requestedThreadId)?.let { UUID.randomUUID().toString() }
+
+        _uiState.update { current ->
+            val updatedConversation = if (pendingMessageId != null && requestedThreadId != null) {
+                current.conversation
+                    .withActiveThread(requestedThreadId)
+                    .appendUserMessage(
+                        threadId = requestedThreadId,
+                        text = pendingSend.payload,
+                        messageId = pendingMessageId,
+                        attachments = pendingSend.attachments,
+                    )
+            } else {
+                current.conversation
+            }
+
+            current.copy(
+                conversation = updatedConversation,
+                draftTurnInput = "",
+                composerAttachments = emptyList(),
+                composerMentionedFiles = emptyList(),
+                composerMentionedSkills = emptyList(),
+                fileAutocompleteItems = emptyList(),
+                isFileAutocompleteVisible = false,
+                isFileAutocompleteLoading = false,
+                fileAutocompleteQuery = "",
+                skillAutocompleteItems = emptyList(),
+                isSkillAutocompleteVisible = false,
+                isSkillAutocompleteLoading = false,
+                skillAutocompleteQuery = "",
+                isStartingTurn = true,
+                errorMessage = null,
+            )
+        }
+        resetFileAutocompleteState()
+        resetSkillAutocompleteState()
+
+        runCatching {
+            transport.startTurn(
+                threadId = requestedThreadId,
+                userInput = pendingSend.payload,
+                accessMode = pendingSend.accessMode,
+                collaborationMode = pendingSend.collaborationMode,
+                preferredProjectPath = pendingSend.preferredProjectPath,
+                modelIdentifier = pendingSend.modelIdentifier,
+                reasoningEffort = pendingSend.reasoningEffort,
+                attachments = pendingSend.attachments,
+                skillMentions = pendingSend.skillMentions,
+            )
+        }.onSuccess { result ->
+            applyTurnStarted(
+                result = result,
+                pendingMessageId = pendingMessageId,
+                pendingMessageText = pendingSend.payload,
+                pendingAttachments = pendingSend.attachments,
+                requestedThreadId = requestedThreadId ?: result.requestedThreadId,
+            )
+        }.onFailure { throwable ->
+            _uiState.update { current ->
+                val updatedConversation = if (pendingMessageId != null && requestedThreadId != null) {
+                    current.conversation.markMessageDeliveryState(
+                        threadId = requestedThreadId,
+                        messageId = pendingMessageId,
+                        deliveryState = CodexMessageDeliveryState.Failed,
+                    )
+                } else {
+                    current.conversation
+                }
+
+                current.copy(
+                    conversation = updatedConversation,
+                    draftTurnInput = pendingSend.rawInput,
+                    composerAttachments = pendingSend.rawAttachments,
+                    composerMentionedFiles = pendingSend.rawFileMentions,
+                    composerMentionedSkills = pendingSend.rawSkillMentions,
+                    isStartingTurn = false,
+                    errorMessage = userFacingTurnErrorMessage(throwable),
+                )
+            }
+            refreshComposerAutocomplete(pendingSend.rawInput)
+        }
+    }
+
+    private suspend fun performQueuedDraftStart(
+        draft: RemodexQueuedTurnDraft,
+        threadId: String,
+    ) {
+        val result = transport.startTurn(
+            threadId = threadId,
+            userInput = draft.text,
+            accessMode = _uiState.value.selectedAccessMode,
+            preferredProjectPath = selectedThreadWorkingDirectory(threadId),
+            modelIdentifier = _uiState.value.selectedModelOption?.model,
+            reasoningEffort = _uiState.value.selectedReasoningEffort,
+            attachments = draft.attachments,
+            skillMentions = draft.skillMentions,
+        )
+        applyTurnStarted(
+            result = result,
+            pendingMessageText = draft.text,
+            pendingAttachments = draft.attachments,
+            requestedThreadId = threadId,
+        )
+    }
+
+    private suspend fun resolveSteerExpectedTurnId(threadId: String): String? {
+        val localTurnId = _uiState.value.conversation.activeTurnIdByThread[threadId]
+        if (!localTurnId.isNullOrBlank()) {
+            return localTurnId
+        }
+
+        return resolveInterruptibleTurnId(
+            threadId = threadId,
+            forceRefresh = true,
+        )
     }
 
     private fun refreshComposerAutocomplete(text: String) {
@@ -1814,6 +2660,28 @@ class RemodexDebugViewModel(
                 isSkillAutocompleteLoading = false,
                 skillAutocompleteQuery = "",
             )
+        }
+    }
+
+    private fun updateComposerAttachmentState(
+        attachmentId: String,
+        state: RemodexComposerImageAttachmentState,
+    ) {
+        _uiState.update { current ->
+            val attachmentIndex = current.composerAttachments.indexOfFirst { it.id == attachmentId }
+            if (attachmentIndex < 0) {
+                return@update current
+            }
+
+            val updatedAttachments = current.composerAttachments.toMutableList()
+            updatedAttachments[attachmentIndex] = updatedAttachments[attachmentIndex].copy(state = state)
+            current.copy(composerAttachments = updatedAttachments)
+        }
+    }
+
+    private fun reportComposerError(message: String) {
+        _uiState.update { current ->
+            current.copy(errorMessage = message)
         }
     }
 
@@ -2501,6 +3369,7 @@ class RemodexDebugViewModel(
         result: RemodexTurnStartResult,
         pendingMessageId: String? = null,
         pendingMessageText: String? = null,
+        pendingAttachments: List<CodexImageAttachment> = emptyList(),
         requestedThreadId: String = result.requestedThreadId,
     ) {
         handleDisplayedThreadChange(
@@ -2541,16 +3410,17 @@ class RemodexDebugViewModel(
                     },
                     turnId = resolvedTurnId,
                 )
-            } else if (!pendingMessageText.isNullOrBlank()) {
+            } else if (!pendingMessageText.isNullOrBlank() || pendingAttachments.isNotEmpty()) {
                 updatedConversation = updatedConversation.appendUserMessage(
                     threadId = result.threadId,
-                    text = pendingMessageText,
+                    text = pendingMessageText.orEmpty(),
                     turnId = resolvedTurnId,
                     deliveryState = if (resolvedTurnId == null) {
                         CodexMessageDeliveryState.Pending
                     } else {
                         CodexMessageDeliveryState.Confirmed
                     },
+                    attachments = pendingAttachments,
                 )
             }
 
@@ -2572,6 +3442,7 @@ class RemodexDebugViewModel(
         threadResult: RemodexThreadReadResult,
         markViewed: Boolean,
     ) {
+        val wasRunning = _uiState.value.conversation.threadHasActiveOrRunningTurn(threadResult.thread.id)
         _uiState.update { current ->
             val updatedConversation = if (markViewed) {
                 current.conversation.markThreadAsViewed(threadResult.thread.id)
@@ -2587,7 +3458,15 @@ class RemodexDebugViewModel(
                 errorMessage = null,
             )
         }
+        noteAssistantMessagesFromConversation(_uiState.value.conversation)
+        refreshAssistantRevertPresentations()
         sanitizeRunningThreadWatches()
+        if (wasRunning &&
+            _uiState.value.activeThreadId == threadResult.thread.id &&
+            !_uiState.value.conversation.threadHasActiveOrRunningTurn(threadResult.thread.id)
+        ) {
+            flushQueueIfPossible(threadResult.thread.id)
+        }
     }
 
     private fun applyThreadResumeResult(
@@ -2595,6 +3474,7 @@ class RemodexDebugViewModel(
         markViewed: Boolean,
     ) {
         val normalizedThreadId = normalizeThreadId(resumeResult.thread?.id ?: resumeResult.threadId) ?: return
+        val wasRunning = _uiState.value.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
         _uiState.update { current ->
             val updatedConversationBase = if (markViewed) {
                 current.conversation.markThreadAsViewed(normalizedThreadId)
@@ -2619,7 +3499,15 @@ class RemodexDebugViewModel(
                 errorMessage = null,
             )
         }
+        noteAssistantMessagesFromConversation(_uiState.value.conversation)
+        refreshAssistantRevertPresentations()
         sanitizeRunningThreadWatches()
+        if (wasRunning &&
+            _uiState.value.activeThreadId == normalizedThreadId &&
+            !_uiState.value.conversation.threadHasActiveOrRunningTurn(normalizedThreadId)
+        ) {
+            flushQueueIfPossible(normalizedThreadId)
+        }
     }
 
     private suspend fun resolveInterruptibleTurnId(
@@ -2671,6 +3559,7 @@ class RemodexDebugViewModel(
                 },
             )
         }
+        refreshAssistantRevertPresentations()
 
         val isConnected = (transport.state.value as? RemodexTransportState.Connected)?.isInitialized == true
         if (!isConnected) {
@@ -2775,11 +3664,13 @@ class RemodexDebugViewModel(
                 )
             }
             requestImmediateSync(threadId)
+            flushQueueIfPossible(threadId)
             return
         }
 
         refreshGitBranchTargets(threadId)
         requestImmediateSync(threadId)
+        flushQueueIfPossible(threadId)
     }
 
     private fun shouldLoadThreadHistory(
@@ -2794,6 +3685,7 @@ class RemodexDebugViewModel(
         threadResult: RemodexThreadReadResult,
         markViewed: Boolean,
     ) {
+        val wasRunning = _uiState.value.conversation.threadHasActiveOrRunningTurn(threadResult.thread.id)
         _uiState.update { current ->
             val updatedConversation = if (markViewed) {
                 current.conversation.markThreadAsViewed(threadResult.thread.id)
@@ -2809,6 +3701,12 @@ class RemodexDebugViewModel(
             )
         }
         sanitizeRunningThreadWatches()
+        if (wasRunning &&
+            _uiState.value.activeThreadId == threadResult.thread.id &&
+            !_uiState.value.conversation.threadHasActiveOrRunningTurn(threadResult.thread.id)
+        ) {
+            flushQueueIfPossible(threadResult.thread.id)
+        }
     }
 
     private fun resolveRecoveryThreadId(
@@ -2897,9 +3795,18 @@ class RemodexDebugViewModel(
         transport.clearResumedThread(threadId)
         clearRunningThreadWatch(threadId)
         _uiState.update { current ->
+            val updatedQueuedDrafts = current.queuedTurnDraftsByThread.toMutableMap().apply {
+                remove(threadId)
+            }
+            val updatedQueuePauseState = current.queuePauseStateByThread.toMutableMap().apply {
+                remove(threadId)
+            }
             current.copy(
                 threads = markThreadArchived(current.threads, threadId),
                 conversation = current.conversation.handleMissingThread(threadId),
+                queuedTurnDraftsByThread = updatedQueuedDrafts,
+                queuePauseStateByThread = updatedQueuePauseState,
+                steeringDraftId = current.steeringDraftId.takeUnless { current.activeThreadId == threadId },
                 isLoadingGitBranchTargets = false,
                 errorMessage = null,
             )
@@ -3209,6 +4116,86 @@ class RemodexDebugViewModel(
         return threadId?.trim()?.takeIf(String::isNotEmpty)
     }
 
+    private fun clearComposerInputs() {
+        _uiState.update { current ->
+            current.copy(
+                draftTurnInput = "",
+                composerAttachments = emptyList(),
+                composerMentionedFiles = emptyList(),
+                composerMentionedSkills = emptyList(),
+                fileAutocompleteItems = emptyList(),
+                isFileAutocompleteVisible = false,
+                isFileAutocompleteLoading = false,
+                fileAutocompleteQuery = "",
+                skillAutocompleteItems = emptyList(),
+                isSkillAutocompleteVisible = false,
+                isSkillAutocompleteLoading = false,
+                skillAutocompleteQuery = "",
+                errorMessage = null,
+            )
+        }
+        resetFileAutocompleteState()
+        resetSkillAutocompleteState()
+    }
+
+    private fun userFacingTurnErrorMessage(throwable: Throwable): String {
+        val transportException = throwable as? RemodexTransportException
+        val rpcMessage = transportException?.rpcError?.message?.trim().orEmpty()
+        if (rpcMessage.isNotEmpty()) {
+            return rpcMessage
+        }
+
+        return throwable.message?.trim()?.takeIf(String::isNotEmpty)
+            ?: "Error while sending message"
+    }
+
+    private fun queuedDrafts(threadId: String): List<RemodexQueuedTurnDraft> {
+        return _uiState.value.queuedTurnDraftsByThread[threadId].orEmpty()
+    }
+
+    private fun setQueuedDrafts(
+        drafts: List<RemodexQueuedTurnDraft>,
+        threadId: String,
+    ) {
+        _uiState.update { current ->
+            val updatedDrafts = current.queuedTurnDraftsByThread.toMutableMap()
+            if (drafts.isEmpty()) {
+                updatedDrafts.remove(threadId)
+            } else {
+                updatedDrafts[threadId] = drafts
+            }
+            current.copy(queuedTurnDraftsByThread = updatedDrafts)
+        }
+    }
+
+    private fun appendQueuedDraft(
+        draft: RemodexQueuedTurnDraft,
+        threadId: String,
+    ) {
+        setQueuedDrafts(queuedDrafts(threadId) + draft, threadId)
+    }
+
+    private fun prependQueuedDraft(
+        draft: RemodexQueuedTurnDraft,
+        threadId: String,
+    ) {
+        setQueuedDrafts(listOf(draft) + queuedDrafts(threadId), threadId)
+    }
+
+    private fun setQueuePauseState(
+        state: RemodexQueuePauseState,
+        threadId: String,
+    ) {
+        _uiState.update { current ->
+            val updatedStateByThread = current.queuePauseStateByThread.toMutableMap()
+            when (state) {
+                RemodexQueuePauseState.Active -> updatedStateByThread.remove(threadId)
+                is RemodexQueuePauseState.Paused -> updatedStateByThread[threadId] = state
+            }
+            current.copy(queuePauseStateByThread = updatedStateByThread)
+        }
+    }
+
     private fun buildTurnStartSummary(result: RemodexTurnStartResult): String {
         result.continuationSummary?.let { summary ->
             return summary
@@ -3280,6 +4267,495 @@ class RemodexDebugViewModel(
         return merged
     }
 
+    private fun ingestAiChangeSetSignals(
+        message: app.remodex.android.core.protocol.RpcMessage,
+        conversation: RemodexConversationState,
+        knownThreadIds: Set<String>,
+    ) {
+        RemodexAIChangeSetSignals.turnDiffSignal(
+            message = message,
+            conversation = conversation,
+            knownThreadIds = knownThreadIds,
+        )?.let { signal ->
+            recordChangeSetPatch(
+                threadId = signal.threadId,
+                turnId = signal.turnId,
+                patch = signal.diff,
+                source = AIChangeSetSource.TurnDiff,
+            )
+        }
+
+        RemodexAIChangeSetSignals.fallbackPatchSignal(
+            message = message,
+            conversation = conversation,
+            knownThreadIds = knownThreadIds,
+        )?.let { signal ->
+            recordChangeSetPatch(
+                threadId = signal.threadId,
+                turnId = signal.turnId,
+                patch = signal.patch,
+                source = AIChangeSetSource.FileChangeFallback,
+            )
+        }
+
+        RemodexAIChangeSetSignals.completedTurnId(message)?.let(::noteTurnFinished)
+    }
+
+    private fun noteAssistantMessagesFromConversation(conversation: RemodexConversationState) {
+        for ((threadId, messages) in conversation.messagesByThread) {
+            for (message in messages) {
+                if (message.role != CodexMessageRole.Assistant) {
+                    continue
+                }
+                val turnId = normalizeThreadId(message.turnId) ?: continue
+                noteAssistantMessage(
+                    threadId = threadId,
+                    turnId = turnId,
+                    assistantMessageId = message.id,
+                )
+            }
+        }
+    }
+
+    private fun noteAssistantMessage(
+        threadId: String,
+        turnId: String,
+        assistantMessageId: String,
+    ) {
+        val normalizedTurnId = normalizeThreadId(turnId) ?: return
+        val normalizedAssistantMessageId = normalizeThreadId(assistantMessageId) ?: return
+        val changeSetId = aiChangeSetIdByTurnId[normalizedTurnId] ?: return
+        val changeSet = aiChangeSetsById[changeSetId] ?: return
+
+        aiChangeSetsById[changeSetId] = changeSet.copy(
+            assistantMessageId = normalizedAssistantMessageId,
+            repoRoot = changeSet.repoRoot ?: gitWorkingDirectoryForThread(threadId),
+        )
+        aiChangeSetIdByAssistantMessageId[normalizedAssistantMessageId] = changeSetId
+        finalizeChangeSetIfPossible(changeSetId)
+    }
+
+    private fun refreshAssistantRevertPresentations() {
+        _uiState.update { current ->
+            val workingDirectory = selectedThreadWorkingDirectory(
+                threadId = current.activeThreadId,
+                threads = current.threads,
+            )
+            val presentations = current.conversation.messagesFor(current.activeThreadId)
+                .mapNotNull { message ->
+                    assistantRevertPresentation(message, workingDirectory)?.let { message.id to it }
+                }
+                .toMap(linkedMapOf())
+            current.copy(
+                assistantRevertPresentationsByMessageId = presentations,
+                assistantRevertSheet = current.assistantRevertSheet?.let { sheet ->
+                    aiChangeSetsById[sheet.id]?.let { latestChangeSet ->
+                        sheet.copy(changeSet = latestChangeSet)
+                    } ?: sheet
+                },
+            )
+        }
+    }
+
+    private fun aiChangeSetForAssistantMessage(
+        message: app.remodex.android.core.model.CodexMessage,
+    ): AIChangeSet? {
+        normalizeThreadId(message.id)?.let { assistantMessageId ->
+            aiChangeSetIdByAssistantMessageId[assistantMessageId]?.let { changeSetId ->
+                aiChangeSetsById[changeSetId]?.let { return it }
+            }
+        }
+
+        normalizeThreadId(message.turnId)?.let { turnId ->
+            aiChangeSetIdByTurnId[turnId]?.let { changeSetId ->
+                aiChangeSetsById[changeSetId]?.let { return it }
+            }
+        }
+
+        return null
+    }
+
+    private fun assistantRevertPresentation(
+        message: app.remodex.android.core.model.CodexMessage,
+        workingDirectory: String?,
+    ): AssistantRevertPresentation? {
+        if (message.role != CodexMessageRole.Assistant) {
+            return null
+        }
+
+        val changeSet = aiChangeSetForAssistantMessage(message) ?: return null
+        val repoBusy = hasActiveRun(changeSet.repoRoot ?: workingDirectory)
+        val hasWorkingDirectory = normalizeWorkingDirectory(workingDirectory) != null
+
+        return when (changeSet.status) {
+            AIChangeSetStatus.Ready -> when {
+                repoBusy -> AssistantRevertPresentation(
+                    title = "Revert changes",
+                    isEnabled = false,
+                    helperText = "Finish the active run in this repo before reverting.",
+                )
+
+                !hasWorkingDirectory -> AssistantRevertPresentation(
+                    title = "Cannot revert",
+                    isEnabled = false,
+                    helperText = "The selected local folder is not available on this Mac.",
+                )
+
+                else -> AssistantRevertPresentation(
+                    title = "Revert changes",
+                    isEnabled = true,
+                    helperText = null,
+                )
+            }
+
+            AIChangeSetStatus.Collecting -> AssistantRevertPresentation(
+                title = "Revert changes",
+                isEnabled = false,
+                helperText = "This response is still collecting its final patch.",
+            )
+
+            AIChangeSetStatus.Reverted -> AssistantRevertPresentation(
+                title = "Reverted",
+                isEnabled = false,
+                helperText = null,
+            )
+
+            AIChangeSetStatus.Failed,
+            AIChangeSetStatus.NotRevertable -> AssistantRevertPresentation(
+                title = "Cannot revert",
+                isEnabled = false,
+                helperText = changeSet.unsupportedReasons.firstOrNull()
+                    ?: changeSet.revertMetadata.lastRevertError,
+            )
+        }
+    }
+
+    private fun readyChangeSet(
+        message: app.remodex.android.core.model.CodexMessage,
+    ): AIChangeSet? {
+        val changeSet = aiChangeSetForAssistantMessage(message) ?: return null
+        return changeSet.takeIf { it.status == AIChangeSetStatus.Ready }
+    }
+
+    private fun hasActiveRun(workingDirectory: String?): Boolean {
+        val normalizedWorkingDirectory = normalizeWorkingDirectory(workingDirectory) ?: return false
+        val currentState = _uiState.value
+        return currentState.threads.any { thread ->
+            repositoriesOverlap(thread.cwd, normalizedWorkingDirectory) &&
+                currentState.conversation.threadHasActiveOrRunningTurn(thread.id)
+        }
+    }
+
+    private fun handleAssistantRevertApplyResult(
+        changeSet: AIChangeSet,
+        workingDirectory: String,
+        applyResult: RevertApplyResult,
+    ) {
+        rememberRepoRoot(applyResult.status?.repoRoot, workingDirectory)
+        if (applyResult.success) {
+            markChangeSetReverted(changeSet.id)
+            refreshAssistantRevertPresentations()
+            applyResult.status?.let { status ->
+                applyGitRepoSync(status, workingDirectory)
+            } ?: scheduleGitStatusRefresh(changeSet.threadId)
+            _uiState.update { current ->
+                current.copy(
+                    conversation = current.conversation.appendSystemMessage(
+                        threadId = changeSet.threadId,
+                        kind = CodexMessageKind.Chat,
+                        text = "Reverted changes from this response.",
+                        turnId = changeSet.turnId,
+                    ),
+                    assistantRevertSheet = null,
+                )
+            }
+            return
+        }
+
+        val failureMessage = firstNonEmptyString(
+            applyResult.unsupportedReasons.firstOrNull(),
+            applyResult.conflicts.firstOrNull()?.message,
+            applyResult.stagedFiles.takeIf { it.isNotEmpty() }?.let {
+                "Some targeted files have staged changes. Unstage them first to keep revert predictable."
+            },
+        ) ?: "Patch revert failed."
+        recordChangeSetError(changeSet.id, failureMessage)
+        refreshAssistantRevertPresentations()
+        _uiState.update { current ->
+            val sheet = current.assistantRevertSheet
+            if (sheet?.id != changeSet.id) {
+                return@update current
+            }
+            val affectedFiles = if (!sheet.preview?.affectedFiles.isNullOrEmpty()) {
+                sheet.preview?.affectedFiles.orEmpty()
+            } else {
+                changeSet.fileChanges.map { it.path }
+            }
+            current.copy(
+                assistantRevertSheet = sheet.copy(
+                    preview = RevertPreviewResult(
+                        canRevert = false,
+                        affectedFiles = affectedFiles,
+                        conflicts = applyResult.conflicts,
+                        unsupportedReasons = applyResult.unsupportedReasons,
+                        stagedFiles = applyResult.stagedFiles,
+                    ),
+                    isApplying = false,
+                    errorMessage = failureMessage,
+                ),
+            )
+        }
+    }
+
+    private fun recordChangeSetPatch(
+        threadId: String,
+        turnId: String,
+        patch: String,
+        source: AIChangeSetSource,
+    ) {
+        val normalizedTurnId = normalizeThreadId(turnId) ?: return
+        val normalizedPatch = RemodexAIChangeSetSignals.normalizedUnifiedPatchPayload(patch) ?: return
+        val analysis = AIUnifiedPatchParser.analyze(normalizedPatch)
+        val changeSetId = aiChangeSetIdByTurnId[normalizedTurnId] ?: UUID.randomUUID().toString()
+        var changeSet = aiChangeSetsById[changeSetId] ?: AIChangeSet(
+            id = changeSetId,
+            repoRoot = gitWorkingDirectoryForThread(threadId),
+            threadId = threadId,
+            turnId = normalizedTurnId,
+            assistantMessageId = latestAssistantMessageIdForTurn(threadId, normalizedTurnId),
+            createdAt = Instant.now(),
+            source = source,
+        )
+
+        if (source == AIChangeSetSource.FileChangeFallback && changeSet.source == AIChangeSetSource.TurnDiff) {
+            return
+        }
+
+        changeSet = if (source == AIChangeSetSource.FileChangeFallback) {
+            if (changeSet.forwardUnifiedPatch == normalizedPatch) {
+                changeSet.copy(fallbackPatchCount = maxOf(changeSet.fallbackPatchCount, 1))
+            } else {
+                changeSet.copy(
+                    fallbackPatchCount = changeSet.fallbackPatchCount + 1,
+                    forwardUnifiedPatch = if (changeSet.forwardUnifiedPatch.isEmpty()) {
+                        normalizedPatch
+                    } else {
+                        changeSet.forwardUnifiedPatch
+                    },
+                )
+            }
+        } else {
+            changeSet.copy(fallbackPatchCount = maxOf(changeSet.fallbackPatchCount, 0))
+        }
+
+        changeSet = changeSet.copy(
+            threadId = threadId,
+            repoRoot = changeSet.repoRoot ?: gitWorkingDirectoryForThread(threadId),
+            assistantMessageId = changeSet.assistantMessageId ?: latestAssistantMessageIdForTurn(threadId, normalizedTurnId),
+            source = source,
+            forwardUnifiedPatch = normalizedPatch,
+            patchHash = AIUnifiedPatchParser.hash(normalizedPatch),
+            fileChanges = analysis.fileChanges,
+            unsupportedReasons = analysis.unsupportedReasons,
+            status = AIChangeSetStatus.Collecting,
+        )
+
+        aiChangeSetsById[changeSetId] = changeSet
+        aiChangeSetIdByTurnId[normalizedTurnId] = changeSetId
+        changeSet.assistantMessageId?.let { assistantMessageId ->
+            aiChangeSetIdByAssistantMessageId[assistantMessageId] = changeSetId
+        }
+        finalizeChangeSetIfPossible(changeSetId)
+    }
+
+    private fun finalizeChangeSetIfPossible(changeSetId: String) {
+        var changeSet = aiChangeSetsById[changeSetId] ?: return
+        if (!completedTurnIds.contains(changeSet.turnId)) {
+            aiChangeSetsById[changeSetId] = changeSet
+            return
+        }
+        if (changeSet.status == AIChangeSetStatus.Reverted) {
+            return
+        }
+
+        changeSet = changeSet.copy(
+            repoRoot = changeSet.repoRoot ?: gitWorkingDirectoryForThread(changeSet.threadId),
+            assistantMessageId = changeSet.assistantMessageId ?: latestAssistantMessageIdForTurn(
+                changeSet.threadId,
+                changeSet.turnId,
+            ),
+        )
+
+        changeSet = when {
+            changeSet.forwardUnifiedPatch.isBlank() -> changeSet.copy(
+                status = AIChangeSetStatus.NotRevertable,
+                unsupportedReasons = listOf("This response cannot be auto-reverted because no exact patch was captured."),
+            )
+
+            changeSet.source == AIChangeSetSource.FileChangeFallback &&
+                changeSet.fallbackPatchCount > 1 -> changeSet.copy(
+                status = AIChangeSetStatus.NotRevertable,
+                unsupportedReasons = listOf("This response emitted multiple file-change patches, so v1 cannot safely auto-revert it."),
+            )
+
+            changeSet.unsupportedReasons.isNotEmpty() || changeSet.fileChanges.isEmpty() -> changeSet.copy(
+                status = AIChangeSetStatus.NotRevertable,
+            )
+
+            else -> changeSet.copy(status = AIChangeSetStatus.Ready)
+        }
+
+        if (changeSet.finalizedAt == null) {
+            changeSet = changeSet.copy(finalizedAt = Instant.now())
+        }
+
+        aiChangeSetsById[changeSetId] = changeSet
+        changeSet.assistantMessageId?.let { assistantMessageId ->
+            aiChangeSetIdByAssistantMessageId[assistantMessageId] = changeSetId
+        }
+    }
+
+    private fun noteTurnFinished(turnId: String) {
+        val normalizedTurnId = normalizeThreadId(turnId) ?: return
+        completedTurnIds += normalizedTurnId
+        aiChangeSetIdByTurnId[normalizedTurnId]?.let(::finalizeChangeSetIfPossible)
+    }
+
+    private fun rememberRepoRoot(
+        repoRoot: String?,
+        workingDirectory: String?,
+    ) {
+        val normalizedRepoRoot = normalizeWorkingDirectory(repoRoot) ?: return
+        knownRepoRoots += normalizedRepoRoot
+        repoRootByWorkingDirectory[normalizedRepoRoot] = normalizedRepoRoot
+        normalizeWorkingDirectory(workingDirectory)?.let { normalizedWorkingDirectory ->
+            repoRootByWorkingDirectory[normalizedWorkingDirectory] = normalizedRepoRoot
+        }
+    }
+
+    private fun normalizeWorkingDirectory(rawValue: String?): String? {
+        val trimmed = rawValue?.trim().orEmpty()
+        return trimmed.ifEmpty { null }
+    }
+
+    private fun latestAssistantMessageIdForTurn(
+        threadId: String,
+        turnId: String,
+    ): String? {
+        return _uiState.value.conversation.messagesFor(threadId)
+            .lastOrNull { message ->
+                message.role == CodexMessageRole.Assistant && message.turnId == turnId
+            }
+            ?.id
+    }
+
+    private fun gitWorkingDirectoryForThread(threadId: String): String? {
+        val workingDirectory = _uiState.value.threads.firstOrNull { it.id == threadId }?.cwd
+        return canonicalRepoIdentifier(workingDirectory) ?: workingDirectory
+    }
+
+    private fun canonicalRepoIdentifier(workingDirectory: String?): String? {
+        val normalizedWorkingDirectory = normalizeWorkingDirectory(workingDirectory) ?: return null
+        repoRootByWorkingDirectory[normalizedWorkingDirectory]?.let { return it }
+        return knownRepoRoots
+            .sortedByDescending(String::length)
+            .firstOrNull { root -> isSameOrDescendantPath(normalizedWorkingDirectory, root) }
+            ?: normalizedWorkingDirectory
+    }
+
+    private fun repositoriesOverlap(
+        lhs: String?,
+        rhs: String?,
+    ): Boolean {
+        val left = normalizeWorkingDirectory(lhs) ?: return false
+        val right = normalizeWorkingDirectory(rhs) ?: return false
+        val canonicalLeft = canonicalRepoIdentifier(left) ?: left
+        val canonicalRight = canonicalRepoIdentifier(right) ?: right
+        if (canonicalLeft == canonicalRight) {
+            return true
+        }
+        return isSameOrDescendantPath(left, right) ||
+            isSameOrDescendantPath(right, left) ||
+            isSameOrDescendantPath(canonicalLeft, canonicalRight) ||
+            isSameOrDescendantPath(canonicalRight, canonicalLeft)
+    }
+
+    private fun isSameOrDescendantPath(
+        candidate: String,
+        root: String,
+    ): Boolean {
+        if (candidate.isEmpty() || root.isEmpty()) {
+            return false
+        }
+        if (candidate == root) {
+            return true
+        }
+        if (root == "/") {
+            return candidate.startsWith("/")
+        }
+        return candidate.startsWith("$root/")
+    }
+
+    private fun markRevertAttempt(changeSetId: String) {
+        val changeSet = aiChangeSetsById[changeSetId] ?: return
+        aiChangeSetsById[changeSetId] = changeSet.copy(
+            revertMetadata = changeSet.revertMetadata.copy(
+                revertAttemptedAt = Instant.now(),
+                lastRevertError = null,
+            ),
+        )
+    }
+
+    private fun markChangeSetReverted(changeSetId: String) {
+        val changeSet = aiChangeSetsById[changeSetId] ?: return
+        aiChangeSetsById[changeSetId] = changeSet.copy(
+            status = AIChangeSetStatus.Reverted,
+            revertMetadata = changeSet.revertMetadata.copy(
+                revertedAt = Instant.now(),
+                lastRevertError = null,
+            ),
+        )
+    }
+
+    private fun recordChangeSetError(
+        changeSetId: String,
+        message: String,
+    ) {
+        val changeSet = aiChangeSetsById[changeSetId] ?: return
+        aiChangeSetsById[changeSetId] = changeSet.copy(
+            revertMetadata = changeSet.revertMetadata.copy(
+                lastRevertError = message,
+            ),
+        )
+    }
+
+    private fun userFacingRevertErrorMessage(throwable: Throwable): String {
+        val transportException = throwable as? RemodexTransportException
+        if (transportException?.kind == RemodexTransportFailureKind.Disconnected) {
+            return "Not connected to bridge."
+        }
+        return when (extractRevertErrorCode(throwable)) {
+            "missing_patch" -> "This response cannot be auto-reverted because no exact patch was captured."
+            "missing_working_directory" -> "The selected local folder is not available on this Mac."
+            else -> transportException?.rpcError?.message?.trim()?.takeIf(String::isNotEmpty)
+                ?: throwable.message?.trim()?.takeIf(String::isNotEmpty)
+                ?: "Patch revert failed."
+        }
+    }
+
+    private fun extractRevertErrorCode(throwable: Throwable): String? {
+        val transportException = throwable as? RemodexTransportException ?: return null
+        return transportException.rpcError?.data?.objectValue?.get("errorCode")?.stringValue
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+    }
+
+    private fun firstNonEmptyString(vararg candidates: String?): String? {
+        return candidates.firstNotNullOfOrNull { candidate ->
+            candidate?.trim()?.takeIf(String::isNotEmpty)
+        }
+    }
+
     private fun repoRefreshSignal(
         conversation: RemodexConversationState,
         threadId: String?,
@@ -3293,6 +4769,131 @@ class RemodexDebugViewModel(
         return "${latestRepoMessage.id}|${latestRepoMessage.text.length}|${latestRepoMessage.isStreaming}"
     }
 
+    private fun canRunGitAction(
+        state: RemodexDebugUiState,
+        threadId: String?,
+        workingDirectory: String?,
+    ): Boolean {
+        return state.connectionState is RemodexTransportState.Connected &&
+            threadId != null &&
+            workingDirectory != null &&
+            !state.conversation.threadHasActiveOrRunningTurn(threadId) &&
+            state.runningGitAction == null &&
+            !state.isSwitchingGitBranch
+    }
+
+    private fun applyGitRepoSync(
+        result: GitRepoSyncResult,
+        workingDirectory: String? = null,
+    ) {
+        rememberRepoRoot(result.repoRoot, workingDirectory)
+        _uiState.update { current ->
+            current.copy(
+                gitRepoSync = result,
+                currentGitBranch = result.currentBranch?.trim().takeIf { !it.isNullOrEmpty() }
+                    ?: current.currentGitBranch,
+            )
+        }
+    }
+
+    private fun handleSuccessfulPush(
+        result: GitPushResult,
+        threadId: String,
+        workingDirectory: String?,
+    ) {
+        rememberRepoRoot(result.status?.repoRoot, workingDirectory)
+        _uiState.update { current ->
+            val updatedConversation = appendHiddenPushResetMarkers(
+                conversation = current.conversation,
+                threadId = threadId,
+                workingDirectory = workingDirectory,
+                branch = result.branch,
+                remote = result.remote,
+            )
+            current.copy(
+                conversation = updatedConversation,
+                gitRepoSync = result.status ?: current.gitRepoSync,
+                currentGitBranch = result.status?.currentBranch?.trim().takeIf { !it.isNullOrEmpty() }
+                    ?: current.currentGitBranch,
+            )
+        }
+    }
+
+    private fun handleGitActionFailure(throwable: Throwable) {
+        if (extractGitActionErrorCode(throwable) == "nothing_to_commit") {
+            _uiState.update { current ->
+                current.copy(isShowingNothingToCommitAlert = true)
+            }
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                gitSyncAlert = TurnGitSyncAlert(
+                    id = "git-error",
+                    title = "Git Error",
+                    message = userFacingGitActionErrorMessage(throwable),
+                    action = TurnGitSyncAlertAction.DismissOnly,
+                ),
+            )
+        }
+    }
+
+    private fun userFacingGitActionErrorMessage(throwable: Throwable): String {
+        val transportException = throwable as? RemodexTransportException
+        if (transportException?.kind == RemodexTransportFailureKind.Disconnected) {
+            return "Not connected to bridge."
+        }
+
+        return when (extractGitActionErrorCode(throwable)) {
+            "nothing_to_commit" -> "Nothing to commit."
+            "nothing_to_push" -> "Nothing to push."
+            "push_rejected" -> "Push rejected. Pull changes first."
+            "branch_is_main" -> "Cannot operate on the main branch."
+            "protected_branch" -> "This branch is protected."
+            "branch_behind_remote" -> "Branch is behind remote. Pull first."
+            "dirty_and_behind" -> "Uncommitted changes and branch is behind remote."
+            "checkout_conflict_dirty_tree" -> "Cannot switch branches: you have uncommitted changes."
+            "pull_conflict" -> "Pull failed due to conflicts."
+            "branch_exists" -> transportException?.rpcError?.message?.trim()?.takeIf(String::isNotEmpty)
+                ?: "Branch already exists."
+            "missing_branch", "missing_branch_name" -> "Branch name is required."
+            "confirmation_required" -> "Confirmation is required for this action."
+            "stash_pop_conflict" -> "Stash pop failed due to conflicts."
+            "missing_local_repo" -> "Run `remodex up` from an existing local directory first."
+            "missing_working_directory" -> transportException?.rpcError?.message?.trim()?.takeIf(String::isNotEmpty)
+                ?: "The selected local folder is not available on this Mac."
+            else -> transportException?.rpcError?.message?.trim()?.takeIf(String::isNotEmpty)
+                ?: throwable.message?.trim()?.takeIf(String::isNotEmpty)
+                ?: "Git operation failed."
+        }
+    }
+
+    private fun extractGitActionErrorCode(throwable: Throwable): String? {
+        val transportException = throwable as? RemodexTransportException ?: return null
+        return transportException.rpcError
+            ?.data
+            ?.objectValue
+            ?.get("errorCode")
+            ?.stringValue
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+    }
+
+    private fun buildPullRequestUrl(
+        ownerRepo: String,
+        branch: String,
+        base: String,
+    ): String {
+        val encodedBranch = URLEncoder.encode(branch, Charsets.UTF_8)
+            .replace("+", "%20")
+            .replace("%2F", "/")
+        val encodedBase = URLEncoder.encode(base, Charsets.UTF_8)
+            .replace("+", "%20")
+            .replace("%2F", "/")
+        return "https://github.com/$ownerRepo/compare/$encodedBase...$encodedBranch?expand=1"
+    }
+
     private fun RemodexDebugUiState.applyObservedGitRepoSync(
         status: GitRepoSyncResult?,
         threadId: String,
@@ -3301,6 +4902,7 @@ class RemodexDebugViewModel(
         if (status == null) {
             return copy(gitRepoSync = null)
         }
+        rememberRepoRoot(status.repoRoot, workingDirectory)
 
         var updatedConversation = conversation
         val previousSync = gitRepoSync

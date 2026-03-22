@@ -1,7 +1,12 @@
 package app.remodex.android
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -32,6 +37,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.automirrored.outlined.Send
@@ -51,6 +59,7 @@ import androidx.compose.material.icons.outlined.SettingsEthernet
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -83,6 +92,8 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -104,8 +115,11 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import app.remodex.android.core.model.CodexAccessMode
 import app.remodex.android.core.model.CodexApprovalRequest
+import app.remodex.android.core.model.AssistantRevertPresentation
 import app.remodex.android.core.model.CodexCollaborationModeKind
 import app.remodex.android.core.model.CodexFuzzyFileMatch
 import app.remodex.android.core.model.CodexHostInfo
@@ -118,14 +132,19 @@ import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThread
 import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.GitRepoSyncResult
+import app.remodex.android.core.model.TurnGitActionKind
+import app.remodex.android.core.model.TurnGitSyncAlertAction
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.protocol.JsonValue
+import java.io.File
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val RemodexColorScheme = lightColorScheme(
     background = Color(0xFFF4F3F0),
@@ -195,10 +214,78 @@ fun RemodexAndroidRoot() {
         uiState.isAttemptingAutoReconnect ||
         uiState.hasSavedRelaySession ||
         showManualConnectionShell
+    val selectedThreadHasRunningTurn = uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id)
     val canOpenBranchMenu = selectedThread?.cwd?.isNotBlank() == true &&
-        !uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id) &&
+        !selectedThreadHasRunningTurn &&
         !uiState.isLoadingGitBranchTargets &&
-        !uiState.isSwitchingGitBranch
+        !uiState.isSwitchingGitBranch &&
+        !uiState.isRunningGitAction
+    val canRunGitActions = selectedThread?.cwd?.isNotBlank() == true &&
+        isConnected &&
+        !selectedThreadHasRunningTurn &&
+        !uiState.isSwitchingGitBranch &&
+        !uiState.isRunningGitAction
+    var pendingCameraCaptureFile by remember { mutableStateOf<File?>(null) }
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(
+            RemodexAttachmentPipeline.MaxComposerImages,
+        ),
+    ) { uris ->
+        if (uris.isEmpty()) {
+            return@rememberLauncherForActivityResult
+        }
+
+        scope.launch {
+            val imageDataItems = withContext(Dispatchers.IO) {
+                uris.mapNotNull { uri ->
+                    readComposerImageBytes(context, uri)
+                }
+            }
+            if (imageDataItems.isNotEmpty()) {
+                viewModel.enqueueComposerImageData(imageDataItems)
+            }
+        }
+    }
+    val cameraCaptureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture(),
+    ) { didCapture ->
+        val captureFile = pendingCameraCaptureFile
+        pendingCameraCaptureFile = null
+        if (captureFile == null) {
+            return@rememberLauncherForActivityResult
+        }
+
+        scope.launch {
+            val imageData = if (didCapture) {
+                withContext(Dispatchers.IO) {
+                    captureFile.takeIf(File::exists)?.readBytes()
+                }
+            } else {
+                null
+            }
+            captureFile.delete()
+            if (imageData != null && imageData.isNotEmpty()) {
+                viewModel.enqueueCapturedImageData(imageData)
+            }
+        }
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { isGranted ->
+        if (!isGranted) {
+            viewModel.reportCameraPermissionDenied()
+            return@rememberLauncherForActivityResult
+        }
+
+        val captureUri = createComposerCameraCaptureUri(context)
+        if (captureUri == null) {
+            viewModel.reportComposerMediaError("Could not prepare the camera capture file.")
+            return@rememberLauncherForActivityResult
+        }
+
+        pendingCameraCaptureFile = captureUri.first
+        cameraCaptureLauncher.launch(captureUri.second)
+    }
 
     LaunchedEffect(Unit) {
         viewModel.attemptAutoConnectOnLaunchIfNeeded()
@@ -222,6 +309,17 @@ fun RemodexAndroidRoot() {
         if (uiState.hasSavedRelaySession || isConnected) {
             showManualConnectionShell = false
         }
+    }
+
+    LaunchedEffect(uiState.pendingExternalUrl) {
+        val pendingExternalUrl = uiState.pendingExternalUrl ?: return@LaunchedEffect
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(pendingExternalUrl))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }
+        viewModel.consumePendingExternalUrl()
     }
 
     MaterialTheme(colorScheme = RemodexColorScheme) {
@@ -286,12 +384,50 @@ fun RemodexAndroidRoot() {
                         onOpenReasoningPicker = { activePanel = REASONING_PICKER_PANEL },
                         onOpenAccessPicker = { activePanel = ACCESS_PICKER_PANEL },
                         onPromptChange = viewModel::updateDraftTurnInput,
+                        onOpenPhotoLibrary = {
+                            if (viewModel.openPhotoLibraryPicker()) {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                                )
+                            }
+                        },
+                        onOpenCamera = {
+                            val cameraAvailable = context.packageManager
+                                .hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+                            if (viewModel.openCamera(cameraAvailable = cameraAvailable)) {
+                                val hasCameraPermission = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.CAMERA,
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (hasCameraPermission) {
+                                    val captureUri = createComposerCameraCaptureUri(context)
+                                    if (captureUri == null) {
+                                        viewModel.reportComposerMediaError("Could not prepare the camera capture file.")
+                                    } else {
+                                        pendingCameraCaptureFile = captureUri.first
+                                        cameraCaptureLauncher.launch(captureUri.second)
+                                    }
+                                } else {
+                                    cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                }
+                            }
+                        },
+                        onRemoveAttachment = viewModel::removeComposerAttachment,
                         onSelectFileAutocomplete = viewModel::selectFileAutocomplete,
                         onSelectSkillAutocomplete = viewModel::selectSkillAutocomplete,
                         onRemoveMentionedFile = viewModel::removeMentionedFile,
                         onRemoveMentionedSkill = viewModel::removeMentionedSkill,
                         onSendPrompt = viewModel::startTurn,
                         onStopTurn = viewModel::interruptTurn,
+                        onResumeQueue = viewModel::resumeQueueAndFlushIfPossible,
+                        onSteerQueuedDraft = viewModel::steerQueuedDraft,
+                        onRemoveQueuedDraft = viewModel::removeQueuedDraft,
+                        onStartAssistantRevert = { message ->
+                            viewModel.startAssistantRevertPreview(
+                                message = message,
+                                workingDirectory = selectedThread?.cwd,
+                            )
+                        },
                         onSubmitStructuredUserInput = viewModel::respondToStructuredUserInput,
                         submittingStructuredRequestKeys = uiState.submittingStructuredRequestKeys,
                         onRefreshGitBranches = { viewModel.refreshGitBranchTargets() },
@@ -320,6 +456,77 @@ fun RemodexAndroidRoot() {
                     isHandling = uiState.isHandlingPendingApproval,
                     onApprove = viewModel::approvePendingRequest,
                     onDecline = viewModel::declinePendingRequest,
+                )
+            }
+
+            if (uiState.isShowingNothingToCommitAlert) {
+                AlertDialog(
+                    onDismissRequest = viewModel::dismissNothingToCommitAlert,
+                    title = {
+                        Text("Nothing to Commit")
+                    },
+                    text = {
+                        Text(
+                            text = "No local changes are ready to commit.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = viewModel::dismissNothingToCommitAlert) {
+                            Text("OK")
+                        }
+                    },
+                )
+            }
+
+            uiState.gitSyncAlert?.let { gitSyncAlert ->
+                AlertDialog(
+                    onDismissRequest = viewModel::dismissGitSyncAlert,
+                    title = {
+                        Text(gitSyncAlert.title)
+                    },
+                    text = {
+                        Text(
+                            text = gitSyncAlert.message,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                when (gitSyncAlert.action) {
+                                    TurnGitSyncAlertAction.DismissOnly -> viewModel.dismissGitSyncAlert()
+                                    TurnGitSyncAlertAction.PullRebase -> viewModel.confirmGitSyncAlertAction(gitSyncAlert.action)
+                                }
+                            },
+                        ) {
+                            Text(
+                                when (gitSyncAlert.action) {
+                                    TurnGitSyncAlertAction.DismissOnly -> "OK"
+                                    TurnGitSyncAlertAction.PullRebase -> "Pull with Rebase"
+                                },
+                            )
+                        }
+                    },
+                    dismissButton = if (gitSyncAlert.action == TurnGitSyncAlertAction.PullRebase) {
+                        {
+                            TextButton(onClick = viewModel::dismissGitSyncAlert) {
+                                Text("Cancel")
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                )
+            }
+
+            uiState.assistantRevertSheet?.let { sheetState ->
+                AssistantRevertSheetDialog(
+                    state = sheetState,
+                    onClose = viewModel::dismissAssistantRevertSheet,
+                    onConfirm = {
+                        viewModel.confirmAssistantRevert(selectedThread?.cwd)
+                    },
                 )
             }
 
@@ -354,6 +561,9 @@ fun RemodexAndroidRoot() {
                     showDeveloperPanels = showDeveloperPanels,
                     branchLabel = uiState.currentBranchLabel,
                     branchChoices = uiState.availableGitBranchTargets,
+                    canOpenBranchMenu = canOpenBranchMenu,
+                    canRunGitActions = canRunGitActions,
+                    shouldShowDiscardRuntimeChangesAndSync = uiState.shouldShowDiscardRuntimeChangesAndSync,
                     onDismiss = { activePanel = null },
                     onOpenSettings = { activePanel = SETTINGS_PANEL },
                     onOpenBranchPicker = {
@@ -380,6 +590,10 @@ fun RemodexAndroidRoot() {
                     onInterruptTurn = {
                         activePanel = null
                         viewModel.interruptTurn()
+                    },
+                    onTriggerGitAction = { action ->
+                        activePanel = null
+                        viewModel.triggerGitAction(action)
                     },
                 )
 
@@ -948,12 +1162,19 @@ private fun MainConversationPane(
     onOpenReasoningPicker: () -> Unit,
     onOpenAccessPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
+    onOpenPhotoLibrary: () -> Unit,
+    onOpenCamera: () -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onSelectFileAutocomplete: (CodexFuzzyFileMatch) -> Unit,
     onSelectSkillAutocomplete: (CodexSkillMetadata) -> Unit,
     onRemoveMentionedFile: (String) -> Unit,
     onRemoveMentionedSkill: (String) -> Unit,
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
+    onResumeQueue: () -> Unit,
+    onSteerQueuedDraft: (String) -> Unit,
+    onRemoveQueuedDraft: (String) -> Unit,
+    onStartAssistantRevert: (CodexMessage) -> Unit,
     onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
     submittingStructuredRequestKeys: Set<String>,
     onRefreshGitBranches: () -> Unit,
@@ -972,6 +1193,12 @@ private fun MainConversationPane(
     }
     val isLoadingSelectedThread = uiState.conversation.isLoadingThread(selectedThread?.id)
     val isRunningSelectedThread = uiState.conversation.threadHasActiveOrRunningTurn(selectedThread?.id)
+    val queuedDrafts = uiState.activeThreadId
+        ?.let { threadId -> uiState.queuedTurnDraftsByThread[threadId] }
+        .orEmpty()
+    val isQueuePaused = uiState.activeThreadId
+        ?.let { threadId -> uiState.queuePauseStateByThread[threadId] is RemodexQueuePauseState.Paused }
+        ?: false
 
     Column(
         modifier = Modifier
@@ -1009,6 +1236,8 @@ private fun MainConversationPane(
                         isLoadingThread = isLoadingSelectedThread,
                         isThreadRunning = isRunningSelectedThread,
                         activeTurnId = selectedActiveTurnId,
+                        assistantRevertPresentationsByMessageId = uiState.assistantRevertPresentationsByMessageId,
+                        onStartAssistantRevert = onStartAssistantRevert,
                         onSubmitStructuredUserInput = onSubmitStructuredUserInput,
                         submittingStructuredRequestKeys = submittingStructuredRequestKeys,
                         modifier = Modifier.weight(1f),
@@ -1021,8 +1250,16 @@ private fun MainConversationPane(
                     }
                     ComposerArea(
                         prompt = uiState.draftTurnInput,
+                        composerAttachments = uiState.composerAttachments,
+                        remainingAttachmentSlots = uiState.remainingAttachmentSlots,
+                        hasReadyImages = uiState.hasReadyImages,
+                        hasBlockingAttachmentState = uiState.hasBlockingAttachmentState,
                         composerMentionedFiles = uiState.composerMentionedFiles,
                         composerMentionedSkills = uiState.composerMentionedSkills,
+                        queuedDrafts = queuedDrafts,
+                        queuedCount = queuedDrafts.size,
+                        isQueuePaused = isQueuePaused,
+                        steeringDraftId = uiState.steeringDraftId,
                         fileAutocompleteItems = uiState.fileAutocompleteItems,
                         isFileAutocompleteVisible = uiState.isFileAutocompleteVisible,
                         isFileAutocompleteLoading = uiState.isFileAutocompleteLoading,
@@ -1053,12 +1290,18 @@ private fun MainConversationPane(
                         onOpenReasoningPicker = onOpenReasoningPicker,
                         onOpenAccessPicker = onOpenAccessPicker,
                         onPromptChange = onPromptChange,
+                        onOpenPhotoLibrary = onOpenPhotoLibrary,
+                        onOpenCamera = onOpenCamera,
+                        onRemoveAttachment = onRemoveAttachment,
                         onSelectFileAutocomplete = onSelectFileAutocomplete,
                         onSelectSkillAutocomplete = onSelectSkillAutocomplete,
                         onRemoveMentionedFile = onRemoveMentionedFile,
                         onRemoveMentionedSkill = onRemoveMentionedSkill,
                         onSendPrompt = onSendPrompt,
                         onStopTurn = onStopTurn,
+                        onResumeQueue = onResumeQueue,
+                        onSteerQueuedDraft = onSteerQueuedDraft,
+                        onRemoveQueuedDraft = onRemoveQueuedDraft,
                         onRefreshGitBranches = onRefreshGitBranches,
                         branchChoices = uiState.availableGitBranchTargets,
                         isLoadingBranches = uiState.isLoadingGitBranchTargets,
@@ -1212,6 +1455,8 @@ private fun ConversationTimeline(
     isLoadingThread: Boolean,
     isThreadRunning: Boolean,
     activeTurnId: String?,
+    assistantRevertPresentationsByMessageId: Map<String, AssistantRevertPresentation>,
+    onStartAssistantRevert: (CodexMessage) -> Unit,
     onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
     submittingStructuredRequestKeys: Set<String>,
     modifier: Modifier = Modifier,
@@ -1306,6 +1551,8 @@ private fun ConversationTimeline(
             items(visibleMessages, key = { it.id }) { message ->
                 TranscriptMessage(
                     message = message,
+                    assistantRevertPresentation = assistantRevertPresentationsByMessageId[message.id],
+                    onStartAssistantRevert = onStartAssistantRevert,
                     onSubmitStructuredUserInput = onSubmitStructuredUserInput,
                     submittingStructuredRequestKeys = submittingStructuredRequestKeys,
                 )
@@ -1757,6 +2004,9 @@ private fun ActionMenuSheet(
     showDeveloperPanels: Boolean,
     branchLabel: String?,
     branchChoices: List<String>,
+    canOpenBranchMenu: Boolean,
+    canRunGitActions: Boolean,
+    shouldShowDiscardRuntimeChangesAndSync: Boolean,
     onDismiss: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenBranchPicker: () -> Unit,
@@ -1764,8 +2014,95 @@ private fun ActionMenuSheet(
     onStartThread: () -> Unit,
     onToggleDeveloperPanels: () -> Unit,
     onInterruptTurn: () -> Unit,
+    onTriggerGitAction: (TurnGitActionKind) -> Unit,
 ) {
     FloatingSheetDialog(onDismiss = onDismiss) {
+        val workspaceRows = buildList {
+            add(
+                MenuRowModel(
+                    title = when {
+                        uiState.isSwitchingGitBranch -> "Switching..."
+                        uiState.isLoadingGitBranchTargets -> "Reloading branches..."
+                        !branchLabel.isNullOrBlank() -> branchLabel
+                        else -> "Branch"
+                    },
+                    subtitle = when {
+                        uiState.isLoadingGitBranchTargets -> "Refreshing local branch state from the paired host"
+                        branchChoices.isEmpty() -> "Inspect local branch state and reload branch targets"
+                        else -> "Browse ${branchChoices.size} known branch target(s)"
+                    },
+                    onClick = if (canOpenBranchMenu) onOpenBranchPicker else null,
+                ),
+            )
+            add(
+                MenuRowModel(
+                    title = TurnGitActionKind.SyncNow.title,
+                    subtitle = "Refresh repository sync state from the paired host",
+                    onClick = if (canRunGitActions) {
+                        { onTriggerGitAction(TurnGitActionKind.SyncNow) }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                MenuRowModel(
+                    title = TurnGitActionKind.Commit.title,
+                    subtitle = "Create a local commit from the current runtime changes",
+                    onClick = if (canRunGitActions) {
+                        { onTriggerGitAction(TurnGitActionKind.Commit) }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                MenuRowModel(
+                    title = TurnGitActionKind.Push.title,
+                    subtitle = "Publish the current local branch to its tracked remote",
+                    onClick = if (canRunGitActions) {
+                        { onTriggerGitAction(TurnGitActionKind.Push) }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                MenuRowModel(
+                    title = TurnGitActionKind.CommitAndPush.title,
+                    subtitle = "Commit local runtime changes and publish them immediately",
+                    onClick = if (canRunGitActions) {
+                        { onTriggerGitAction(TurnGitActionKind.CommitAndPush) }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                MenuRowModel(
+                    title = TurnGitActionKind.CreatePR.title,
+                    subtitle = "Open the GitHub compare view for the current branch",
+                    onClick = if (canRunGitActions) {
+                        { onTriggerGitAction(TurnGitActionKind.CreatePR) }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            if (shouldShowDiscardRuntimeChangesAndSync) {
+                add(
+                    MenuRowModel(
+                        title = TurnGitActionKind.DiscardRuntimeChangesAndSync.title,
+                        subtitle = "Reset local runtime changes to the tracked remote branch",
+                        onClick = if (canRunGitActions) {
+                            { onTriggerGitAction(TurnGitActionKind.DiscardRuntimeChangesAndSync) }
+                        } else {
+                            null
+                        },
+                    ),
+                )
+            }
+        }
         Column(
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -1793,22 +2130,7 @@ private fun ActionMenuSheet(
             )
             GroupedMenuSection(
                 title = "Workspace",
-                rows = listOf(
-                    MenuRowModel(
-                        title = when {
-                            uiState.isSwitchingGitBranch -> "Switching..."
-                            uiState.isLoadingGitBranchTargets -> "Reloading branches..."
-                            !branchLabel.isNullOrBlank() -> branchLabel
-                            else -> "Branch"
-                        },
-                        subtitle = when {
-                            uiState.isLoadingGitBranchTargets -> "Refreshing local branch state from the paired host"
-                            branchChoices.isEmpty() -> "Inspect local branch state and reload branch targets"
-                            else -> "Browse ${branchChoices.size} known branch target(s)"
-                        },
-                        onClick = onOpenBranchPicker,
-                    ),
-                ),
+                rows = workspaceRows,
             )
             GroupedMenuSection(
                 title = "Runtime",
@@ -2661,12 +2983,18 @@ private fun GroupedMenuSection(
 @Composable
 private fun TranscriptMessage(
     message: CodexMessage,
+    assistantRevertPresentation: AssistantRevertPresentation?,
+    onStartAssistantRevert: (CodexMessage) -> Unit,
     onSubmitStructuredUserInput: (JsonValue, Map<String, List<String>>) -> Unit,
     submittingStructuredRequestKeys: Set<String>,
 ) {
     when (message.role) {
         CodexMessageRole.User -> UserTranscriptBubble(message = message)
-        CodexMessageRole.Assistant -> AssistantTranscriptBlock(message = message)
+        CodexMessageRole.Assistant -> AssistantTranscriptBlock(
+            message = message,
+            assistantRevertPresentation = assistantRevertPresentation,
+            onStartAssistantRevert = onStartAssistantRevert,
+        )
         CodexMessageRole.System -> SystemTranscriptBlock(
             message = message,
             onSubmitStructuredUserInput = onSubmitStructuredUserInput,
@@ -2713,8 +3041,16 @@ private fun DeveloperPanel(
 @Composable
 private fun ComposerArea(
     prompt: String,
+    composerAttachments: List<RemodexComposerImageAttachment>,
+    remainingAttachmentSlots: Int,
+    hasReadyImages: Boolean,
+    hasBlockingAttachmentState: Boolean,
     composerMentionedFiles: List<RemodexComposerMentionedFile>,
     composerMentionedSkills: List<RemodexComposerMentionedSkill>,
+    queuedDrafts: List<RemodexQueuedTurnDraft>,
+    queuedCount: Int,
+    isQueuePaused: Boolean,
+    steeringDraftId: String?,
     fileAutocompleteItems: List<CodexFuzzyFileMatch>,
     isFileAutocompleteVisible: Boolean,
     isFileAutocompleteLoading: Boolean,
@@ -2741,12 +3077,18 @@ private fun ComposerArea(
     onOpenReasoningPicker: () -> Unit,
     onOpenAccessPicker: () -> Unit,
     onPromptChange: (String) -> Unit,
+    onOpenPhotoLibrary: () -> Unit,
+    onOpenCamera: () -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onSelectFileAutocomplete: (CodexFuzzyFileMatch) -> Unit,
     onSelectSkillAutocomplete: (CodexSkillMetadata) -> Unit,
     onRemoveMentionedFile: (String) -> Unit,
     onRemoveMentionedSkill: (String) -> Unit,
     onSendPrompt: () -> Unit,
     onStopTurn: () -> Unit,
+    onResumeQueue: () -> Unit,
+    onSteerQueuedDraft: (String) -> Unit,
+    onRemoveQueuedDraft: (String) -> Unit,
     onRefreshGitBranches: () -> Unit,
     branchChoices: List<String>,
     isLoadingBranches: Boolean,
@@ -2756,6 +3098,8 @@ private fun ComposerArea(
     onSelectGitBaseBranch: (String) -> Unit,
     onSelectBranch: (String) -> Unit,
 ) {
+    var isAttachmentMenuExpanded by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -2780,6 +3124,16 @@ private fun ComposerArea(
             )
         }
 
+        if (queuedDrafts.isNotEmpty()) {
+            QueuedDraftsPanel(
+                drafts = queuedDrafts,
+                canSteerDrafts = isRunningSelectedThread,
+                steeringDraftId = steeringDraftId,
+                onSteer = onSteerQueuedDraft,
+                onRemove = onRemoveQueuedDraft,
+            )
+        }
+
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = Color(0xFFF8F7F4),
@@ -2789,6 +3143,13 @@ private fun ComposerArea(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                if (composerAttachments.isNotEmpty()) {
+                    ComposerAttachmentsPreview(
+                        attachments = composerAttachments,
+                        onRemove = onRemoveAttachment,
+                    )
+                }
+
                 if (composerMentionedFiles.isNotEmpty()) {
                     ComposerMentionChipRow {
                         composerMentionedFiles.forEach { file ->
@@ -2841,10 +3202,34 @@ private fun ComposerArea(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    MinimalIconChip(
-                        icon = Icons.Outlined.Add,
-                        contentDescription = "Add attachment or context",
-                    )
+                    Box {
+                        MinimalIconChip(
+                            icon = Icons.Outlined.Add,
+                            contentDescription = "Add attachment or context",
+                            onClick = { isAttachmentMenuExpanded = true },
+                        )
+                        DropdownMenu(
+                            expanded = isAttachmentMenuExpanded,
+                            onDismissRequest = { isAttachmentMenuExpanded = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Photo library") },
+                                enabled = remainingAttachmentSlots > 0,
+                                onClick = {
+                                    isAttachmentMenuExpanded = false
+                                    onOpenPhotoLibrary()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Take a photo") },
+                                enabled = remainingAttachmentSlots > 0,
+                                onClick = {
+                                    isAttachmentMenuExpanded = false
+                                    onOpenCamera()
+                                },
+                            )
+                        }
+                    }
                     MinimalControlChip(
                         label = modelLabel,
                         onClick = onOpenModelPicker,
@@ -2859,13 +3244,27 @@ private fun ComposerArea(
                         onClick = onOpenActionMenu,
                     )
                     Spacer(modifier = Modifier.weight(1f))
+                    if (isQueuePaused && queuedCount > 0) {
+                        ResumeQueueButton(onClick = onResumeQueue)
+                    }
                     if (isRunningSelectedThread) {
                         StopActionButton(onClick = onStopTurn)
-                    } else {
+                    }
+                    Box {
                         SendActionButton(
-                            enabled = selectedThreadId != null && !isSending && prompt.trim().isNotEmpty(),
+                            enabled = selectedThreadId != null &&
+                                !isSending &&
+                                (!prompt.trim().isEmpty() || hasReadyImages) &&
+                                !hasBlockingAttachmentState,
                             onClick = onSendPrompt,
                         )
+                        if (queuedCount > 0) {
+                            QueueCountBadge(
+                                queuedCount = queuedCount,
+                                isQueuePaused = isQueuePaused,
+                                modifier = Modifier.align(Alignment.TopEnd),
+                            )
+                        }
                     }
                 }
             }
@@ -3105,6 +3504,207 @@ private fun ComposerMentionChip(
 }
 
 @Composable
+private fun ComposerAttachmentsPreview(
+    attachments: List<RemodexComposerImageAttachment>,
+    onRemove: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        attachments.forEach { attachment ->
+            ComposerAttachmentTile(
+                attachment = attachment,
+                onRemove = onRemove,
+            )
+        }
+    }
+}
+
+@Composable
+private fun QueuedDraftsPanel(
+    drafts: List<RemodexQueuedTurnDraft>,
+    canSteerDrafts: Boolean,
+    steeringDraftId: String?,
+    onSteer: (String) -> Unit,
+    onRemove: (String) -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = Color(0xFFFFFEFC),
+        border = BorderStroke(1.dp, Color(0xFFE8E4DE)),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            drafts.forEachIndexed { index, draft ->
+                QueuedDraftRow(
+                    draft = draft,
+                    canSteerDrafts = canSteerDrafts,
+                    steeringDraftId = steeringDraftId,
+                    onSteer = onSteer,
+                    onRemove = onRemove,
+                )
+                if (index < drafts.lastIndex) {
+                    Divider(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        color = Color(0xFFE8E4DE),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QueuedDraftRow(
+    draft: RemodexQueuedTurnDraft,
+    canSteerDrafts: Boolean,
+    steeringDraftId: String?,
+    onSteer: (String) -> Unit,
+    onRemove: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = ">",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = draft.text,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (canSteerDrafts) {
+            Surface(
+                shape = CircleShape,
+                color = Color(0xFFF1EFEB),
+                border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
+            ) {
+                Text(
+                    text = "Steer",
+                    modifier = Modifier
+                        .clickable(
+                            enabled = steeringDraftId == null,
+                            onClick = { onSteer(draft.id) },
+                        )
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+        Text(
+            text = "×",
+            modifier = Modifier
+                .clickable(
+                    enabled = steeringDraftId != draft.id,
+                    onClick = { onRemove(draft.id) },
+                )
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun ComposerAttachmentTile(
+    attachment: RemodexComposerImageAttachment,
+    onRemove: (String) -> Unit,
+) {
+    Box {
+        Surface(
+            shape = RoundedCornerShape(RemodexAttachmentPipeline.ThumbnailCornerRadiusDp.dp),
+            color = Color(0xFFF1EFEB),
+            border = BorderStroke(
+                1.dp,
+                if (attachment.state == RemodexComposerImageAttachmentState.Failed) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    Color(0xFFE6E1D9)
+                },
+            ),
+        ) {
+            Box(
+                modifier = Modifier.size(RemodexAttachmentPipeline.ThumbnailSidePx.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                when (val state = attachment.state) {
+                    RemodexComposerImageAttachmentState.Loading -> {
+                        Icon(
+                            imageVector = Icons.Outlined.Add,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                        )
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(22.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    RemodexComposerImageAttachmentState.Failed -> {
+                        Text(
+                            text = "!",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+
+                    is RemodexComposerImageAttachmentState.Ready -> {
+                        val thumbnailBitmap = remember(state.attachment.thumbnailBase64JPEG) {
+                            RemodexAttachmentPipeline.thumbnailBitmap(state.attachment.thumbnailBase64JPEG)
+                        }
+                        if (thumbnailBitmap != null) {
+                            Image(
+                                bitmap = thumbnailBitmap.asImageBitmap(),
+                                contentDescription = null,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop,
+                            )
+                        } else {
+                            Text(
+                                text = "Image",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Surface(
+            shape = CircleShape,
+            color = Color(0x99000000),
+            modifier = Modifier.align(Alignment.TopEnd),
+        ) {
+            Text(
+                text = "×",
+                modifier = Modifier
+                    .clickable { onRemove(attachment.id) }
+                    .padding(horizontal = 6.dp, vertical = 1.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = Color.White,
+            )
+        }
+    }
+}
+
+@Composable
 private fun MinimalIconChip(
     icon: ImageVector,
     contentDescription: String?,
@@ -3195,6 +3795,63 @@ private fun SendActionButton(
                 contentDescription = "Send prompt",
                 tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.width(16.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ResumeQueueButton(
+    onClick: () -> Unit,
+) {
+    Surface(
+        shape = CircleShape,
+        color = Color(0xFFE68937),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Refresh,
+                contentDescription = "Resume queued prompts",
+                tint = Color.White,
+                modifier = Modifier.width(16.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun QueueCountBadge(
+    queuedCount: Int,
+    isQueuePaused: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        shape = CircleShape,
+        color = if (isQueuePaused) Color(0xFFE68937) else Color(0xFF2E8B82),
+        border = BorderStroke(1.dp, Color.White),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            if (isQueuePaused) {
+                Text(
+                    text = "II",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White,
+                )
+            }
+            Text(
+                text = queuedCount.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
             )
         }
     }
@@ -3307,6 +3964,7 @@ private fun UserTranscriptBubble(message: CodexMessage) {
     val formattedText = remember(message.text) {
         RemodexMessageTextFormatter.userTokens(message.text)
     }
+    val hasText = message.text.isNotBlank()
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -3317,45 +3975,64 @@ private fun UserTranscriptBubble(message: CodexMessage) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                message.attachments.forEachIndexed { index, _ ->
+                message.attachments.forEach { attachment ->
                     Surface(
                         shape = RoundedCornerShape(16.dp),
                         color = Color(0xFFF5F3EF),
                         border = BorderStroke(1.dp, Color(0xFFE6E1D9)),
                     ) {
-                        Text(
-                            text = "Image ${index + 1}",
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        val thumbnailBitmap = remember(attachment.thumbnailBase64JPEG) {
+                            RemodexAttachmentPipeline.thumbnailBitmap(attachment.thumbnailBase64JPEG)
+                        }
+                        if (thumbnailBitmap != null) {
+                            Image(
+                                bitmap = thumbnailBitmap.asImageBitmap(),
+                                contentDescription = null,
+                                modifier = Modifier.size(RemodexAttachmentPipeline.ThumbnailSidePx.dp),
+                                contentScale = ContentScale.Crop,
+                            )
+                        } else {
+                            Text(
+                                text = "Image",
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
             }
         }
 
-        Surface(
-            modifier = Modifier.widthIn(max = 280.dp),
-            shape = RoundedCornerShape(24.dp),
-            color = Color(0xFFF1F1F1),
-        ) {
-            Text(
-                text = annotatedTranscriptText(formattedText),
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
+        if (hasText) {
+            Surface(
+                modifier = Modifier.widthIn(max = 280.dp),
+                shape = RoundedCornerShape(24.dp),
+                color = Color(0xFFF1F1F1),
+            ) {
+                Text(
+                    text = annotatedTranscriptText(formattedText),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
         }
         UserDeliveryMetaRow(message = message)
     }
 }
 
 @Composable
-private fun AssistantTranscriptBlock(message: CodexMessage) {
+private fun AssistantTranscriptBlock(
+    message: CodexMessage,
+    assistantRevertPresentation: AssistantRevertPresentation?,
+    onStartAssistantRevert: (CodexMessage) -> Unit,
+) {
     val clipboard = LocalClipboardManager.current
     val segments = remember(message.text) {
         RemodexMarkdownRenderer.parseMarkdownSegments(message.text.trim())
     }
+    var showRevertConfirmation by remember(message.id) { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.widthIn(max = 520.dp),
@@ -3387,6 +4064,32 @@ private fun AssistantTranscriptBlock(message: CodexMessage) {
             verticalAlignment = Alignment.CenterVertically,
         )
         {
+            assistantRevertPresentation?.let { presentation ->
+                Surface(
+                    shape = CircleShape,
+                    color = Color(0xFFF5F3EF),
+                    border = BorderStroke(1.dp, Color(0xFFE7E2DB)),
+                    modifier = Modifier.clickable(enabled = presentation.isEnabled) {
+                        showRevertConfirmation = true
+                    },
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "Undo",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (presentation.isEnabled) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                            },
+                        )
+                    }
+                }
+            }
             Surface(
                 shape = CircleShape,
                 color = Color(0xFFF5F3EF),
@@ -3415,6 +4118,36 @@ private fun AssistantTranscriptBlock(message: CodexMessage) {
             }
             MessageMetaRow(message = message, leadingIcon = null)
         }
+    }
+
+    if (showRevertConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showRevertConfirmation = false },
+            title = {
+                Text("Revert Changes")
+            },
+            text = {
+                Text(
+                    text = "Are you sure you want to discard these changes?",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showRevertConfirmation = false
+                        onStartAssistantRevert(message)
+                    },
+                ) {
+                    Text("Revert")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRevertConfirmation = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 
@@ -3848,6 +4581,211 @@ private fun ApprovalRequestDialog(
             }
         },
     )
+}
+
+@Composable
+private fun AssistantRevertSheetDialog(
+    state: RemodexAssistantRevertSheetState,
+    onClose: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val affectedFiles = remember(state.changeSet, state.preview) {
+        if (!state.preview?.affectedFiles.isNullOrEmpty()) {
+            state.preview?.affectedFiles.orEmpty()
+        } else {
+            state.changeSet.fileChanges.map { it.path }
+        }
+    }
+    val totalAdditions = remember(state.changeSet) {
+        state.changeSet.fileChanges.sumOf { it.additions }
+    }
+    val totalDeletions = remember(state.changeSet) {
+        state.changeSet.fileChanges.sumOf { it.deletions }
+    }
+    val canConfirm = remember(state.preview, state.isLoadingPreview, state.isApplying) {
+        state.preview?.canRevert == true && !state.isLoadingPreview && !state.isApplying
+    }
+
+    FloatingSheetDialog(onDismiss = onClose) {
+        SheetHeader(
+            title = "Revert changes",
+            actionLabel = "Close",
+            onAction = onClose,
+        )
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 4.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xFFF2F0EC),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = "Only changes from this AI response will be reverted. Other local changes stay untouched unless they overlap.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        InlineInfoBadge(
+                            icon = Icons.Outlined.FolderOpen,
+                            label = "${affectedFiles.size} file${if (affectedFiles.size == 1) "" else "s"}",
+                        )
+                        InlineInfoBadge(
+                            icon = Icons.Outlined.Add,
+                            label = "+$totalAdditions",
+                            iconTint = Color(0xFF208C49),
+                        )
+                        InlineInfoBadge(
+                            icon = Icons.Outlined.Refresh,
+                            label = "-$totalDeletions",
+                            iconTint = Color(0xFFC74848),
+                        )
+                    }
+                    if (affectedFiles.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            affectedFiles.forEach { path ->
+                                Text(
+                                    text = path,
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            when {
+                state.isLoadingPreview -> {
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = Color(0xFFF2F0EC),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Text(
+                                text = "Checking whether the reverse patch applies cleanly...",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                state.preview != null -> {
+                    val preview = state.preview
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = Color(0xFFF2F0EC),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Text(
+                                text = if (preview.canRevert) {
+                                    "This response can be safely reverted."
+                                } else {
+                                    "Could not safely revert."
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (preview.canRevert) Color(0xFF208C49) else Color(0xFFC98935),
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            if (preview.stagedFiles.isNotEmpty()) {
+                                AssistantRevertIssueSection(
+                                    title = "Staged files",
+                                    lines = preview.stagedFiles.map { "$it: Unstage this file first to keep revert predictable." },
+                                )
+                            }
+                            if (preview.unsupportedReasons.isNotEmpty()) {
+                                AssistantRevertIssueSection(
+                                    title = "Unsupported",
+                                    lines = preview.unsupportedReasons,
+                                )
+                            }
+                            if (preview.conflicts.isNotEmpty()) {
+                                AssistantRevertIssueSection(
+                                    title = "Conflicts",
+                                    lines = preview.conflicts.map { "${it.path}: ${it.message}" },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            state.errorMessage?.takeIf(String::isNotBlank)?.let { errorMessage ->
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xFFFFF1EF),
+                    border = BorderStroke(1.dp, Color(0xFFF0C9C1)),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = "Error",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = errorMessage,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            Button(
+                onClick = onConfirm,
+                enabled = canConfirm,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (state.isApplying) "Reverting..." else "Revert")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AssistantRevertIssueSection(
+    title: String,
+    lines: List<String>,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        lines.forEach { line ->
+            Text(
+                text = line,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
 }
 
 @Composable
@@ -4601,6 +5539,37 @@ private fun DebugBlock(label: String, value: String?) {
             style = MaterialTheme.typography.bodySmall,
         )
     }
+}
+
+private fun createComposerCameraCaptureUri(context: android.content.Context): Pair<File, Uri>? {
+    val targetDirectory = File(context.cacheDir, "composer_images").apply { mkdirs() }
+    if (!targetDirectory.exists()) {
+        return null
+    }
+
+    val captureFile = runCatching {
+        File.createTempFile("remodex_capture_", ".jpg", targetDirectory)
+    }.getOrNull() ?: return null
+    val captureUri = runCatching {
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            captureFile,
+        )
+    }.getOrNull() ?: return null
+
+    return captureFile to captureUri
+}
+
+private fun readComposerImageBytes(
+    context: android.content.Context,
+    uri: Uri,
+): ByteArray? {
+    return runCatching {
+        context.contentResolver.openInputStream(uri)?.use { inputStream ->
+            inputStream.readBytes()
+        }
+    }.getOrNull()?.takeIf(ByteArray::isNotEmpty)
 }
 
 private fun connectionStateLabel(state: RemodexTransportState): String {
