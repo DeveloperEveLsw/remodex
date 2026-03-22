@@ -3836,7 +3836,10 @@ private fun FileChangeSystemBlock(message: CodexMessage) {
 
 @Composable
 private fun CommandExecutionSystemBlock(message: CodexMessage) {
-    val status = parseCommandExecutionStatus(message.text)
+    val status = parseCommandExecutionStatus(message)
+    var isExpanded by rememberSaveable(message.id) { mutableStateOf(false) }
+    val rawCommand = status?.rawCommand
+    val canExpand = rawCommand != null && rawCommand != status.summary
     SystemCardContainer(
         message = message,
         title = "Command",
@@ -3844,30 +3847,59 @@ private fun CommandExecutionSystemBlock(message: CodexMessage) {
         isStreaming = message.isStreaming,
     ) {
         if (status != null) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Box(
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
                     modifier = Modifier
-                        .width(3.dp)
-                        .height(34.dp)
-                        .background(status.accent, RoundedCornerShape(99.dp)),
-                )
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                        .fillMaxWidth()
+                        .clickable(enabled = canExpand) { isExpanded = !isExpanded },
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(
-                        text = status.command,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface,
+                    Box(
+                        modifier = Modifier
+                            .width(3.dp)
+                            .height(34.dp)
+                            .background(status.accent, RoundedCornerShape(99.dp)),
                     )
-                    Text(
-                        text = status.statusLabel,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = status.accent,
-                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = status.summary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = status.statusLabel,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = status.accent,
+                            )
+                            if (canExpand) {
+                                Text(
+                                    text = if (isExpanded) "Hide details" else "Show details",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (isExpanded && canExpand) {
+                    SelectionContainer {
+                        Text(
+                            text = rawCommand.orEmpty(),
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                lineHeight = 20.sp,
+                                fontFamily = FontFamily.Monospace,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         } else if (message.text.isNotBlank()) {
@@ -4453,19 +4485,27 @@ private fun SystemCardContainer(
 }
 
 private data class CommandExecutionStatus(
-    val command: String,
+    val summary: String,
     val statusLabel: String,
     val accent: Color,
+    val rawCommand: String?,
 )
 
-private fun parseCommandExecutionStatus(text: String): CommandExecutionStatus? {
+private fun parseCommandExecutionStatus(message: CodexMessage): CommandExecutionStatus? {
+    val text = message.text
     val words = text.trim().split(Regex("\\s+")).filter(String::isNotBlank)
     val first = words.firstOrNull()?.lowercase() ?: return null
-    val command = words.drop(1).joinToString(" ").trim().ifEmpty { "command" }
+    val summary = message.commandExecutionDetails?.summary
+        ?.trim()
+        ?.takeIf(String::isNotEmpty)
+        ?: words.drop(1).joinToString(" ").trim().ifEmpty { "command" }
+    val rawCommand = message.commandExecutionDetails?.rawCommand
+        ?.trim()
+        ?.takeIf(String::isNotEmpty)
     return when (first) {
-        "running" -> CommandExecutionStatus(command, "running", Color(0xFFC98935))
-        "completed" -> CommandExecutionStatus(command, "completed", Color(0xFF4DA468))
-        "failed", "stopped" -> CommandExecutionStatus(command, first, Color(0xFFD35D5D))
+        "running" -> CommandExecutionStatus(summary, "running", Color(0xFFC98935), rawCommand)
+        "completed" -> CommandExecutionStatus(summary, "completed", Color(0xFF4DA468), rawCommand)
+        "failed", "stopped" -> CommandExecutionStatus(summary, first, Color(0xFFD35D5D), rawCommand)
         else -> null
     }
 }

@@ -582,6 +582,75 @@ class RemodexConversationReducerTests {
     }
 
     @Test
+    fun reducerUsesStructuredSummaryForSafeCommandExecutionAndAvoidsThinkingDuplicate() {
+        val knownThreadIds = setOf("thread-1")
+        val conversation = RemodexConversationReducer.reduce(
+            conversation = RemodexConversationState(),
+            message = RpcMessage.notification(
+                method = "codex/event/exec_command_begin",
+                params = jsonObject(
+                    "conversationId" to JsonPrimitive("thread-1"),
+                    "id" to JsonPrimitive("turn-1"),
+                    "msg" to jsonObject(
+                        "type" to JsonPrimitive("exec_command_begin"),
+                        "call_id" to JsonPrimitive("call-1"),
+                        "turn_id" to JsonPrimitive("turn-1"),
+                        "command" to jsonArray(
+                            JsonPrimitive("/bin/zsh"),
+                            JsonPrimitive("-lc"),
+                            JsonPrimitive("nl -ba AndroidClient/app/src/main/java/app/remodex/android/MainActivity.kt | sed -n '1,80p'"),
+                        ),
+                    ),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        val commandRows = conversation.messagesFor("thread-1").filter {
+            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.CommandExecution
+        }
+        val thinkingRows = conversation.messagesFor("thread-1").filter {
+            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Thinking
+        }
+        assertEquals(1, commandRows.size)
+        assertEquals("running Read MainActivity.kt", commandRows.single().text)
+        assertEquals("Read MainActivity.kt", commandRows.single().commandExecutionDetails?.summary)
+        assertTrue(
+            commandRows.single().commandExecutionDetails?.rawCommand?.contains("nl -ba AndroidClient/app/src/main/java/app/remodex/android/MainActivity.kt") == true,
+        )
+        assertTrue(thinkingRows.isEmpty())
+    }
+
+    @Test
+    fun reducerFallsBackToRunningPreviewForMixedIntentCommandExecution() {
+        val knownThreadIds = setOf("thread-1")
+        val conversation = RemodexConversationReducer.reduce(
+            conversation = RemodexConversationState(),
+            message = RpcMessage.notification(
+                method = "item/started",
+                params = jsonObject(
+                    "threadId" to JsonPrimitive("thread-1"),
+                    "turnId" to JsonPrimitive("turn-1"),
+                    "item" to jsonObject(
+                        "id" to JsonPrimitive("call-1"),
+                        "type" to JsonPrimitive("commandExecution"),
+                        "status" to JsonPrimitive("inProgress"),
+                        "command" to JsonPrimitive("mkdir tmp && touch tmp/smoke.txt"),
+                    ),
+                ),
+            ),
+            knownThreadIds = knownThreadIds,
+        )
+
+        val commandRow = conversation.messagesFor("thread-1").first {
+            it.kind == CodexMessageKind.CommandExecution
+        }
+        assertTrue(commandRow.text.startsWith("running "))
+        assertTrue(commandRow.text.contains("mkdir tmp && touch"))
+        assertEquals("mkdir tmp && touch tmp/smoke.txt", commandRow.commandExecutionDetails?.rawCommand)
+    }
+
+    @Test
     fun reducerAddsToolCallActivityLinesIntoThinkingRow() {
         val conversation = RemodexConversationReducer.reduce(
             conversation = RemodexConversationState(),

@@ -1,5 +1,6 @@
 package app.remodex.android
 
+import app.remodex.android.core.model.CodexCommandExecutionDetails
 import app.remodex.android.core.model.CodexMessage
 import app.remodex.android.core.model.CodexMessageDeliveryState
 import app.remodex.android.core.model.CodexImageAttachment
@@ -677,6 +678,7 @@ data class RemodexConversationState(
         turnId: String? = null,
         itemId: String? = null,
         isStreaming: Boolean = false,
+        commandExecutionDetails: CodexCommandExecutionDetails? = null,
     ): RemodexConversationState {
         val normalizedThreadId = normalizeThreadId(threadId) ?: return this
         val trimmedText = text.trim()
@@ -694,7 +696,7 @@ data class RemodexConversationState(
             emptySet()
         }
         val incomingCommandKey = if (kind == CodexMessageKind.CommandExecution) {
-            commandExecutionPreviewKey(text)
+            commandExecutionKey(text, commandExecutionDetails)
         } else {
             null
         }
@@ -733,7 +735,11 @@ data class RemodexConversationState(
                     else -> existingMessage.itemId
                 },
                 isStreaming = isStreaming,
-                orderIndex = nextOrderIndex(updatedMessages),
+                commandExecutionDetails = when (kind) {
+                    CodexMessageKind.CommandExecution -> commandExecutionDetails ?: existingMessage.commandExecutionDetails
+                    else -> existingMessage.commandExecutionDetails
+                },
+                orderIndex = existingMessage.orderIndex,
             )
             val prunedMessages = pruneDuplicateSystemRows(
                 threadMessages = updatedMessages,
@@ -758,6 +764,7 @@ data class RemodexConversationState(
             turnId = resolvedTurnId,
             itemId = normalizedItemId ?: syntheticItemId,
             isStreaming = isStreaming,
+            commandExecutionDetails = commandExecutionDetails,
             orderIndex = nextOrderIndex(existingMessages),
         )
         return replaceThreadMessages(normalizedThreadId, nextMessages)
@@ -771,6 +778,7 @@ data class RemodexConversationState(
         turnId: String? = null,
         itemId: String? = null,
         isStreaming: Boolean = false,
+        commandExecutionDetails: CodexCommandExecutionDetails? = null,
     ): RemodexConversationState {
         val normalizedThreadId = normalizeThreadId(threadId) ?: return this
         val trimmedText = text.trim()
@@ -789,6 +797,7 @@ data class RemodexConversationState(
             turnId = normalizeThreadId(turnId),
             itemId = normalizeThreadId(itemId),
             isStreaming = isStreaming,
+            commandExecutionDetails = commandExecutionDetails,
             orderIndex = nextOrderIndex(existingMessages),
         )
         return replaceThreadMessages(normalizedThreadId, nextMessages)
@@ -835,6 +844,7 @@ data class RemodexConversationState(
         text: String,
         turnId: String? = null,
         itemId: String? = null,
+        commandExecutionDetails: CodexCommandExecutionDetails? = null,
     ): RemodexConversationState {
         return upsertSystemMessage(
             threadId = threadId,
@@ -843,6 +853,7 @@ data class RemodexConversationState(
             turnId = turnId,
             itemId = itemId,
             isStreaming = false,
+            commandExecutionDetails = commandExecutionDetails,
         )
     }
 
@@ -1325,7 +1336,10 @@ data class RemodexConversationState(
                     message.role == CodexMessageRole.System &&
                         message.kind == CodexMessageKind.CommandExecution &&
                         message.turnId == normalizedTurnId &&
-                        commandExecutionPreviewKey(message.text) == commandKey
+                        commandExecutionKey(
+                            text = message.text,
+                            details = message.commandExecutionDetails,
+                        ) == commandKey
                 }
                 if (commandIndex >= 0) {
                     return commandIndex
@@ -1521,7 +1535,10 @@ data class RemodexConversationState(
                 historyMessage.kind == CodexMessageKind.CommandExecution
             ) {
                 val normalizedTurnId = normalizeThreadId(historyMessage.turnId)
-                val incomingCommandKey = commandExecutionPreviewKey(historyMessage.text)
+                val incomingCommandKey = commandExecutionKey(
+                    text = historyMessage.text,
+                    details = historyMessage.commandExecutionDetails,
+                )
                 if (normalizedTurnId != null && incomingCommandKey != null) {
                     for (index in existingMessages.indices.reversed()) {
                         val existingMessage = existingMessages[index]
@@ -1531,7 +1548,10 @@ data class RemodexConversationState(
                         if (existingMessage.role == CodexMessageRole.System &&
                             existingMessage.kind == CodexMessageKind.CommandExecution &&
                             existingMessage.turnId == normalizedTurnId &&
-                            commandExecutionPreviewKey(existingMessage.text) == incomingCommandKey
+                            commandExecutionKey(
+                                text = existingMessage.text,
+                                details = existingMessage.commandExecutionDetails,
+                            ) == incomingCommandKey
                         ) {
                             return index
                         }
@@ -1849,6 +1869,17 @@ data class RemodexConversationState(
             return command.ifEmpty { null }
         }
 
+        private fun commandExecutionKey(
+            text: String,
+            details: CodexCommandExecutionDetails?,
+        ): String? {
+            val detailKey = details?.dedupeKey?.trim().orEmpty()
+            if (detailKey.isNotEmpty()) {
+                return detailKey.lowercase()
+            }
+            return commandExecutionPreviewKey(text)
+        }
+
         private fun isFileChangeSnapshotPayload(text: String): Boolean {
             val trimmed = text.trim()
             if (trimmed.isEmpty()) {
@@ -1913,7 +1944,10 @@ data class RemodexConversationState(
                 }
 
                 if (kind == CodexMessageKind.CommandExecution && commandKey != null) {
-                    return@filter commandExecutionPreviewKey(candidate.text) != commandKey
+                    return@filter commandExecutionKey(
+                        text = candidate.text,
+                        details = candidate.commandExecutionDetails,
+                    ) != commandKey
                 }
 
                 true

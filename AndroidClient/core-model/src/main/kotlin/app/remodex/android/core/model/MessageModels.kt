@@ -65,5 +65,6 @@ data class CodexMessage(
     val attachments: List<CodexImageAttachment> = emptyList(),
     val planState: CodexPlanState? = null,
     val structuredUserInputRequest: CodexStructuredUserInputRequest? = null,
+    val commandExecutionDetails: CodexCommandExecutionDetails? = null,
     val orderIndex: Int = 0,
 )

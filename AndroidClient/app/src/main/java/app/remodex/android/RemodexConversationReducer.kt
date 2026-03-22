@@ -1,5 +1,6 @@
 package app.remodex.android
 
+import app.remodex.android.core.model.CodexCommandExecutionDetails
 import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexPlanStep
 import app.remodex.android.core.model.CodexPlanStepStatus
@@ -24,7 +25,8 @@ object RemodexConversationReducer {
         val phase: CommandRunPhase,
         val shortCommand: String,
         val fullCommand: String,
-        val activityLine: String?,
+        val summaryLabel: String,
+        val dedupeKey: String,
     )
 
     private data class CommandExecutionMessageContext(
@@ -289,34 +291,22 @@ object RemodexConversationReducer {
                             turnId = resolvedTurnId,
                             itemId = itemId,
                         ),
-                        statusText = commandExecutionStatusText(state),
-                        isStreaming = true,
+                        state = state,
                     )
                 }
             }
             return conversation
         }
 
-        var nextConversation = publishCommandExecutionStatus(
+        return publishCommandExecutionStatus(
             conversation = conversation,
             context = CommandExecutionMessageContext(
                 threadId = threadId,
                 turnId = resolvedTurnId,
                 itemId = itemId,
             ),
-            statusText = commandExecutionStatusText(state),
-            isStreaming = state.phase == CommandRunPhase.Running,
+            state = state,
         )
-
-        if (state.activityLine != null) {
-            nextConversation = nextConversation.appendThinkingActivityLine(
-                threadId = threadId,
-                turnId = resolvedTurnId,
-                line = state.activityLine,
-            )
-        }
-
-        return nextConversation
     }
 
     private fun reduceEssentialActivityEvent(
@@ -527,6 +517,17 @@ object RemodexConversationReducer {
             eventObject = eventObject,
             isCompleted = false,
         ).ifBlank { streamingPlaceholderText(kind) }
+        val commandDetails = if (kind == CodexMessageKind.CommandExecution) {
+            commandExecutionDetails(
+                decodeCommandRunViewState(
+                    payloadObject = itemObject,
+                    paramsObject = paramsObject,
+                    eventType = commandExecutionEventType(eventObject, paramsObject),
+                ),
+            )
+        } else {
+            null
+        }
 
         return conversation.upsertSystemMessage(
             threadId = threadId,
@@ -535,6 +536,7 @@ object RemodexConversationReducer {
             turnId = turnId,
             itemId = itemId,
             isStreaming = true,
+            commandExecutionDetails = commandDetails,
         )
     }
 
@@ -556,6 +558,17 @@ object RemodexConversationReducer {
             turnIdHint = turnId,
         ) ?: return conversation
         val itemId = extractItemId(paramsObject, eventObject, itemObject)
+        val commandDetails = if (kind == CodexMessageKind.CommandExecution) {
+            commandExecutionDetails(
+                decodeCommandRunViewState(
+                    payloadObject = itemObject,
+                    paramsObject = paramsObject,
+                    eventType = commandExecutionEventType(eventObject, paramsObject),
+                ),
+            )
+        } else {
+            null
+        }
 
         return conversation.completeSystemMessage(
             threadId = threadId,
@@ -563,6 +576,7 @@ object RemodexConversationReducer {
             text = text,
             turnId = turnId,
             itemId = itemId,
+            commandExecutionDetails = commandDetails,
         )
     }
 
@@ -653,14 +667,11 @@ object RemodexConversationReducer {
         return publishCommandExecutionStatus(
             conversation = conversation,
             context = context,
-            statusText = commandExecutionStatusText(
-                decodeCommandRunViewState(
-                    payloadObject = payloadObject,
-                    paramsObject = paramsObject,
-                    eventType = commandExecutionEventType(eventObject, paramsObject),
-                ),
+            state = decodeCommandRunViewState(
+                payloadObject = payloadObject,
+                paramsObject = paramsObject,
+                eventType = commandExecutionEventType(eventObject, paramsObject),
             ),
-            isStreaming = true,
         )
     }
 
@@ -721,7 +732,6 @@ object RemodexConversationReducer {
             paramsObject = paramsObject,
             eventType = commandExecutionEventType(eventObject, paramsObject),
         )
-        val statusText = commandExecutionStatusText(state)
         val existingRunRow = conversation.messagesFor(context.threadId).firstOrNull { message ->
             message.role == app.remodex.android.core.model.CodexMessageRole.System &&
                 message.kind == CodexMessageKind.CommandExecution &&
@@ -736,8 +746,7 @@ object RemodexConversationReducer {
                 return publishCommandExecutionStatus(
                     conversation = conversation,
                     context = context,
-                    statusText = statusText,
-                    isStreaming = state.phase == CommandRunPhase.Running,
+                    state = state,
                 )
             }
             return conversation
@@ -746,17 +755,18 @@ object RemodexConversationReducer {
         return publishCommandExecutionStatus(
             conversation = conversation,
             context = context,
-            statusText = statusText,
-            isStreaming = state.phase == CommandRunPhase.Running,
+            state = state,
         )
     }
 
     private fun publishCommandExecutionStatus(
         conversation: RemodexConversationState,
         context: CommandExecutionMessageContext,
-        statusText: String,
-        isStreaming: Boolean,
+        state: CommandRunViewState,
     ): RemodexConversationState {
+        val statusText = commandExecutionStatusText(state)
+        val details = commandExecutionDetails(state)
+        val isStreaming = state.phase == CommandRunPhase.Running
         if (!context.itemId.isNullOrBlank()) {
             return if (isStreaming) {
                 conversation.upsertSystemMessage(
@@ -766,6 +776,7 @@ object RemodexConversationReducer {
                     turnId = context.turnId,
                     itemId = context.itemId,
                     isStreaming = true,
+                    commandExecutionDetails = details,
                 )
             } else {
                 conversation.completeSystemMessage(
@@ -774,6 +785,7 @@ object RemodexConversationReducer {
                     text = statusText,
                     turnId = context.turnId,
                     itemId = context.itemId,
+                    commandExecutionDetails = details,
                 )
             }
         }
@@ -786,6 +798,7 @@ object RemodexConversationReducer {
                     text = statusText,
                     turnId = context.turnId,
                     isStreaming = true,
+                    commandExecutionDetails = details,
                 )
             } else {
                 conversation.completeSystemMessage(
@@ -793,6 +806,7 @@ object RemodexConversationReducer {
                     kind = CodexMessageKind.CommandExecution,
                     text = statusText,
                     turnId = context.turnId,
+                    commandExecutionDetails = details,
                 )
             }
         }
@@ -804,6 +818,7 @@ object RemodexConversationReducer {
             turnId = context.turnId,
             itemId = context.itemId,
             isStreaming = isStreaming,
+            commandExecutionDetails = details,
         )
     }
 
@@ -847,7 +862,15 @@ object RemodexConversationReducer {
             CommandRunPhase.Failed -> "failed"
             CommandRunPhase.Stopped -> "stopped"
         }
-        return "$phase ${state.shortCommand}"
+        return "$phase ${state.summaryLabel}"
+    }
+
+    private fun commandExecutionDetails(state: CommandRunViewState): CodexCommandExecutionDetails {
+        return CodexCommandExecutionDetails(
+            rawCommand = state.fullCommand,
+            summary = state.summaryLabel,
+            dedupeKey = state.dedupeKey,
+        )
     }
 
     private fun decodeCommandRunViewState(
@@ -865,6 +888,7 @@ object RemodexConversationReducer {
         val phase = commandRunPhase(status, eventType)
         val rawCommand = extractCommandExecutionCommand(payloadObject) ?: "command"
         val shortCommand = shortCommandPreview(rawCommand)
+        val structuredSummary = RemodexCommandSummaryParser.summarize(rawCommand)
         val itemId = firstNonBlank(
             payloadObject["id"]?.stringValue,
             payloadObject["call_id"]?.stringValue,
@@ -877,7 +901,9 @@ object RemodexConversationReducer {
             phase = phase,
             shortCommand = shortCommand,
             fullCommand = rawCommand,
-            activityLine = if (phase == CommandRunPhase.Running) "Running $shortCommand" else null,
+            summaryLabel = structuredSummary?.summary ?: shortCommand,
+            dedupeKey = structuredSummary?.dedupeKey
+                ?: rawCommand.trim().replace(Regex("\\s+"), " ").lowercase(),
         )
     }
 
