@@ -6,6 +6,7 @@
 ## Progress Snapshot
 
 - In progress: protocol and terminology generalization
+- In progress: iOS timeline/state architecture parity for Android tracked in `Docs/PLAN-android-ios-thread-parity.md`
 - Done: Android + multi-host roadmap defined
 - Done: relay now accepts legacy `iphone` and new `mobile` client role semantics
 - Done: bridge now emits host platform/capability metadata for mobile clients

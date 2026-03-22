@@ -93,10 +93,16 @@
 - [ ] Bind composer reasoning chip to real runtime state.
 - [ ] Bind runtime/access pills to real request state instead of static labels.
 - [ ] Show real runtime defaults in settings instead of hardcoded placeholders.
-- [ ] Resolve branch state from the selected thread `cwd` instead of thread metadata.
-- [ ] Add Android `git/branchesWithStatus` parity for current/default/available branches.
-- [ ] Add Android `git/status` refresh parity for current branch and diff state updates.
-- [ ] Make branch picker render real branch choices returned by the host bridge.
+- [x] Resolve branch state from the selected thread `cwd` instead of thread metadata.
+- [x] Add Android `git/branchesWithStatus` parity for current/default/available branches.
+- [x] Add Android `git/status` refresh parity for current branch and diff state updates.
+- [x] Make branch picker render real branch choices returned by the host bridge.
+- [x] Split branch menu state into current branch and PR target selection.
+- [ ] Match iOS branch refresh semantics around reconnect, thread-ready, and turn-finished transitions.
+- [ ] Match iOS branch refresh failure handling instead of surfacing Android-only global errors.
+- [ ] Match iOS branch switch success flow without adding Android-only post-checkout refresh behavior.
+- [ ] Add Android debounce-based repo status refresh parity for repo-affecting timeline changes.
+- [ ] Preserve the iOS bridge contract exactly; do not add Android-only checkout branch coercion or remote-branch fallback logic.
 - [ ] Make action menu rows reflect real supported actions or explicit disabled state.
 - [ ] Keep onboarding CTA focused on connection setup / QR pairing flow.
 
@@ -118,6 +124,8 @@
 - [ ] Unit test stale-thread continuation flow.
 - [ ] Unit test unread badge behavior for inactive threads.
 - [ ] Unit test reconnect and stop recovery.
+- [ ] Unit test Android branch refresh/switch semantics against the current iOS behavior.
+- [ ] Verify whether the paired host bridge process is actually running commit `b4ccc66` when reproducing branch checkout failures.
 
 ## Sign-Off Criteria
 
@@ -128,5 +136,7 @@
 - [ ] Reconnect does not break active turn visibility or interruptibility.
 - [ ] Visible runtime controls map to real Android state and request parameters.
 - [ ] Branch UI is sourced from host git RPC scoped by thread `cwd`, not from `thread/read` metadata.
+- [ ] Android branch popup matches the lightweight floating menu feel of the iOS reference.
+- [ ] Android branch lifecycle behavior matches the current iOS implementation before any bridge contract changes are attempted.
 - [ ] Android main conversation screen reads as the same product as the iOS reference.
 - [ ] Android settings, onboarding, pickers, and menus align with the iOS reference set.

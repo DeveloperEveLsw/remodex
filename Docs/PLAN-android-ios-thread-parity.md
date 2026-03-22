@@ -9,10 +9,13 @@
 - Completed: Android Compose timeline now renders from per-thread conversation state instead of `selectedMessages`
 - Completed: Android incoming notification reducer now handles basic turn and assistant lifecycle events
 - Completed: Android main conversation screen, onboarding landing, settings, action menu, and branch sheet now follow the current iOS visual direction
+- Completed: Android branch state is now sourced from selected thread `cwd` plus host git RPC (`git/branchesWithStatus`, `git/status`, `git/checkout`) instead of thread metadata
+- Completed: Android branch picker now follows the current iOS interaction structure for `Current branch` versus `PR target`
 - Pending: `prepareThreadForDisplay` parity is still incomplete around viewed-state, `thread/resume`, hydration merge, and reconnect recovery
 - Pending: sidebar unread/running/failed badge semantics are not wired yet
 - Pending: Stop recovery and reconnect guardrails are not wired yet
-- Pending: composer/runtime controls now partially drive real request state, but branch/git surfaces still do not follow the iOS `cwd -> git RPC -> host` flow
+- Pending: composer/runtime controls mostly drive real request state, but broader git lifecycle parity is still incomplete around branch refresh timing, refresh failure handling, repo-affecting status refresh debounce, and remaining action semantics
+- Pending: bridge branch checkout semantics remain a separate contract issue; Android should not add Android-only fallback behavior to paper over it
 - Pending: remaining parity gaps are now primarily behavioral and state-machine related
 
 ## Goal
@@ -53,7 +56,26 @@ Use the local reference set in `/home/lws19/codex_android/remodex/UI ref` togeth
 - `transport.notifications` already feed `RemodexConversationReducer` and mutate the per-thread timeline.
 - `selectThread()` sets the active thread immediately, but it still behaves like a thin `thread/read(includeTurns=true)` wrapper instead of full iOS `prepareThreadForDisplay(threadId:)`.
 - `applyThreadRead(...)` still replaces thread history wholesale, so stale hydration can overwrite rows that were already created by live events.
-- composer controls and runtime pills are now partially connected to Android request state, but branch UI still reads like a visual shell because it is not yet backed by the iOS-style git RPC flow.
+- composer controls and runtime pills now largely reflect Android request state.
+- branch UI now uses host git RPC scoped by selected thread `cwd`, and no longer reads branch info from thread metadata.
+- remaining branch parity gaps are around iOS-style lifecycle polish rather than source-of-truth wiring.
+- Android currently refreshes branch targets again after a successful checkout and surfaces branch refresh failures through global `errorMessage`, both of which diverge from the current iOS implementation.
+
+## Branch Parity Decision
+
+The working rule for the next branch parity passes is:
+
+- keep the iOS to bridge contract unchanged on Android
+- do not add Android-only branch checkout coercion, `origin/` rewriting, or remote-only fallback behavior
+- match the current iOS behavior first, then address bridge contract flaws in the bridge itself as a separate track
+
+This matters because the current iOS path is simple:
+
+- `git/branchesWithStatus` returns the branch strings shown in UI
+- the selected branch string is sent back unchanged through `git/checkout`
+- any guarantee that a listed branch is actually checkout-safe belongs to the bridge contract, not to Android UI code
+
+The latest bridge checkout fix in commit `b4ccc66` corrected a wrong internal git invocation (`git checkout -- <branch>` to `git checkout <branch>`), but it did not change the JSON-RPC contract. Android should therefore continue aligning to the iOS contract shape while keeping bridge checkout semantics as a bridge-owned concern.
 
 ## Required End State
 
@@ -265,6 +287,11 @@ Tasks:
 - resolve branch state from the selected thread `cwd`, not from thread metadata
 - add Android git service calls equivalent to iOS `git/branchesWithStatus`, `git/status`, and `git/checkout`
 - make the branch sheet/picker render real current/default/available branches returned by the host bridge
+- preserve a selected PR target branch separately from the current checked-out branch, like iOS `selectedGitBaseBranch`
+- align branch refresh timing with iOS around thread preparation, reconnect recovery, and turn-finished transitions
+- refine repo-affecting status refresh timing so Android matches iOS `scheduleGitStatusRefresh(...)` more closely
+- keep branch refresh failures silent like iOS unless a user-triggered branch switch itself fails
+- remove Android-only post-checkout branch refresh if strict iOS parity remains the target
 - make the action menu call real actions where the Android transport already supports them, and keep unsupported actions explicitly disabled instead of pretending they work
 - keep onboarding CTA focused on local connection setup and QR pairing rather than a generic empty-state affordance
 
@@ -272,6 +299,8 @@ Exit criteria:
 
 - the visible runtime values in composer, settings, and sheets come from state rather than hardcoded placeholders
 - branch label, branch choices, and branch refresh behavior come from git RPC results scoped by the selected thread `cwd`
+- current branch and PR target are presented as separate pieces of state, matching the iOS branch menu model
+- Android branch lifecycle behavior matches iOS before any bridge contract expansion work begins
 - unsupported actions are visually clear and not misleading
 - the Android UI no longer suggests that model/reasoning/branch controls are interactive when they are not
 
@@ -340,9 +369,46 @@ Exit criteria:
 1. Finish `prepareThreadForDisplay` semantics and merge-safe hydration.
 2. Add badge and viewed-state rules.
 3. Add stop and reconnect recovery.
-4. Bind runtime controls and secondary sheets to real state/actions, including iOS-style git branch sourcing via `cwd`.
-5. Fill in reasoning, plan, structured input, and other non-chat timeline item parity.
-6. Expand tests until the state machine and visual behavior are covered.
+4. Bring Android git lifecycle behavior in line with current iOS semantics:
+   - add the same branch refresh triggers
+   - add debounce-based repo status refresh
+   - remove Android-only branch refresh/error behavior that does not exist on iOS
+5. Bind runtime controls and secondary sheets to real state/actions, including iOS-style git branch sourcing via `cwd`.
+6. Fill in reasoning, plan, structured input, and other non-chat timeline item parity.
+7. Expand tests until the state machine and visual behavior are covered.
+
+## Next Session Handoff
+
+Start from the assumption that Android should continue mirroring the current iOS branch flow and should not ship Android-only checkout workarounds.
+
+### Confirmed code facts
+
+- Android branch UI parity work landed in commits `742a369`, `207093f`, and `8bfaf40`.
+- Bridge checkout command fix landed in commit `b4ccc66`.
+- The bridge JSON-RPC contract for `git/checkout` did not change with `b4ccc66`; only the internal git argv changed.
+- iOS does not implement a special remote-only branch fallback path in the app layer.
+
+### Open branch-related gaps to address next
+
+- make Android branch refresh triggers match iOS exactly
+- decide whether turn-finished should call `refreshGitBranchTargets(...)` instead of `refreshGitStatus(...)` for strict parity
+- make Android branch refresh failures silent like iOS
+- remove the Android-only `refreshGitBranchTargets(activeThreadId)` call after a successful checkout if parity remains the goal
+- add debounce-based repo status refresh for repo-affecting timeline updates
+- add tests that lock these semantics down
+
+### Reproduction note for the checkout failure investigation
+
+The reported error `git/checkout failed: RPC error -32000: error: pathspec 'main' did not match any file(s) known to git` can still be explained by two different runtime states:
+
+- the paired host is still running an old bridge process that executes `git checkout -- <branch>`
+- the paired host is running the latest bridge, but the branch list contains a remote-only branch name that is not checkout-safe in the current git environment
+
+Before changing Android behavior, verify on the host side:
+
+- whether the running `phodex-bridge` process was restarted after `b4ccc66`
+- whether the live `git/checkout` handler is executing `git checkout <branch>` or the old `git checkout -- <branch>`
+- whether the failing branch exists locally, remotely, or both
 
 ## Deferred Until Core Parity Lands
 
