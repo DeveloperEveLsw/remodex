@@ -68,8 +68,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationDrawerItem
-import androidx.compose.material3.NavigationDrawerItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -91,8 +89,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -128,15 +126,16 @@ import app.remodex.android.core.model.CodexMessageKind
 import app.remodex.android.core.model.CodexMessageRole
 import app.remodex.android.core.model.CodexSkillMetadata
 import app.remodex.android.core.model.CodexStructuredUserInputQuestion
-import app.remodex.android.core.model.CodexThreadRunBadgeState
 import app.remodex.android.core.model.CodexThread
-import app.remodex.android.core.model.CodexThreadSyncState
 import app.remodex.android.core.model.GitRepoSyncResult
 import app.remodex.android.core.model.TurnGitActionKind
 import app.remodex.android.core.model.TurnGitSyncAlertAction
 import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.protocol.JsonValue
+import app.remodex.android.sidebar.RemodexSidebarDrawer
+import app.remodex.android.sidebar.RemodexSidebarProjectChoice
+import app.remodex.android.sidebar.buildSidebarProjectChoices
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
@@ -205,9 +204,10 @@ fun RemodexAndroidRoot() {
     var showQrScanner by rememberSaveable { mutableStateOf(false) }
     var showManualConnectionShell by rememberSaveable { mutableStateOf(false) }
     var showNewChatProjectPicker by rememberSaveable { mutableStateOf(false) }
+    var sidebarSearchText by rememberSaveable { mutableStateOf("") }
     val selectedThread = uiState.threads.firstOrNull { it.id == uiState.activeThreadId }
     val newChatProjectChoices = remember(uiState.threads) {
-        buildNewChatProjectChoices(uiState.threads)
+        buildSidebarProjectChoices(uiState.threads)
     }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
     val shouldShowConnectionShell = isConnected ||
@@ -333,9 +333,11 @@ fun RemodexAndroidRoot() {
                 gesturesEnabled = true,
                 scrimColor = Color(0x19000000),
                 drawerContent = {
-                    SidebarDrawer(
+                    RemodexSidebarDrawer(
                         uiState = uiState,
                         showDeveloperPanels = showDeveloperPanels,
+                        searchText = sidebarSearchText,
+                        onSearchTextChange = { sidebarSearchText = it },
                         onOpenSettings = { activePanel = SETTINGS_PANEL },
                         onToggleDeveloperPanels = { showDeveloperPanels = !showDeveloperPanels },
                         onNewChat = {
@@ -653,136 +655,9 @@ fun RemodexAndroidRoot() {
         }
     }
 }
-
-private data class NewChatProjectChoice(
-    val path: String,
-    val label: String,
-)
-
-private fun buildNewChatProjectChoices(threads: List<CodexThread>): List<NewChatProjectChoice> {
-    return threads
-        .mapNotNull { thread ->
-            thread.normalizedProjectPath?.let { path ->
-                NewChatProjectChoice(
-                    path = path,
-                    label = thread.projectDisplayName,
-                )
-            }
-        }
-        .distinctBy(NewChatProjectChoice::path)
-        .sortedBy { it.label.lowercase(Locale.ROOT) }
-}
-
-@Composable
-private fun SidebarDrawer(
-    uiState: RemodexDebugUiState,
-    showDeveloperPanels: Boolean,
-    onOpenSettings: () -> Unit,
-    onToggleDeveloperPanels: () -> Unit,
-    onNewChat: () -> Unit,
-    onRefreshThreads: () -> Unit,
-    onSelectThread: (String) -> Unit,
-    onParsePairingPayload: () -> Unit,
-    onConnect: () -> Unit,
-    onDisconnect: () -> Unit,
-    onOpenScanner: () -> Unit,
-    onUpdateQrPayload: (String) -> Unit,
-) {
-    val groupedThreads = remember(uiState.threads) {
-        uiState.threads.groupBy { it.projectDisplayName }
-            .toSortedMap(compareBy<String> { it.equals("No Project", ignoreCase = true) }.thenBy { it.lowercase() })
-    }
-    val canStartNewChat = !uiState.isStartingThread &&
-        uiState.connectionState is RemodexTransportState.Connected
-
-    Surface(
-        modifier = Modifier
-            .width(320.dp)
-            .fillMaxSize(),
-        shape = RoundedCornerShape(topEnd = 28.dp, bottomEnd = 28.dp),
-        color = Color(0xFFFDFBF7),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            SidebarHeader(onOpenSettings = onOpenSettings)
-            SearchStrip()
-            NavigationDrawerItem(
-                label = {
-                    Text(
-                        text = if (uiState.isStartingThread) "Creating..." else "New Chat",
-                        style = MaterialTheme.typography.labelLarge,
-                        modifier = Modifier.alpha(if (canStartNewChat) 1f else 0.5f),
-                    )
-                },
-                selected = false,
-                onClick = {
-                    if (canStartNewChat) {
-                        onNewChat()
-                    }
-                },
-                icon = {
-                    Icon(
-                        imageVector = Icons.Outlined.Add,
-                        contentDescription = null,
-                        modifier = Modifier.alpha(if (canStartNewChat) 1f else 0.5f),
-                    )
-                },
-                colors = NavigationDrawerItemDefaults.colors(
-                    unselectedContainerColor = Color.Transparent,
-                ),
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(vertical = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                groupedThreads.forEach { (projectName, threads) ->
-                    item(key = "header-$projectName") {
-                        SidebarSectionHeader(title = projectName)
-                    }
-                    items(items = threads.take(8), key = { it.id }) { thread ->
-                        ThreadDrawerRow(
-                            thread = thread,
-                            isSelected = thread.id == uiState.activeThreadId,
-                            badgeState = if (thread.id == uiState.activeThreadId) {
-                                null
-                            } else {
-                                uiState.conversation.threadRunBadgeState(thread.id)
-                            },
-                            onClick = { onSelectThread(thread.id) },
-                        )
-                    }
-                }
-            }
-
-            Divider(color = Color(0xFFDCD6CD))
-            SidebarConnectionPanel(
-                uiState = uiState,
-                showDeveloperPanels = showDeveloperPanels,
-                onToggleDeveloperPanels = onToggleDeveloperPanels,
-                onRefreshThreads = onRefreshThreads,
-                onParsePairingPayload = onParsePairingPayload,
-                onConnect = onConnect,
-                onDisconnect = onDisconnect,
-                onOpenScanner = onOpenScanner,
-                onUpdateQrPayload = onUpdateQrPayload,
-            )
-        }
-    }
-}
-
 @Composable
 private fun NewChatProjectPickerSheet(
-    choices: List<NewChatProjectChoice>,
+    choices: List<RemodexSidebarProjectChoice>,
     onDismiss: () -> Unit,
     onSelectProject: (String) -> Unit,
     onSelectWithoutProject: () -> Unit,
@@ -823,328 +698,6 @@ private fun NewChatProjectPickerSheet(
                     onClick = onSelectWithoutProject,
                 )
             }
-        }
-    }
-}
-
-@Composable
-private fun SidebarHeader(onOpenSettings: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Surface(
-            shape = CircleShape,
-            color = Color(0xFF111111),
-            tonalElevation = 0.dp,
-        ) {
-            Box(
-                modifier = Modifier
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-            ) {
-                Text(
-                    text = ">...[]",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-        }
-        Column {
-            Text(
-                text = "Remodex",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = "Remote Codex Workspace",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        Spacer(modifier = Modifier.weight(1f))
-        TextButton(onClick = onOpenSettings) {
-            Text("Settings")
-        }
-    }
-}
-
-@Composable
-private fun SearchStrip() {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        color = Color(0xFFF0EDE8),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.Search,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = "Search conversations",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-private fun SidebarSectionHeader(title: String) {
-    Text(
-        text = title,
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        fontWeight = FontWeight.SemiBold,
-    )
-}
-
-@Composable
-private fun ThreadDrawerRow(
-    thread: CodexThread,
-    isSelected: Boolean,
-    badgeState: CodexThreadRunBadgeState?,
-    onClick: () -> Unit,
-) {
-    NavigationDrawerItem(
-        label = {
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = thread.displayTitle,
-                        style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false),
-                    )
-                    badgeState?.let { state ->
-                        ThreadRunBadge(state = state)
-                    }
-                }
-                Text(
-                    text = thread.preview ?: thread.id,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        },
-        selected = isSelected,
-        onClick = onClick,
-        icon = {
-            Icon(
-                imageVector = if (thread.syncState == CodexThreadSyncState.ArchivedLocal) {
-                    Icons.AutoMirrored.Outlined.MenuBook
-                } else {
-                    Icons.Outlined.FolderOpen
-                },
-                contentDescription = null,
-            )
-        },
-        colors = NavigationDrawerItemDefaults.colors(
-            selectedContainerColor = Color(0xFFE8E4DD),
-            selectedIconColor = MaterialTheme.colorScheme.onSurface,
-            selectedTextColor = MaterialTheme.colorScheme.onSurface,
-            unselectedContainerColor = Color.Transparent,
-        ),
-        shape = RoundedCornerShape(18.dp),
-        modifier = Modifier.fillMaxWidth(),
-    )
-}
-
-@Composable
-private fun ThreadRunBadge(state: CodexThreadRunBadgeState) {
-    val (label, background, foreground) = when (state) {
-        CodexThreadRunBadgeState.Running -> Triple("Running", Color(0xFFE9F2FF), Color(0xFF2D6FD2))
-        CodexThreadRunBadgeState.Ready -> Triple("Ready", Color(0xFFEAF6EC), Color(0xFF2F8C4C))
-        CodexThreadRunBadgeState.Failed -> Triple("Failed", Color(0xFFFFECE8), Color(0xFFC65446))
-    }
-
-    Surface(
-        shape = CircleShape,
-        color = background,
-    ) {
-        Text(
-            text = label,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-            style = MaterialTheme.typography.labelSmall,
-            color = foreground,
-            fontWeight = FontWeight.SemiBold,
-        )
-    }
-}
-
-@Composable
-private fun SidebarConnectionPanel(
-    uiState: RemodexDebugUiState,
-    showDeveloperPanels: Boolean,
-    onToggleDeveloperPanels: () -> Unit,
-    onRefreshThreads: () -> Unit,
-    onParsePairingPayload: () -> Unit,
-    onConnect: () -> Unit,
-    onDisconnect: () -> Unit,
-    onOpenScanner: () -> Unit,
-    onUpdateQrPayload: (String) -> Unit,
-) {
-    val connectLabel = when {
-        uiState.isBusy || uiState.isAttemptingAutoReconnect -> "Connecting..."
-        uiState.hasSavedRelaySession && uiState.qrPayload.isBlank() -> "Reconnect"
-        else -> "Connect"
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "Bridge",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            TextButton(onClick = onToggleDeveloperPanels) {
-                Text(if (showDeveloperPanels) "Hide Debug" else "Show Debug")
-            }
-        }
-
-        StatusBadgeRow(
-            stateLabel = connectionStateLabel(uiState.connectionState),
-            hostInfo = uiState.hostInfo,
-            planSupported = uiState.supportsPlanCollaborationMode,
-        )
-
-        OutlinedTextField(
-            value = uiState.qrPayload,
-            onValueChange = onUpdateQrPayload,
-            modifier = Modifier.fillMaxWidth(),
-            minLines = 3,
-            maxLines = 5,
-            placeholder = {
-                Text("""{"relay":"ws://host:3000","sessionId":"..."}""")
-            },
-            shape = RoundedCornerShape(20.dp),
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(onClick = onOpenScanner) {
-                Text("Scan QR")
-            }
-            OutlinedButton(onClick = onParsePairingPayload) {
-                Text("Parse")
-            }
-            Button(
-                onClick = onConnect,
-                enabled = !uiState.isBusy && !uiState.isAttemptingAutoReconnect,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary,
-                ),
-            ) {
-                Text(connectLabel)
-            }
-            OutlinedButton(onClick = onDisconnect) {
-                Text("Stop")
-            }
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(
-                onClick = onRefreshThreads,
-                enabled = !uiState.isLoadingThreads &&
-                    uiState.connectionState is RemodexTransportState.Connected,
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Refresh,
-                    contentDescription = null,
-                    modifier = Modifier.width(16.dp),
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(if (uiState.isLoadingThreads) "Loading..." else "Refresh")
-            }
-            uiState.sessionUrl?.let { sessionUrl ->
-                Text(
-                    text = sessionUrl,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun StatusBadgeRow(
-    stateLabel: String,
-    hostInfo: CodexHostInfo?,
-    planSupported: Boolean,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        PillBadge(
-            icon = Icons.Outlined.Lan,
-            label = stateLabel,
-            tone = when {
-                stateLabel.startsWith("Connected") -> Color(0xFFE6F1E2)
-                stateLabel.startsWith("Connecting") || stateLabel.startsWith("Retrying") -> Color(0xFFF7EFD8)
-                else -> Color(0xFFF1E2E0)
-            },
-        )
-        PillBadge(
-            icon = Icons.Outlined.Code,
-            label = hostInfo?.displayName ?: "Host unknown",
-        )
-        PillBadge(
-            icon = Icons.Outlined.SettingsEthernet,
-            label = if (planSupported) "Plan ready" else "Plan pending",
-        )
-    }
-}
-
-@Composable
-private fun PillBadge(
-    icon: ImageVector,
-    label: String,
-    tone: Color = Color(0xFFEDE8E1),
-) {
-    Surface(
-        shape = CircleShape,
-        color = tone,
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                modifier = Modifier.width(14.dp),
-                tint = MaterialTheme.colorScheme.onSurface,
-            )
-            Text(
-                text = label,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
         }
     }
 }
@@ -5570,20 +5123,6 @@ private fun readComposerImageBytes(
             inputStream.readBytes()
         }
     }.getOrNull()?.takeIf(ByteArray::isNotEmpty)
-}
-
-private fun connectionStateLabel(state: RemodexTransportState): String {
-    return when (state) {
-        RemodexTransportState.Disconnected -> "Disconnected"
-        is RemodexTransportState.Connecting -> "Connecting ${state.attempt}"
-        is RemodexTransportState.Retrying -> "Retrying ${state.attempt}"
-        is RemodexTransportState.Connected -> {
-            if (state.isInitialized) "Connected" else "Handshaking"
-        }
-        is RemodexTransportState.Failed -> {
-            if (state.isPermanent) "Failed" else "Retry queued"
-        }
-    }
 }
 
 private fun messageRoleLabel(message: CodexMessage): String {
