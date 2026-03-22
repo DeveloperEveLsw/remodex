@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
@@ -22,7 +24,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -50,21 +51,19 @@ internal fun RemodexSidebarConnectionPanel(
     onOpenScanner: () -> Unit,
     onUpdateQrPayload: (String) -> Unit,
 ) {
-    var isManualPairingExpanded by rememberSaveable { mutableStateOf(false) }
     val isConnected = uiState.connectionState is RemodexTransportState.Connected
-    val showPairingControls = isManualPairingExpanded ||
-        showDeveloperPanels ||
-        !isConnected ||
-        uiState.qrPayload.isNotBlank()
+    var isExpanded by rememberSaveable(isConnected) { mutableStateOf(!isConnected) }
+    val showExpandedPanel = showDeveloperPanels || !isConnected || isExpanded
     val connectLabel = when {
         uiState.isBusy || uiState.isAttemptingAutoReconnect -> "Connecting..."
         uiState.hasSavedRelaySession && uiState.qrPayload.isBlank() -> "Reconnect"
         else -> "Connect"
     }
-
-    LaunchedEffect(isConnected, uiState.qrPayload) {
-        if (isConnected && uiState.qrPayload.isBlank()) {
-            isManualPairingExpanded = false
+    val compactSummary = buildString {
+        append(connectionStateLabel)
+        uiState.hostInfo?.displayName?.takeIf(String::isNotBlank)?.let { hostName ->
+            append(" · ")
+            append(hostName)
         }
     }
 
@@ -80,23 +79,35 @@ internal fun RemodexSidebarConnectionPanel(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
+                if (showExpandedPanel) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = "Bridge",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = uiState.hostInfo?.displayName ?: "Local bridge session",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                } else {
                     Text(
                         text = "Bridge",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Text(
-                        text = uiState.hostInfo?.displayName ?: "Local bridge session",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    CompactConnectionSummary(
+                        summary = compactSummary,
+                        modifier = Modifier.weight(1f),
                     )
                 }
 
@@ -104,9 +115,20 @@ internal fun RemodexSidebarConnectionPanel(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    if (isConnected) {
-                        TextButton(onClick = { isManualPairingExpanded = !isManualPairingExpanded }) {
-                            Text(if (showPairingControls) "Hide Pairing" else "Pair")
+                    if (isConnected && !showDeveloperPanels) {
+                        IconButton(onClick = { isExpanded = !isExpanded }) {
+                            Icon(
+                                imageVector = if (showExpandedPanel) {
+                                    Icons.Outlined.KeyboardArrowUp
+                                } else {
+                                    Icons.Outlined.KeyboardArrowDown
+                                },
+                                contentDescription = if (showExpandedPanel) {
+                                    "Collapse connection details"
+                                } else {
+                                    "Expand connection details"
+                                },
+                            )
                         }
                     }
                     IconButton(onClick = onOpenSettings) {
@@ -118,22 +140,22 @@ internal fun RemodexSidebarConnectionPanel(
                 }
             }
 
-            ConnectionSummaryRow(
-                connectionStateLabel = connectionStateLabel,
-                planSupported = uiState.supportsPlanCollaborationMode,
-            )
-
-            uiState.sessionUrl?.let { sessionUrl ->
-                Text(
-                    text = sessionUrl,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
+            if (showExpandedPanel) {
+                ConnectionSummaryRow(
+                    connectionStateLabel = connectionStateLabel,
+                    planSupported = uiState.supportsPlanCollaborationMode,
                 )
-            }
 
-            if (showPairingControls) {
+                uiState.sessionUrl?.let { sessionUrl ->
+                    Text(
+                        text = sessionUrl,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
                 OutlinedTextField(
                     value = uiState.qrPayload,
                     onValueChange = onUpdateQrPayload,
@@ -168,77 +190,99 @@ internal fun RemodexSidebarConnectionPanel(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Button(
-                        modifier = Modifier.weight(1f),
-                        onClick = onConnect,
-                        enabled = !uiState.isBusy && !uiState.isAttemptingAutoReconnect,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary,
-                        ),
-                    ) {
-                        Text(connectLabel)
-                    }
-                    OutlinedButton(
-                        modifier = Modifier.weight(1f),
-                        onClick = onDisconnect,
-                        enabled = isConnected,
-                    ) {
-                        Text("Stop")
+                    if (isConnected) {
+                        OutlinedButton(
+                            modifier = Modifier.weight(1f),
+                            onClick = onRefreshThreads,
+                            enabled = !uiState.isLoadingThreads,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Refresh,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Text(
+                                text = if (uiState.isLoadingThreads) "Loading..." else "Refresh",
+                                modifier = Modifier.padding(start = 6.dp),
+                            )
+                        }
+                        OutlinedButton(
+                            modifier = Modifier.weight(1f),
+                            onClick = onDisconnect,
+                        ) {
+                            Text("Disconnect")
+                        }
+                    } else {
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            onClick = onConnect,
+                            enabled = !uiState.isBusy && !uiState.isAttemptingAutoReconnect,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = MaterialTheme.colorScheme.onPrimary,
+                            ),
+                        ) {
+                            Text(connectLabel)
+                        }
+                        OutlinedButton(
+                            modifier = Modifier.weight(1f),
+                            onClick = onDisconnect,
+                            enabled = false,
+                        ) {
+                            Text("Stop")
+                        }
                     }
                 }
-            } else {
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    OutlinedButton(
-                        modifier = Modifier.weight(1f),
-                        onClick = onRefreshThreads,
-                        enabled = !uiState.isLoadingThreads && isConnected,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Refresh,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
+                    if (!isConnected && uiState.hasSavedRelaySession) {
+                        TextButton(onClick = onConnect) {
+                            Text(connectLabel)
+                        }
+                    } else {
                         Text(
-                            text = if (uiState.isLoadingThreads) "Loading..." else "Refresh",
-                            modifier = Modifier.padding(start = 6.dp),
+                            text = if (isConnected) "Connection ready" else "Waiting for pairing",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    OutlinedButton(
-                        modifier = Modifier.weight(1f),
-                        onClick = onDisconnect,
-                        enabled = isConnected,
-                    ) {
-                        Text("Disconnect")
-                    }
-                }
-            }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (!showPairingControls && !isConnected && uiState.hasSavedRelaySession) {
-                    TextButton(onClick = onConnect) {
-                        Text(connectLabel)
+                    TextButton(onClick = onToggleDeveloperPanels) {
+                        Text(if (showDeveloperPanels) "Hide Debug" else "Show Debug")
                     }
-                } else {
-                    Text(
-                        text = if (isConnected) "Connection ready" else "Waiting for pairing",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-
-                TextButton(onClick = onToggleDeveloperPanels) {
-                    Text(if (showDeveloperPanels) "Hide Debug" else "Show Debug")
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun CompactConnectionSummary(
+    summary: String,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Surface(
+            modifier = Modifier.size(10.dp),
+            shape = CircleShape,
+            color = Color(0xFF2F8C4C),
+        ) {}
+
+        Text(
+            text = summary,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
