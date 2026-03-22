@@ -15,7 +15,8 @@ object RemodexTimelineProjector {
         val visibleMessages = removeHiddenSystemMarkers(messages)
         val reordered = enforceIntraTurnOrder(visibleMessages)
         val collapsedThinking = collapseConsecutiveThinkingMessages(reordered)
-        val dedupedFileChanges = removeDuplicateFileChangeMessages(collapsedThinking)
+        val latestThinkingOnly = removeObsoleteThinkingMessages(collapsedThinking)
+        val dedupedFileChanges = removeDuplicateFileChangeMessages(latestThinkingOnly)
         val dedupedAssistant = removeDuplicateAssistantMessages(dedupedFileChanges)
         return RemodexTimelineProjection(messages = dedupedAssistant)
     }
@@ -104,14 +105,15 @@ object RemodexTimelineProjector {
             CodexMessageRole.User -> 0
             CodexMessageRole.System -> when (message.kind) {
                 CodexMessageKind.Thinking -> 1
-                CodexMessageKind.CommandExecution -> 2
-                CodexMessageKind.Chat -> 3
-                CodexMessageKind.Plan -> 3
+                CodexMessageKind.Activity -> 2
+                CodexMessageKind.CommandExecution -> 3
+                CodexMessageKind.Chat -> 4
+                CodexMessageKind.Plan -> 4
                 CodexMessageKind.FileChange -> 5
                 CodexMessageKind.UserInputPrompt -> 6
             }
 
-            CodexMessageRole.Assistant -> 4
+            CodexMessageRole.Assistant -> 5
         }
     }
 
@@ -195,6 +197,16 @@ object RemodexTimelineProjector {
         }
 
         return "$existingTrimmed\n$incomingTrimmed"
+    }
+
+    private fun removeObsoleteThinkingMessages(messages: List<CodexMessage>): List<CodexMessage> {
+        return messages.filterIndexed { index, message ->
+            if (message.role != CodexMessageRole.System || message.kind != CodexMessageKind.Thinking) {
+                return@filterIndexed true
+            }
+
+            index == messages.lastIndex
+        }
     }
 
     private fun removeDuplicateAssistantMessages(messages: List<CodexMessage>): List<CodexMessage> {

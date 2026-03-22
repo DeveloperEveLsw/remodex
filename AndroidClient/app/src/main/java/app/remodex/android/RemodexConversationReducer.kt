@@ -323,11 +323,19 @@ object RemodexConversationReducer {
             turnIdHint = turnId,
         ) ?: return conversation
         val resolvedTurnId = normalizeThreadId(turnId) ?: conversation.activeTurnIdByThread[threadId]
-        return conversation.appendThinkingActivityLine(
-            threadId = threadId,
-            turnId = resolvedTurnId,
-            line = line,
-        )
+        return if (eventType == "background_event") {
+            conversation.appendThinkingActivityLine(
+                threadId = threadId,
+                turnId = resolvedTurnId,
+                line = line,
+            )
+        } else {
+            conversation.appendActivityLine(
+                threadId = threadId,
+                turnId = resolvedTurnId,
+                line = line,
+            )
+        }
     }
 
     private fun reduceToolCallDelta(
@@ -368,7 +376,7 @@ object RemodexConversationReducer {
         }
 
         return activityLines.fold(conversation) { current, line ->
-            current.appendThinkingActivityLine(
+            current.appendActivityLine(
                 threadId = threadId,
                 turnId = resolvedTurnId,
                 line = line,
@@ -1475,7 +1483,11 @@ object RemodexConversationReducer {
         val extractedText = when (kind) {
             CodexMessageKind.CommandExecution -> extractCommandExecutionText(itemObject, paramsObject, eventObject, isCompleted)
             CodexMessageKind.FileChange -> extractFileChangeText(itemObject, paramsObject, eventObject, isCompleted)
-            CodexMessageKind.Thinking, CodexMessageKind.Plan, CodexMessageKind.UserInputPrompt, CodexMessageKind.Chat ->
+            CodexMessageKind.Thinking,
+            CodexMessageKind.Activity,
+            CodexMessageKind.Plan,
+            CodexMessageKind.UserInputPrompt,
+            CodexMessageKind.Chat ->
                 extractMessageText(itemObject)
         }
         return extractedText.ifBlank {
@@ -1611,6 +1623,7 @@ object RemodexConversationReducer {
     private fun streamingPlaceholderText(kind: CodexMessageKind): String {
         return when (kind) {
             CodexMessageKind.Thinking -> "Thinking..."
+            CodexMessageKind.Activity -> "Working..."
             CodexMessageKind.FileChange -> "Applying file changes..."
             CodexMessageKind.CommandExecution -> "Running command"
             CodexMessageKind.Plan -> "Planning..."

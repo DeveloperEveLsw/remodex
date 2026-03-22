@@ -36,6 +36,9 @@ enum class CodexMessageKind {
     @SerialName("thinking")
     Thinking,
 
+    @SerialName("activity")
+    Activity,
+
     @SerialName("fileChange")
     FileChange,
 

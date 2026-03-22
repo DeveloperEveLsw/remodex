@@ -3728,6 +3728,7 @@ private fun SystemTranscriptBlock(
     ) {
         when (message.kind) {
             CodexMessageKind.Thinking -> ThinkingSystemBlock(message = message)
+            CodexMessageKind.Activity -> ActivitySystemBlock(message = message)
             CodexMessageKind.FileChange -> FileChangeSystemBlock(message = message)
             CodexMessageKind.CommandExecution -> CommandExecutionSystemBlock(message = message)
             CodexMessageKind.Plan -> PlanSystemBlock(message = message)
@@ -3741,6 +3742,22 @@ private fun SystemTranscriptBlock(
             CodexMessageKind.Chat -> DefaultSystemBlock(message = message)
         }
     }
+}
+
+@Composable
+private fun ActivitySystemBlock(message: CodexMessage) {
+    val summary = remember(message.text) {
+        message.text.trim()
+    }
+    if (summary.isBlank()) {
+        return
+    }
+
+    Text(
+        text = summary,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable
@@ -3949,7 +3966,6 @@ private fun CommandExecutionSystemBlock(message: CodexMessage) {
                 }
             }
         }
-        MessageMetaRow(message = message, leadingIcon = null)
     }
 }
 
@@ -5195,6 +5211,7 @@ private fun messageRoleLabel(message: CodexMessage): String {
         CodexMessageRole.Assistant -> "Remodex"
         CodexMessageRole.System -> when (message.kind) {
             CodexMessageKind.Thinking -> "Reasoning"
+            CodexMessageKind.Activity -> "Activity"
             CodexMessageKind.FileChange -> "Workspace"
             CodexMessageKind.CommandExecution -> "Command"
             CodexMessageKind.Plan -> "Plan"
@@ -5207,6 +5224,7 @@ private fun messageKindLabel(kind: CodexMessageKind): String {
     return when (kind) {
         CodexMessageKind.Chat -> "Chat"
         CodexMessageKind.Thinking -> "Reasoning"
+        CodexMessageKind.Activity -> "Activity"
         CodexMessageKind.FileChange -> "Diff"
         CodexMessageKind.CommandExecution -> "Command"
         CodexMessageKind.Plan -> "Plan"
@@ -5217,6 +5235,7 @@ private fun messageKindLabel(kind: CodexMessageKind): String {
 private fun assistantKindTone(kind: CodexMessageKind): Color {
     return when (kind) {
         CodexMessageKind.Thinking -> Color(0xFFF1F3FA)
+        CodexMessageKind.Activity -> Color.Transparent
         CodexMessageKind.FileChange -> Color(0xFFF4F1EB)
         CodexMessageKind.CommandExecution -> Color(0xFFF1F4F8)
         CodexMessageKind.Plan -> Color(0xFFF3F2F8)

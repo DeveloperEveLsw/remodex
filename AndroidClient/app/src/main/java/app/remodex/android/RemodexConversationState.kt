@@ -1094,6 +1094,45 @@ data class RemodexConversationState(
         return nextState.withRecentActivityLine(dedupeKey, trimmedLine, now)
     }
 
+    fun appendActivityLine(
+        threadId: String,
+        turnId: String?,
+        line: String,
+    ): RemodexConversationState {
+        val normalizedThreadId = normalizeThreadId(threadId) ?: return this
+        val normalizedTurnId = normalizeThreadId(turnId)
+        val trimmedLine = line.trim()
+        if (trimmedLine.isEmpty()) {
+            return this
+        }
+
+        val dedupeKey = "$normalizedThreadId|${normalizedTurnId ?: "no-turn"}|activity"
+        val now = Instant.now()
+        val previous = recentActivityLineByThread[dedupeKey]
+        if (previous != null &&
+            previous.line.equals(trimmedLine, ignoreCase = true) &&
+            java.time.Duration.between(previous.timestamp, now).seconds <= 4
+        ) {
+            return this
+        }
+
+        val resolvedTurnId = normalizedTurnId ?: activeTurnIdByThread[normalizedThreadId]
+        val isTurnActive = isTurnActiveForThinkingActivity(normalizedThreadId, resolvedTurnId)
+        if (!isTurnActive && resolvedTurnId == null) {
+            return this
+        }
+
+        val nextState = appendSystemMessage(
+            threadId = normalizedThreadId,
+            kind = CodexMessageKind.Activity,
+            text = trimmedLine,
+            turnId = resolvedTurnId,
+            isStreaming = isTurnActive,
+        )
+
+        return nextState.withRecentActivityLine(dedupeKey, trimmedLine, now)
+    }
+
     fun mergeLateReasoningDeltaIfPossible(
         threadId: String,
         turnId: String?,
@@ -1393,6 +1432,7 @@ data class RemodexConversationState(
         private fun streamingPlaceholderText(kind: CodexMessageKind): String {
             return when (kind) {
                 CodexMessageKind.Thinking -> "Thinking..."
+                CodexMessageKind.Activity -> "Working..."
                 CodexMessageKind.FileChange -> "Applying file changes..."
                 CodexMessageKind.CommandExecution -> "Running command"
                 CodexMessageKind.Plan -> "Planning..."

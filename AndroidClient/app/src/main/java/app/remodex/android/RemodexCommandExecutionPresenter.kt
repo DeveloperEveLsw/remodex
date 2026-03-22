@@ -48,7 +48,7 @@ object RemodexCommandExecutionPresenter {
     ): String {
         return when (phase) {
             CodexCommandExecutionPhase.Running -> "Running $preview"
-            CodexCommandExecutionPhase.Completed -> preview
+            CodexCommandExecutionPhase.Completed -> "Ran $preview"
             CodexCommandExecutionPhase.Failed -> "Failed $preview"
             CodexCommandExecutionPhase.Stopped -> "Stopped $preview"
         }
