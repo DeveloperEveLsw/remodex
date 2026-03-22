@@ -519,6 +519,7 @@ open class RemodexTransportClient(
         threadId: String,
         accessMode: CodexAccessMode = CodexAccessMode.OnRequest,
         modelIdentifier: String? = null,
+        force: Boolean = false,
     ): RemodexThreadResumeResult {
         val normalizedThreadId = threadId.trim()
         if (normalizedThreadId.isEmpty()) {
@@ -527,12 +528,14 @@ open class RemodexTransportClient(
                 message = "thread/resume requires a non-empty threadId",
             )
         }
-        resumedThreadsById[normalizedThreadId]?.let { cachedThread ->
-            return RemodexThreadResumeResult(
-                threadId = normalizedThreadId,
-                thread = cachedThread,
-                response = RpcMessage.success(id = null, result = JsonObject(emptyMap<String, JsonValue>())),
-            )
+        if (!force) {
+            resumedThreadsById[normalizedThreadId]?.let { cachedThread ->
+                return RemodexThreadResumeResult(
+                    threadId = normalizedThreadId,
+                    thread = cachedThread,
+                    response = RpcMessage.success(id = null, result = JsonObject(emptyMap<String, JsonValue>())),
+                )
+            }
         }
 
         val response = sendRequestWithSandboxFallback(
@@ -552,10 +555,22 @@ open class RemodexTransportClient(
         if (resumedThread != null) {
             resumedThreadsById[normalizedThreadId] = resumedThread
         }
+        val resumeMessages = if (threadObject != null) {
+            decodeMessagesFromThreadRead(normalizedThreadId, threadObject)
+        } else {
+            emptyList()
+        }
+        val turnStateSnapshot = if (threadObject != null) {
+            extractThreadTurnStateSnapshot(threadObject)
+        } else {
+            RemodexThreadTurnStateSnapshot()
+        }
 
         return RemodexThreadResumeResult(
             threadId = normalizedThreadId,
             thread = resumedThread,
+            messages = resumeMessages,
+            turnStateSnapshot = turnStateSnapshot,
             response = response,
         )
     }

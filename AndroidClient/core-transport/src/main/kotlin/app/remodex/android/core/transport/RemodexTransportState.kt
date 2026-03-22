@@ -72,6 +72,8 @@ data class RemodexThreadStartResult(
 data class RemodexThreadResumeResult(
     val threadId: String,
     val thread: CodexThread? = null,
+    val messages: List<CodexMessage> = emptyList(),
+    val turnStateSnapshot: RemodexThreadTurnStateSnapshot = RemodexThreadTurnStateSnapshot(),
     val response: RpcMessage,
 )
 

@@ -855,6 +855,108 @@ class RemodexDebugViewModelTests {
     }
 
     @Test
+    fun foregroundReturnUsesResumePayloadToRecoverMissingStreamingGap() = runTest {
+        val thread = CodexThread(
+            id = "thread-gap",
+            title = "Gap",
+            cwd = "/tmp/project",
+        )
+        val partialMessage = CodexMessage(
+            id = "msg-gap",
+            threadId = thread.id,
+            role = CodexMessageRole.Assistant,
+            kind = CodexMessageKind.Chat,
+            text = "partial",
+            turnId = "turn-gap",
+            itemId = "item-gap",
+            isStreaming = true,
+            orderIndex = 0,
+        )
+        val recoveredMessage = partialMessage.copy(
+            text = "partial response recovered after foreground return",
+            isStreaming = true,
+        )
+        val snapshot = RemodexThreadTurnStateSnapshot(
+            interruptibleTurnId = "turn-gap",
+            latestTurnId = "turn-gap",
+        )
+        val transport = FakeTransportClient(
+            readThreadResults = mapOf(
+                thread.id to RemodexThreadReadResult(
+                    thread = thread,
+                    messages = listOf(partialMessage),
+                    turnStateSnapshot = snapshot,
+                ),
+            ),
+            queuedReadThreadResults = mapOf(
+                thread.id to listOf(
+                    RemodexThreadReadResult(
+                        thread = thread,
+                        messages = listOf(partialMessage),
+                        turnStateSnapshot = snapshot,
+                    ),
+                    RemodexThreadReadResult(
+                        thread = thread,
+                        messages = listOf(partialMessage),
+                        turnStateSnapshot = snapshot,
+                    ),
+                ),
+            ),
+            queuedResumeThreadResults = mapOf(
+                thread.id to listOf(
+                    RemodexThreadResumeResult(
+                        threadId = thread.id,
+                        thread = thread,
+                        response = RpcMessage.success(null, JsonObject(emptyMap())),
+                    ),
+                    RemodexThreadResumeResult(
+                        threadId = thread.id,
+                        thread = thread,
+                        messages = listOf(partialMessage),
+                        turnStateSnapshot = snapshot,
+                        response = RpcMessage.success(null, JsonObject(emptyMap())),
+                    ),
+                    RemodexThreadResumeResult(
+                        threadId = thread.id,
+                        thread = thread,
+                        response = RpcMessage.success(null, JsonObject(emptyMap())),
+                    ),
+                    RemodexThreadResumeResult(
+                        threadId = thread.id,
+                        thread = thread,
+                        messages = listOf(recoveredMessage),
+                        turnStateSnapshot = snapshot,
+                        response = RpcMessage.success(null, JsonObject(emptyMap())),
+                    ),
+                ),
+            ),
+        )
+        val viewModel = createViewModel(transport = transport)
+
+        viewModel.selectThread(thread.id)
+        advanceUntilIdle()
+        val initialResumeCount = transport.recordedMethods.count { it == "thread/resume" }
+        assertEquals(
+            "partial",
+            viewModel.uiState.value.conversation.messagesFor(thread.id)
+                .last { it.role == CodexMessageRole.Assistant }
+                .text,
+        )
+
+        viewModel.setForegroundState(false)
+        viewModel.setForegroundState(true)
+        advanceUntilIdle()
+
+        assertTrue(transport.recordedMethods.count { it == "thread/resume" } > initialResumeCount)
+        assertEquals(
+            "partial response recovered after foreground return",
+            viewModel.uiState.value.conversation.messagesFor(thread.id)
+                .last { it.role == CodexMessageRole.Assistant }
+                .text,
+        )
+    }
+
+    @Test
     fun immediateRealtimeSyncRecoversActiveThreadAfterMissedCompletion() = runTest {
         val thread = CodexThread(
             id = "thread-running",
@@ -1496,6 +1598,7 @@ class RemodexDebugViewModelTests {
     private class FakeTransportClient(
         private val readThreadResults: Map<String, RemodexThreadReadResult> = emptyMap(),
         queuedReadThreadResults: Map<String, List<RemodexThreadReadResult>> = emptyMap(),
+        queuedResumeThreadResults: Map<String, List<RemodexThreadResumeResult>> = emptyMap(),
         private val threadListResult: List<CodexThread> = emptyList(),
         private val startThreadResult: RemodexThreadStartResult? = null,
         private val startTurnResult: RemodexTurnStartResult? = null,
@@ -1532,6 +1635,9 @@ class RemodexDebugViewModelTests {
         val sentErrorResponses = mutableListOf<SentRpcErrorResponse>()
         private val stateFlow: MutableStateFlow<app.remodex.android.core.transport.RemodexTransportState>
         private val queuedReadThreadResultsById = queuedReadThreadResults
+            .mapValues { (_, results) -> java.util.ArrayDeque(results) }
+            .toMutableMap()
+        private val queuedResumeThreadResultsById = queuedResumeThreadResults
             .mapValues { (_, results) -> java.util.ArrayDeque(results) }
             .toMutableMap()
 
@@ -1626,12 +1732,20 @@ class RemodexDebugViewModelTests {
             threadId: String,
             accessMode: app.remodex.android.core.model.CodexAccessMode,
             modelIdentifier: String?,
+            force: Boolean,
         ): RemodexThreadResumeResult {
             recordedMethods += "thread/resume"
             resumeThreadThrowable?.let { throw it }
+            val queuedResult = queuedResumeThreadResultsById[threadId]?.pollFirst()
+            if (queuedResult != null) {
+                return queuedResult
+            }
+            val threadReadResult = readThreadResults[threadId]
             return RemodexThreadResumeResult(
                 threadId = threadId,
-                thread = readThreadResults[threadId]?.thread,
+                thread = threadReadResult?.thread,
+                messages = threadReadResult?.messages.orEmpty(),
+                turnStateSnapshot = threadReadResult?.turnStateSnapshot ?: RemodexThreadTurnStateSnapshot(),
                 response = RpcMessage.success(null, JsonObject(emptyMap())),
             )
         }

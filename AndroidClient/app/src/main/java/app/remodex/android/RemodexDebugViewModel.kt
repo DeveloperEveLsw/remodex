@@ -29,6 +29,7 @@ import app.remodex.android.core.transport.RemodexTransportDiagnostics
 import app.remodex.android.core.transport.RemodexTransportException
 import app.remodex.android.core.transport.RemodexTransportFailureKind
 import app.remodex.android.core.transport.RemodexThreadReadResult
+import app.remodex.android.core.transport.RemodexThreadResumeResult
 import app.remodex.android.core.transport.RemodexThreadStartResult
 import app.remodex.android.core.transport.RemodexTransportState
 import app.remodex.android.core.transport.RemodexTurnStartResult
@@ -2589,6 +2590,38 @@ class RemodexDebugViewModel(
         sanitizeRunningThreadWatches()
     }
 
+    private fun applyThreadResumeResult(
+        resumeResult: RemodexThreadResumeResult,
+        markViewed: Boolean,
+    ) {
+        val normalizedThreadId = normalizeThreadId(resumeResult.thread?.id ?: resumeResult.threadId) ?: return
+        _uiState.update { current ->
+            val updatedConversationBase = if (markViewed) {
+                current.conversation.markThreadAsViewed(normalizedThreadId)
+            } else {
+                current.conversation
+            }
+            var updatedConversation = updatedConversationBase.withRefreshedInFlightTurnState(
+                normalizedThreadId,
+                resumeResult.turnStateSnapshot,
+            )
+            if (resumeResult.messages.isNotEmpty()) {
+                updatedConversation = updatedConversation.mergeHydratedThreadMessages(
+                    normalizedThreadId,
+                    resumeResult.messages,
+                )
+            }
+            current.copy(
+                conversation = updatedConversation,
+                threads = resumeResult.thread?.let { resumedThread ->
+                    upsertThread(current.threads, resumedThread)
+                } ?: current.threads,
+                errorMessage = null,
+            )
+        }
+        sanitizeRunningThreadWatches()
+    }
+
     private suspend fun resolveInterruptibleTurnId(
         threadId: String,
         forceRefresh: Boolean = false,
@@ -2650,18 +2683,20 @@ class RemodexDebugViewModel(
             return
         }
 
+        val shouldHydrateHistory = shouldLoadThreadHistory(_uiState.value, threadId, forceHydration)
+
         runCatching {
             transport.resumeThread(
                 threadId = threadId,
                 accessMode = _uiState.value.selectedAccessMode,
                 modelIdentifier = _uiState.value.selectedModelOption?.model,
+                force = forceHydration,
             )
         }.onSuccess { resumeResult ->
-            resumeResult.thread?.let { resumedThread ->
-                _uiState.update { current ->
-                    current.copy(threads = upsertThread(current.threads, resumedThread))
-                }
-            }
+            applyThreadResumeResult(
+                resumeResult = resumeResult,
+                markViewed = true,
+            )
         }.onFailure { throwable ->
             if (shouldTreatAsMissingThread(throwable)) {
                 handleMissingThreadLocally(threadId)
@@ -2680,8 +2715,6 @@ class RemodexDebugViewModel(
             }
             return
         }
-
-        val shouldHydrateHistory = shouldLoadThreadHistory(_uiState.value, threadId, forceHydration)
 
         val threadReadResult = runCatching {
             transport.readThread(threadId = threadId, includeTurns = true)
@@ -2719,19 +2752,18 @@ class RemodexDebugViewModel(
         if (threadReadResult != null &&
             _uiState.value.conversation.threadHasActiveOrRunningTurn(threadId)
         ) {
-            transport.clearResumedThread(threadId)
             runCatching {
                 transport.resumeThread(
                     threadId = threadId,
                     accessMode = _uiState.value.selectedAccessMode,
                     modelIdentifier = _uiState.value.selectedModelOption?.model,
+                    force = true,
                 )
             }.onSuccess { resumeResult ->
-                resumeResult.thread?.let { resumedThread ->
-                    _uiState.update { current ->
-                        current.copy(threads = upsertThread(current.threads, resumedThread))
-                    }
-                }
+                applyThreadResumeResult(
+                    resumeResult = resumeResult,
+                    markViewed = true,
+                )
             }
         }
 
