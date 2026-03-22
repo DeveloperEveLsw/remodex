@@ -54,7 +54,7 @@ class RemodexCommandExecutionPresenterTests {
         )
 
         assertNotNull(presentation)
-        assertEquals("git diff -- Docs/ui-smoke-test-20260322.md", presentation?.collapsedSummary)
+        assertEquals("Ran git diff -- Docs/ui-smoke-test-20260322.md", presentation?.collapsedSummary)
         assertEquals("Succeeded", presentation?.detailStatusLabel)
     }
 

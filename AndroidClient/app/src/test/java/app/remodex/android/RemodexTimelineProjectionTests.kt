@@ -10,7 +10,7 @@ import org.junit.Test
 
 class RemodexTimelineProjectionTests {
     @Test
-    fun projectReordersSingleItemTurnIntoUserThinkingAssistantFileChange() {
+    fun projectHidesThinkingOnceLaterMessagesArrive() {
         val messages = listOf(
             assistantMessage(id = "assistant", turnId = "turn-1", orderIndex = 2),
             fileChangeMessage(id = "diff", turnId = "turn-1", text = "Edited file", orderIndex = 3),
@@ -20,7 +20,7 @@ class RemodexTimelineProjectionTests {
 
         val projected = RemodexTimelineProjector.project(messages).messages
 
-        assertEquals(listOf("user", "thinking", "assistant", "diff"), projected.map(CodexMessage::id))
+        assertEquals(listOf("user", "assistant", "diff"), projected.map(CodexMessage::id))
     }
 
     @Test
@@ -88,11 +88,11 @@ class RemodexTimelineProjectionTests {
 
         val projected = RemodexTimelineProjector.project(messages).messages
 
-        assertEquals(listOf("user", "thinking-1", "assistant-1", "command-1", "assistant-2"), projected.map(CodexMessage::id))
+        assertEquals(listOf("user", "assistant-1", "command-1", "assistant-2"), projected.map(CodexMessage::id))
     }
 
     @Test
-    fun projectPreservesPartialInterleavedThinkingChronology() {
+    fun projectKeepsOnlyLatestThinkingRowVisible() {
         val messages = listOf(
             userMessage(id = "user", turnId = "turn-1", orderIndex = 0),
             thinkingMessage(id = "thinking-1", turnId = "turn-1", itemId = "item-1", text = "Reasoning A", orderIndex = 1),
@@ -102,7 +102,7 @@ class RemodexTimelineProjectionTests {
 
         val projected = RemodexTimelineProjector.project(messages).messages
 
-        assertEquals(listOf("user", "thinking-1", "assistant-1", "thinking-2"), projected.map(CodexMessage::id))
+        assertEquals(listOf("user", "assistant-1", "thinking-2"), projected.map(CodexMessage::id))
     }
 
     @Test

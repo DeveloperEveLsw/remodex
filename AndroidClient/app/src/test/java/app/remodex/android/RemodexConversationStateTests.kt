@@ -309,7 +309,7 @@ class RemodexConversationStateTests {
     }
 
     @Test
-    fun completeSystemMessageMovesWorkspaceCardToLatestRawTimelinePositionLikeIos() {
+    fun completeSystemMessageKeepsWorkspaceCardInPlaceWhenCompleting() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
             .appendUserMessage(threadId = threadId, text = "Apply the patch")
@@ -337,17 +337,17 @@ class RemodexConversationStateTests {
         assertEquals(
             listOf(
                 CodexMessageRole.User to CodexMessageKind.Chat,
-                CodexMessageRole.Assistant to CodexMessageKind.Chat,
                 CodexMessageRole.System to CodexMessageKind.FileChange,
+                CodexMessageRole.Assistant to CodexMessageKind.Chat,
             ),
             messages.map { it.role to it.kind },
         )
-        assertFalse(messages[2].isStreaming)
-        assertTrue(messages[2].orderIndex > messages[1].orderIndex)
+        assertFalse(messages[1].isStreaming)
+        assertTrue(messages[1].orderIndex < messages[2].orderIndex)
     }
 
     @Test
-    fun completeSystemMessageMovesCommandCardToLatestRawTimelinePositionLikeIos() {
+    fun completeSystemMessageKeepsCommandCardInPlaceWhenCompleting() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
             .appendUserMessage(threadId = threadId, text = "Run tests")
@@ -375,13 +375,13 @@ class RemodexConversationStateTests {
         assertEquals(
             listOf(
                 CodexMessageRole.User to CodexMessageKind.Chat,
-                CodexMessageRole.Assistant to CodexMessageKind.Chat,
                 CodexMessageRole.System to CodexMessageKind.CommandExecution,
+                CodexMessageRole.Assistant to CodexMessageKind.Chat,
             ),
             messages.map { it.role to it.kind },
         )
-        assertFalse(messages[2].isStreaming)
-        assertTrue(messages[2].orderIndex > messages[1].orderIndex)
+        assertFalse(messages[1].isStreaming)
+        assertTrue(messages[1].orderIndex < messages[2].orderIndex)
     }
 
     @Test
@@ -429,7 +429,7 @@ class RemodexConversationStateTests {
     }
 
     @Test
-    fun mergeHydratedThreadMessagesPreservesLateSystemRowChronologyLikeIos() {
+    fun mergeHydratedThreadMessagesPreservesExistingSystemRowPosition() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
             .appendUserMessage(threadId = threadId, text = "Run tests")
@@ -493,12 +493,20 @@ class RemodexConversationStateTests {
         val commandMessage = messages.first { it.kind == CodexMessageKind.CommandExecution }
 
         assertEquals(3, messages.size)
-        assertTrue(commandMessage.orderIndex > assistantMessage.orderIndex)
+        assertEquals(
+            listOf(
+                CodexMessageRole.User to CodexMessageKind.Chat,
+                CodexMessageRole.System to CodexMessageKind.CommandExecution,
+                CodexMessageRole.Assistant to CodexMessageKind.Chat,
+            ),
+            messages.map { it.role to it.kind },
+        )
+        assertTrue(commandMessage.orderIndex < assistantMessage.orderIndex)
         assertEquals("completed echo one", commandMessage.text)
     }
 
     @Test
-    fun mergeHydratedThreadMessagesPreservesProjectedRenderOrderLikeIos() {
+    fun mergeHydratedThreadMessagesOmitsStaleThinkingFromProjectedRenderOrder() {
         val threadId = "thread-1"
         val conversation = RemodexConversationState()
             .appendUserMessage(threadId = threadId, text = "Run tests")
@@ -587,7 +595,7 @@ class RemodexConversationStateTests {
         val projected = RemodexTimelineProjector.project(merged.messagesFor(threadId)).messages
 
         assertEquals(
-            listOf("Run tests", "Reasoning", "First answer", "completed echo one", "Second answer"),
+            listOf("Run tests", "First answer", "completed echo one", "Second answer"),
             projected.map(CodexMessage::text),
         )
     }

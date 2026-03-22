@@ -655,7 +655,7 @@ class RemodexConversationReducerTests {
     }
 
     @Test
-    fun reducerAddsToolCallActivityLinesIntoThinkingRow() {
+    fun reducerAddsToolCallActivityLinesAsIndependentActivityRows() {
         val conversation = RemodexConversationReducer.reduce(
             conversation = RemodexConversationState(),
             message = RpcMessage.notification(
@@ -669,17 +669,17 @@ class RemodexConversationReducerTests {
             knownThreadIds = setOf("thread-1"),
         )
 
-        val thinkingRows = conversation.messagesFor("thread-1").filter {
-            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Thinking
+        val activityRows = conversation.messagesFor("thread-1").filter {
+            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Activity
         }
-        assertEquals(1, thinkingRows.size)
-        assertTrue(thinkingRows.single().text.contains("Read CodexProtocol.swift"))
-        assertTrue(thinkingRows.single().text.contains("Search extractSystemTitleAndBody"))
-        assertFalse(thinkingRows.single().text.contains("ignore"))
+        assertEquals(
+            listOf("Read CodexProtocol.swift", "Search extractSystemTitleAndBody"),
+            activityRows.map { it.text },
+        )
     }
 
     @Test
-    fun reducerMergesEssentialActivityEventsIntoThinkingRow() {
+    fun reducerRoutesSearchReadAndListEventsToIndependentActivityRows() {
         val knownThreadIds = setOf("thread-1")
         var conversation = RemodexConversationState()
 
@@ -747,11 +747,19 @@ class RemodexConversationReducerTests {
             it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Thinking
         }
         assertEquals(1, thinkingRows.size)
-        val body = thinkingRows.single().text
-        assertTrue(body.contains("Checking repo"))
-        assertTrue(body.contains("Read Sources/App.swift"))
-        assertTrue(body.contains("Search extractTitle"))
-        assertTrue(body.contains("List files /tmp/project"))
+        assertEquals("Checking repo", thinkingRows.single().text)
+
+        val activityRows = conversation.messagesFor("thread-1").filter {
+            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Activity
+        }
+        assertEquals(
+            listOf(
+                "Read Sources/App.swift",
+                "Search extractTitle",
+                "List files /tmp/project",
+            ),
+            activityRows.map { it.text },
+        )
     }
 
     @Test
@@ -800,7 +808,7 @@ class RemodexConversationReducerTests {
     }
 
     @Test
-    fun reducerUpdatesExistingThinkingRowWhenLateActivityArrivesWithTurnIdAfterCompletion() {
+    fun reducerAppendsLateActivityRowsWithTurnIdAfterCompletion() {
         val knownThreadIds = setOf("thread-1")
         var conversation = RemodexConversationState()
 
@@ -851,13 +859,14 @@ class RemodexConversationReducerTests {
             knownThreadIds = knownThreadIds,
         )
 
-        val thinkingRows = conversation.messagesFor("thread-1").filter {
-            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Thinking
+        val activityRows = conversation.messagesFor("thread-1").filter {
+            it.role == CodexMessageRole.System && it.kind == CodexMessageKind.Activity
         }
-        assertEquals(1, thinkingRows.size)
-        assertTrue(thinkingRows.single().text.contains("Read file A.swift"))
-        assertTrue(thinkingRows.single().text.contains("Read B.swift"))
-        assertFalse(thinkingRows.single().isStreaming)
+        assertEquals(
+            listOf("Read file A.swift", "Read B.swift"),
+            activityRows.map { it.text },
+        )
+        assertTrue(activityRows.none { it.isStreaming })
     }
 
     @Test
@@ -1106,7 +1115,7 @@ class RemodexConversationReducerTests {
     }
 
     @Test
-    fun reducerPreservesInterleavedThinkingWhenReasoningStartsAfterAssistantText() {
+    fun reducerShowsOnlyLatestThinkingWhenReasoningContinuesAfterAssistantText() {
         val knownThreadIds = setOf("thread-1")
         var conversation = RemodexConversationState()
 
@@ -1167,7 +1176,7 @@ class RemodexConversationReducerTests {
 
         val projected = RemodexTimelineProjector.project(conversation.messagesFor("thread-1")).messages
         assertEquals(
-            listOf("Reasoning A", "Answer 1", "Reasoning B"),
+            listOf("Answer 1", "Reasoning B"),
             projected.map { it.text },
         )
     }
